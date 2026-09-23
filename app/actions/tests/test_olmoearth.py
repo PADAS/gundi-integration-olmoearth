@@ -1,14 +1,14 @@
 """Tests for the OlmoEarth connector.
 
-The contracts worth pinning down here are the ones the API sample does not
-enforce for us: that an unset filter operator is *absent* from the request
-rather than sent empty, that offset paging cannot skip a record, that a
-polygon detection still gets a point location, and that a failed run leaves a
-watermark the next run can resume from.
+The contracts worth pinning down here are the ones the API cannot enforce for
+us: that an unset filter operator is *absent* from the request rather than sent
+empty, that the connector never sends the Result scope the server derives for
+itself, that offset paging cannot skip a record, that a polygon detection still
+gets a point location, and that a failed run leaves a watermark the next run
+can resume from without either dropping or duplicating detections.
 """
 import datetime
 import json
-from typing import List, Optional
 
 import httpx
 import pytest
@@ -19,7 +19,6 @@ from app.actions import handlers
 from app.actions.configurations import (
     AuthenticateConfig,
     ListPredictionsConfig,
-    PredictionSelection,
     PullEventsConfig,
 )
 from app.services.errors import (
@@ -31,10 +30,7 @@ from app.services.errors import (
 
 BASE_URL = "https://olmoearth.example.org"
 PREDICTIONS_PATH = "/api/v1/predictions/search"
-
-
-def features_path(result_id: str) -> str:
-    return f"/api/v1/prediction-results/{result_id}/features/search"
+FEATURES_PATH = "/api/v1/prediction-results/features/search"
 
 
 # --------------------------------------------------------------------------
@@ -116,12 +112,13 @@ def feature(
     bbox=None,
     start_time="2026-09-01T00:00:00Z",
     created_at="2026-09-02T00:00:00Z",
+    result_id="result-1",
     extra_properties=None,
 ):
     properties = {
         "oe_start_time": start_time,
         "oe_created_at": created_at,
-        "oe_prediction_result_id": "result-1",
+        "oe_prediction_result_id": result_id,
         "oe_prediction_result_file_id": "file-1",
     }
     properties.update(extra_properties or {})
@@ -148,6 +145,10 @@ def prediction(pid="pred-1", creation_time="2026-09-02T00:00:00Z", **extra):
     return record
 
 
+def parsed(record):
+    return client.Feature.parse_obj(record)
+
+
 # --------------------------------------------------------------------------
 # Request serialization
 # --------------------------------------------------------------------------
@@ -167,6 +168,33 @@ def test_an_unset_operator_is_absent_from_the_body_not_sent_empty():
     assert "status" not in body
 
 
+def test_a_feature_search_body_has_the_two_halves_the_endpoint_expects():
+    """`prediction_results` picks the Results, `features` filters within them.
+    Flattening the two into one object is the most likely way to get this
+    endpoint wrong, so pin the shape."""
+    body = client.FeatureSearchRequest(
+        prediction_results=client.PredictionResultFilters(
+            prediction_model_id=client.KeywordFilter(eq="model-abc")
+        ),
+        features=client.FeatureFilters(limit=250),
+    ).as_body()
+
+    assert body["prediction_results"] == {"prediction_model_id": {"eq": "model-abc"}}
+    assert body["features"]["limit"] == 250
+    assert body["features"]["sort_by"] == "oe_created_at"
+
+
+def test_the_connector_cannot_send_the_result_scope_the_server_derives():
+    """The server builds `features.oe_prediction_result_id` from the
+    access-controlled `prediction_results` query and 422s a caller-supplied
+    one. Leaving the field off the model is what makes that unreachable rather
+    than merely discouraged."""
+    assert "oe_prediction_result_id" not in client.FeatureFilters.__fields__
+
+    with pytest.raises(ValueError):
+        client.FeatureFilters(oe_prediction_result_id=client.KeywordFilter(eq="result-1"))
+
+
 def test_datetimes_are_serialized_as_iso_strings():
     """`as_body` has to produce something json-serializable: httpx would choke
     on a datetime, and the failure would only show up against a live API."""
@@ -180,49 +208,17 @@ def test_datetimes_are_serialized_as_iso_strings():
 def test_explicit_paging_values_survive_serialization():
     """limit/offset have defaults, so `exclude_defaults` would drop offset=0 —
     and an omitted offset is a different request from offset 0."""
-    body = client.FeatureSearchRequest(limit=50, offset=0).as_body()
+    body = client.FeatureSearchRequest(features=client.FeatureFilters(limit=50, offset=0)).as_body()
 
-    assert body["limit"] == 50
-    assert body["offset"] == 0
-
-
-# --------------------------------------------------------------------------
-# Resolving result ids
-# --------------------------------------------------------------------------
-@pytest.mark.parametrize(
-    "extra",
-    [
-        {"prediction_result_ids": ["result-9"]},
-        {"result_ids": ["result-9"]},
-        {"results": [{"id": "result-9"}]},
-        {"prediction_results": ["result-9"]},
-    ],
-)
-def test_result_ids_are_read_from_whichever_field_names_them(extra):
-    """The predictions response schema was not documented, so the connector
-    probes the plausible field names rather than assuming one."""
-    assert client.result_ids_for(client.Prediction.parse_obj(prediction(**extra))) == ["result-9"]
-
-
-def test_a_prediction_naming_no_results_falls_back_to_its_own_id():
-    """The documented flow gives us no link between the two identifiers. Until
-    that is confirmed, assume they are the same value — and log loudly."""
-    assert client.result_ids_for(client.Prediction.parse_obj(prediction("pred-7"))) == ["pred-7"]
-
-
-def test_several_results_are_all_returned():
-    parsed = client.Prediction.parse_obj(prediction(result_ids=["a", "b", "c"]))
-
-    assert client.result_ids_for(parsed) == ["a", "b", "c"]
+    assert body["features"]["limit"] == 50
+    assert body["features"]["offset"] == 0
 
 
 # --------------------------------------------------------------------------
 # Geometry
 # --------------------------------------------------------------------------
 def test_a_point_feature_keeps_its_own_coordinates():
-    location = handlers.centroid_of(client.Feature.parse_obj(feature()))
-
-    assert location == {"lat": -51.7, "lon": -72.7}
+    assert handlers.centroid_of(parsed(feature())) == {"lat": -51.7, "lon": -72.7}
 
 
 def test_a_polygon_is_reduced_to_a_point_so_gundi_can_place_it():
@@ -230,7 +226,7 @@ def test_a_polygon_is_reduced_to_a_point_so_gundi_can_place_it():
         "type": "Polygon",
         "coordinates": [[[0.0, 0.0], [0.0, 2.0], [2.0, 2.0], [2.0, 0.0], [0.0, 0.0]]],
     }
-    location = handlers.centroid_of(client.Feature.parse_obj(feature(geometry=polygon)))
+    location = handlers.centroid_of(parsed(feature(geometry=polygon)))
 
     assert location["lat"] == pytest.approx(0.8)
     assert location["lon"] == pytest.approx(0.8)
@@ -243,9 +239,7 @@ def test_the_providers_bbox_wins_over_averaging_the_vertices():
         "type": "Polygon",
         "coordinates": [[[0.0, 0.0], [0.0, 2.0], [2.0, 2.0], [2.0, 0.0], [0.0, 0.0]]],
     }
-    location = handlers.centroid_of(
-        client.Feature.parse_obj(feature(geometry=polygon, bbox=[0.0, 0.0, 2.0, 2.0]))
-    )
+    location = handlers.centroid_of(parsed(feature(geometry=polygon, bbox=[0.0, 0.0, 2.0, 2.0])))
 
     assert location == {"lat": 1.0, "lon": 1.0}
 
@@ -253,7 +247,7 @@ def test_the_providers_bbox_wins_over_averaging_the_vertices():
 def test_a_feature_with_no_geometry_has_no_location():
     record = feature()
     record["geometry"] = None
-    assert handlers.centroid_of(client.Feature.parse_obj(record)) is None
+    assert handlers.centroid_of(parsed(record)) is None
 
 
 # --------------------------------------------------------------------------
@@ -265,9 +259,7 @@ def test_an_event_is_timestamped_when_the_model_saw_it_not_when_it_was_written(p
     a detection feed is the difference between a useful timestamp and a useless
     one."""
     event = handlers.transform_feature(
-        client.Feature.parse_obj(feature(start_time="2026-08-01T00:00:00Z", created_at="2026-09-02T00:00:00Z")),
-        client.Prediction.parse_obj(prediction()),
-        "result-1",
+        parsed(feature(start_time="2026-08-01T00:00:00Z", created_at="2026-09-02T00:00:00Z")),
         pull_config,
     )
 
@@ -276,23 +268,19 @@ def test_an_event_is_timestamped_when_the_model_saw_it_not_when_it_was_written(p
 
 
 def test_a_feature_without_a_start_time_falls_back_to_when_it_was_created(pull_config):
-    record = feature(start_time=None)
+    record = feature()
     record["properties"].pop("oe_start_time")
-    event = handlers.transform_feature(
-        client.Feature.parse_obj(record), client.Prediction.parse_obj(prediction()), "result-1", pull_config
-    )
 
-    assert event["recorded_at"].startswith("2026-09-02T00:00:00")
+    assert handlers.transform_feature(parsed(record), pull_config)["recorded_at"].startswith(
+        "2026-09-02T00:00:00"
+    )
 
 
 def test_the_models_own_properties_are_kept_apart_from_the_oe_provenance(pull_config):
     """`oe_`-prefixed fields are bookkeeping. Burying the model's actual output
     among them is what makes a detection feed unreadable downstream."""
     event = handlers.transform_feature(
-        client.Feature.parse_obj(feature(extra_properties={"confidence": 0.91, "species": "elephant"})),
-        client.Prediction.parse_obj(prediction()),
-        "result-1",
-        pull_config,
+        parsed(feature(extra_properties={"confidence": 0.91, "species": "elephant"})), pull_config
     )
 
     details = event["event_details"]
@@ -300,32 +288,39 @@ def test_the_models_own_properties_are_kept_apart_from_the_oe_provenance(pull_co
     assert details["species"] == "elephant"
     assert not [key for key in details if key.startswith("oe_")]
     # Provenance is still present, under names that say what they are.
-    assert details["prediction_id"] == "pred-1"
     assert details["prediction_result_id"] == "result-1"
     assert details["model_id"] == "model-abc"
 
 
 def test_a_feature_id_is_qualified_by_its_result_so_it_is_globally_unique(pull_config):
-    """Feature ids restart per prediction result — the sample response returns
-    `1`. Unqualified, feature 1 of every result would collide."""
-    event = handlers.transform_feature(
-        client.Feature.parse_obj(feature(feature_id=1)),
-        client.Prediction.parse_obj(prediction()),
-        "result-42",
-        pull_config,
-    )
+    """Feature ids restart per Prediction Result — the sample response returns
+    `1`. One search now spans many Results at once, which is precisely when an
+    unqualified id would collide."""
+    event = handlers.transform_feature(parsed(feature(feature_id=1, result_id="result-42")), pull_config)
 
     assert event["external_source_id"] == "result-42:1"
 
 
+def test_a_feature_naming_no_result_still_gets_a_stable_id(pull_config):
+    record = feature()
+    record["properties"].pop("oe_prediction_result_id")
+
+    assert handlers.transform_feature(parsed(record), pull_config)["external_source_id"] == "1"
+
+
+def test_the_event_title_is_configurable_because_a_cross_result_feed_has_no_prediction_name(
+    pull_config,
+):
+    pull_config.event_title_prefix = "Kaza deforestation"
+
+    assert handlers.transform_feature(parsed(feature(3)), pull_config)["title"] == (
+        "Kaza deforestation detection 3"
+    )
+
+
 def test_the_full_geometry_travels_with_the_event_by_default(pull_config):
     polygon = {"type": "Polygon", "coordinates": [[[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.0, 0.0]]]}
-    event = handlers.transform_feature(
-        client.Feature.parse_obj(feature(geometry=polygon)),
-        client.Prediction.parse_obj(prediction()),
-        "result-1",
-        pull_config,
-    )
+    event = handlers.transform_feature(parsed(feature(geometry=polygon)), pull_config)
 
     assert event["geometry"]["type"] == "Polygon"
     assert event["geometry"]["coordinates"] == polygon["coordinates"]
@@ -333,64 +328,77 @@ def test_the_full_geometry_travels_with_the_event_by_default(pull_config):
 
 def test_geometry_can_be_left_off(pull_config):
     pull_config.include_geometry = False
-    event = handlers.transform_feature(
-        client.Feature.parse_obj(feature()), client.Prediction.parse_obj(prediction()), "result-1", pull_config
-    )
 
-    assert "geometry" not in event
+    assert "geometry" not in handlers.transform_feature(parsed(feature()), pull_config)
 
 
 def test_an_unplaceable_feature_is_skipped_rather_than_sent_without_a_location(pull_config):
     record = feature()
     record["geometry"] = None
-    assert handlers.transform_feature(
-        client.Feature.parse_obj(record), client.Prediction.parse_obj(prediction()), "result-1", pull_config
-    ) is None
+
+    assert handlers.transform_feature(parsed(record), pull_config) is None
 
 
 # --------------------------------------------------------------------------
 # Query construction
 # --------------------------------------------------------------------------
-def test_the_prediction_window_is_inclusive_of_the_watermark(pull_config):
-    """`gt` would drop a prediction created in the same second as the
-    watermark. The processed-id list is what stops the boundary prediction from
-    being ingested twice."""
+def since_of(request):
+    return request.features.oe_created_at
+
+
+def test_the_watermark_window_is_inclusive(pull_config):
+    """`gt` would drop a detection written in the same second as the watermark
+    but indexed after the run read it. The boundary-id list is what stops the
+    re-read becoming a duplicate."""
     since = datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)
-    request = handlers.build_prediction_query(pull_config, since)
+    request = handlers.build_feature_search(pull_config, since)
 
-    assert request.creation_time.gte == since
-    assert request.creation_time.gt is None
-    assert request.model_id.eq == "model-abc"
-    assert request.sort_direction == "desc"
+    assert since_of(request).gte == since
+    assert since_of(request).gt is None
 
 
-def test_an_empty_status_means_every_status(pull_config):
-    pull_config.prediction_status = None
-    assert handlers.build_prediction_query(pull_config, datetime.datetime.now(datetime.timezone.utc)).status is None
+def test_each_scope_field_lands_on_the_prediction_results_half(pull_config):
+    """These are the filters the server access-controls. Putting one on the
+    feature half instead would be accepted and quietly do nothing."""
+    pull_config.project_id = "proj-1"
+    pull_config.organization_id = "org-1"
+    pull_config.target_area_id = "area-1"
+    scope = handlers.build_feature_search(pull_config, datetime.datetime.now(datetime.timezone.utc)).prediction_results
+
+    assert scope.prediction_model_id.eq == "model-abc"
+    assert scope.prediction_project_id.eq == "proj-1"
+    assert scope.organization_id.eq == "org-1"
+    assert scope.prediction_target_area_id.eq == "area-1"
 
 
 def test_a_minimum_confidence_becomes_a_provider_side_property_filter(pull_config):
     """Filtering here rather than after the fact is the difference between
     paging through every detection and paging through the ones that matter."""
     pull_config.min_confidence = 0.8
-    request = handlers.build_feature_query(pull_config)
+    features = handlers.build_feature_search(pull_config, datetime.datetime.now(datetime.timezone.utc)).features
 
-    assert request.property_filters[0].property_name == "confidence"
-    assert request.property_filters[0].numeric_filter.gte == 0.8
+    assert features.property_filters[0].property_name == "confidence"
+    assert features.property_filters[0].numeric_filter.gte == 0.8
 
 
 def test_the_confidence_property_name_is_configurable(pull_config):
     pull_config.min_confidence = 0.5
     pull_config.confidence_property = "score"
+    request = handlers.build_feature_search(pull_config, datetime.datetime.now(datetime.timezone.utc))
 
-    assert handlers.build_feature_query(pull_config).property_filters[0].property_name == "score"
+    assert request.features.property_filters[0].property_name == "score"
 
 
-def test_an_area_of_interest_becomes_the_intersects_geometry_filter(pull_config):
+def test_the_area_of_interest_filters_features_not_predictions(pull_config):
+    """`prediction_intersects_geometry` matches through registered Areas only:
+    a Prediction created from an uploaded GeoJSON keeps its footprint in a file
+    and never matches. Enforcing an AOI there would silently drop exactly the
+    detections nobody would think to look for."""
     pull_config.area_of_interest = {"type": "Polygon", "coordinates": [[[0, 0], [0, 1], [1, 1], [0, 0]]]}
-    request = handlers.build_feature_query(pull_config)
+    request = handlers.build_feature_search(pull_config, datetime.datetime.now(datetime.timezone.utc))
 
-    assert request.intersects_geometry.type == "Polygon"
+    assert request.features.intersects_geometry.type == "Polygon"
+    assert request.prediction_results.prediction_intersects_geometry is None
 
 
 def test_a_malformed_area_of_interest_is_reported_as_a_configuration_problem(pull_config):
@@ -399,7 +407,23 @@ def test_a_malformed_area_of_interest_is_reported_as_a_configuration_problem(pul
     pull_config.area_of_interest = {"coordinates": [[0, 0]]}  # no `type`
 
     with pytest.raises(IntegrationConfigurationError):
-        handlers.build_feature_query(pull_config)
+        handlers.build_feature_search(pull_config, datetime.datetime.now(datetime.timezone.utc))
+
+
+def test_a_config_with_nothing_to_narrow_it_is_rejected_up_front():
+    """Unscoped, the search returns every Result the token can read — a silent
+    firehose, or a 400 past the provider's thousand-Result ceiling. Better
+    found in the portal than at 4am."""
+    with pytest.raises(ValueError, match="at least one"):
+        PullEventsConfig()
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [{"model_id": "m"}, {"project_id": "p"}, {"organization_id": "o"}, {"target_area_id": "a"}],
+)
+def test_any_one_scope_is_enough(scope):
+    assert PullEventsConfig(**scope)
 
 
 # --------------------------------------------------------------------------
@@ -430,6 +454,24 @@ async def test_a_bad_request_is_not_retried():
         with pytest.raises(IntegrationBadResponseError):
             await api.search_predictions(client.PredictionSearchRequest())
     assert len(recorded) == 1
+
+
+@pytest.mark.asyncio
+async def test_too_broad_a_scope_is_reported_as_a_configuration_problem():
+    """The provider refuses to search more than a thousand Prediction Results
+    at once — it will not truncate, because a partial feature set is
+    indistinguishable from a complete one. That is the integration's own
+    filters being too wide, so say which ones narrow it."""
+    transport, _ = make_transport(
+        {
+            FEATURES_PATH: httpx.Response(
+                400, text="This search spans 4213 Prediction Results, more than the 1000 that can be searched at once."
+            )
+        }
+    )
+    async with client.OlmoEarthClient(BASE_URL, "t", transport=transport) as api:
+        with pytest.raises(IntegrationConfigurationError, match="area of interest"):
+            await api.search_features(client.FeatureSearchRequest())
 
 
 @pytest.mark.asyncio
@@ -479,45 +521,51 @@ def test_a_client_without_a_token_points_at_the_auth_action():
 # --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_paging_walks_every_page_until_a_short_one():
-    path = features_path("result-1")
     transport, recorded = make_transport(
-        {path: [json_response([feature(i) for i in range(3)], total=5), json_response([feature(3), feature(4)], total=5)]}
+        {
+            FEATURES_PATH: [
+                json_response([feature(i) for i in range(3)], total=5),
+                json_response([feature(3), feature(4)], total=5),
+            ]
+        }
     )
+    request = client.FeatureSearchRequest(features=client.FeatureFilters(limit=3))
     async with client.OlmoEarthClient(BASE_URL, "t", transport=transport) as api:
-        collected = [f async for f in api.iter_features("result-1", client.FeatureSearchRequest(limit=3))]
+        collected = [f async for f in api.iter_features(request)]
 
     # Ids come back as strings: the response sends integers, the filters send
     # keywords, and the model settles on one so identity is stable.
     assert [f.id for f in collected] == ["0", "1", "2", "3", "4"]
-    assert [json.loads(r.content)["offset"] for r in recorded] == [0, 3]
+    assert [json.loads(r.content)["features"]["offset"] for r in recorded] == [0, 3]
 
 
 @pytest.mark.asyncio
 async def test_paging_sorts_ascending_so_a_new_record_cannot_shift_the_window():
-    """Offset paging over a `desc` sort skips a record whenever one is inserted
+    """Offset paging over a `desc` sort skips a record whenever one is written
     mid-walk: everything after it shifts one slot forward. Ascending order only
     ever appends past the window already read."""
-    path = features_path("result-1")
-    transport, recorded = make_transport({path: [json_response([feature(1)], total=1)]})
+    transport, recorded = make_transport({FEATURES_PATH: [json_response([feature(1)], total=1)]})
+    request = client.FeatureSearchRequest(
+        features=client.FeatureFilters(limit=50, sort_direction="desc")
+    )
     async with client.OlmoEarthClient(BASE_URL, "t", transport=transport) as api:
-        request = client.FeatureSearchRequest(limit=50, sort_direction="desc")
-        [f async for f in api.iter_features("result-1", request)]
+        [f async for f in api.iter_features(request)]
 
-    body = json.loads(recorded[0].content)
-    assert body["sort_by"] == "oe_created_at"
-    assert body["sort_direction"] == "asc"
+    features = json.loads(recorded[0].content)["features"]
+    assert features["sort_by"] == "oe_created_at"
+    assert features["sort_direction"] == "asc"
     # The caller's own request object is left as they built it.
-    assert request.sort_direction == "desc"
+    assert request.features.sort_direction == "desc"
 
 
 @pytest.mark.asyncio
 async def test_paging_stops_at_the_feature_cap():
-    path = features_path("result-1")
-    transport, _ = make_transport({path: [json_response([feature(i) for i in range(50)], total=1000)] * 5})
+    transport, _ = make_transport(
+        {FEATURES_PATH: [json_response([feature(i) for i in range(50)], total=1000)] * 5}
+    )
+    request = client.FeatureSearchRequest(features=client.FeatureFilters(limit=50))
     async with client.OlmoEarthClient(BASE_URL, "t", transport=transport) as api:
-        collected = [
-            f async for f in api.iter_features("result-1", client.FeatureSearchRequest(limit=50), max_features=75)
-        ]
+        collected = [f async for f in api.iter_features(request, max_features=75)]
 
     assert len(collected) == 75
 
@@ -526,10 +574,12 @@ async def test_paging_stops_at_the_feature_cap():
 async def test_paging_stops_once_the_reported_total_is_reached():
     """A provider that pads the last page to full size would otherwise be
     paged forever."""
-    path = features_path("result-1")
-    transport, recorded = make_transport({path: [json_response([feature(i) for i in range(2)], total=2)] * 3})
+    transport, recorded = make_transport(
+        {FEATURES_PATH: [json_response([feature(i) for i in range(2)], total=2)] * 3}
+    )
+    request = client.FeatureSearchRequest(features=client.FeatureFilters(limit=2))
     async with client.OlmoEarthClient(BASE_URL, "t", transport=transport) as api:
-        collected = [f async for f in api.iter_features("result-1", client.FeatureSearchRequest(limit=2))]
+        collected = [f async for f in api.iter_features(request)]
 
     assert len(collected) == 2
     assert len(recorded) == 1
@@ -596,6 +646,10 @@ def route_client(mocker, routes):
     return recorded
 
 
+def state_of(captured_state, integration):
+    return captured_state[(str(integration.id), "pull_events", "no-source")]
+
+
 @pytest.mark.asyncio
 async def test_auth_checks_the_credentials_against_a_real_search(mocker, integration):
     """An empty result is still proof the host, path and token all work."""
@@ -605,6 +659,18 @@ async def test_auth_checks_the_credentials_against_a_real_search(mocker, integra
 
     assert result["valid_credentials"] is True
     assert json.loads(recorded[0].content)["limit"] == 1
+
+
+@pytest.mark.asyncio
+async def test_auth_asks_an_endpoint_that_actually_requires_a_token(mocker, integration):
+    """The features endpoint accepts anonymous callers and answers 200 with the
+    public Results, so validating against it would pass a dead token. The
+    predictions search requires a real user."""
+    recorded = route_client(mocker, {PREDICTIONS_PATH: json_response([], total=0)})
+
+    await handlers.action_auth(integration, AuthenticateConfig(api_token="s3cr3t-token"))
+
+    assert [r.url.path for r in recorded] == [PREDICTIONS_PATH]
 
 
 @pytest.mark.asyncio
@@ -643,18 +709,11 @@ async def test_list_predictions_says_when_the_list_is_only_a_prefix(mocker, inte
 async def test_a_pull_turns_features_into_events(
     mocker, integration, pull_config, captured_gundi, captured_state, no_activity_logs
 ):
-    route_client(
-        mocker,
-        {
-            PREDICTIONS_PATH: json_response([prediction("pred-1", result_ids=["result-1"])], total=1),
-            features_path("result-1"): [json_response([feature(1), feature(2)], total=2)],
-        },
-    )
+    route_client(mocker, {FEATURES_PATH: [json_response([feature(1), feature(2)], total=2)]})
 
     result = await handlers.action_pull_events(integration, pull_config)
 
-    assert result["predictions_processed"] == 1
-    assert result["features_extracted"] == 2
+    assert result["features_read"] == 2
     assert result["events_sent"] == 2
     events = captured_gundi[0]["events"]
     assert [e["external_source_id"] for e in events] == ["result-1:1", "result-1:2"]
@@ -662,120 +721,160 @@ async def test_a_pull_turns_features_into_events(
 
 
 @pytest.mark.asyncio
-async def test_a_prediction_already_ingested_is_not_ingested_again(
+async def test_a_pull_reads_every_result_in_one_request(
     mocker, integration, pull_config, captured_gundi, captured_state, no_activity_logs
 ):
-    """The search is bounded with `gte`, so the boundary prediction comes back
-    every run. Recognising it is what keeps events from being duplicated."""
-    routes = {
-        PREDICTIONS_PATH: json_response([prediction("pred-1", result_ids=["result-1"])], total=1),
-        features_path("result-1"): [json_response([feature(1)], total=1)],
-    }
-    route_client(mocker, routes)
-    await handlers.action_pull_events(integration, pull_config)
-
-    # The same prediction is still the newest thing the provider has.
-    routes[PREDICTIONS_PATH] = json_response([prediction("pred-1", result_ids=["result-1"])], total=1)
-    routes[features_path("result-1")] = [json_response([feature(1)], total=1)]
-    route_client(mocker, routes)
-    second = await handlers.action_pull_events(integration, pull_config)
-
-    assert second["predictions_processed"] == 0
-    assert len(captured_gundi) == 1, "nothing should have been re-sent"
-
-
-@pytest.mark.asyncio
-async def test_the_watermark_advances_to_the_newest_prediction(
-    mocker, integration, pull_config, captured_gundi, captured_state, no_activity_logs
-):
-    route_client(
+    """The whole point of the new endpoint: detections from many Prediction
+    Results arrive together, with no per-Result round trip."""
+    recorded = route_client(
         mocker,
         {
-            PREDICTIONS_PATH: json_response(
-                [
-                    prediction("pred-2", creation_time="2026-09-05T00:00:00Z", result_ids=["result-2"]),
-                    prediction("pred-1", creation_time="2026-09-04T00:00:00Z", result_ids=["result-1"]),
-                ],
-                total=2,
-            ),
-            features_path("result-1"): [json_response([feature(1)], total=1)],
-            features_path("result-2"): [json_response([feature(2)], total=1)],
+            FEATURES_PATH: [
+                json_response([feature(1, result_id="result-1"), feature(1, result_id="result-2")], total=2)
+            ]
         },
     )
 
     result = await handlers.action_pull_events(integration, pull_config)
 
-    assert result["predictions_processed"] == 2
-    assert result["watermark"].startswith("2026-09-05T00:00:00")
-    state = captured_state[(str(integration.id), "pull_events", "no-source")]
-    # Newest first, so the most recently ingested survives the bound.
-    assert state["processed_prediction_ids"] == ["pred-2", "pred-1"]
+    assert len(recorded) == 1
+    assert result["events_sent"] == 2
+    assert [e["external_source_id"] for e in captured_gundi[0]["events"]] == ["result-1:1", "result-2:1"]
 
 
 @pytest.mark.asyncio
-async def test_a_failure_partway_through_leaves_the_finished_predictions_behind(
+async def test_a_detection_already_ingested_is_not_sent_again(
     mocker, integration, pull_config, captured_gundi, captured_state, no_activity_logs
 ):
-    """State is written per prediction, not once at the end. A run that dies on
-    the second prediction must not re-send the first one's events next time."""
-    route_client(
-        mocker,
-        {
-            PREDICTIONS_PATH: json_response(
-                [
-                    prediction("pred-2", creation_time="2026-09-05T00:00:00Z", result_ids=["result-2"]),
-                    prediction("pred-1", creation_time="2026-09-04T00:00:00Z", result_ids=["result-1"]),
-                ],
-                total=2,
-            ),
-            features_path("result-1"): [json_response([feature(1)], total=1)],
-            features_path("result-2"): httpx.Response(500, text="boom"),
-        },
-    )
+    """The search is bounded with `gte`, so everything sharing the watermark
+    second comes back every run. The boundary-id list is what keeps that from
+    duplicating events."""
+    routes = {FEATURES_PATH: [json_response([feature(1)], total=1)]}
+    route_client(mocker, routes)
+    await handlers.action_pull_events(integration, pull_config)
 
-    with pytest.raises(IntegrationBadResponseError):
-        await handlers.action_pull_events(integration, pull_config)
+    # The same detection is still the newest thing the provider has.
+    routes[FEATURES_PATH] = [json_response([feature(1)], total=1)]
+    routes[PREDICTIONS_PATH] = json_response([], total=0)  # the empty-run token probe
+    route_client(mocker, routes)
+    second = await handlers.action_pull_events(integration, pull_config)
 
-    state = captured_state[(str(integration.id), "pull_events", "no-source")]
-    assert state["processed_prediction_ids"] == ["pred-1"]
-    assert state["last_prediction_creation_time"].startswith("2026-09-04T00:00:00")
+    assert second["features_read"] == 0
+    assert second["features_skipped"] == 1
+    assert len(captured_gundi) == 1, "nothing should have been re-sent"
 
 
 @pytest.mark.asyncio
-async def test_latest_only_takes_the_newest_prediction_and_leaves_the_rest(
-    mocker, integration, captured_gundi, captured_state, no_activity_logs
+async def test_a_detection_written_into_the_boundary_second_is_still_picked_up(
+    mocker, integration, pull_config, captured_gundi, captured_state, no_activity_logs
+):
+    """The reason the cursor is `gte` and not `gt`. A bulk-inserted Result
+    stamps thousands of features with one `oe_created_at`; if some are indexed
+    after a run has already read that second, `gt` would never see them."""
+    routes = {FEATURES_PATH: [json_response([feature(1, created_at="2026-09-02T00:00:00Z")], total=1)]}
+    route_client(mocker, routes)
+    await handlers.action_pull_events(integration, pull_config)
+
+    # Feature 2 lands in the same second, after the first run read it.
+    routes[FEATURES_PATH] = [
+        json_response(
+            [
+                feature(1, created_at="2026-09-02T00:00:00Z"),
+                feature(2, created_at="2026-09-02T00:00:00Z"),
+            ],
+            total=2,
+        )
+    ]
+    route_client(mocker, routes)
+    second = await handlers.action_pull_events(integration, pull_config)
+
+    assert second["features_skipped"] == 1  # feature 1, already sent
+    assert second["events_sent"] == 1
+    assert captured_gundi[1]["events"][0]["external_source_id"] == "result-1:2"
+
+
+@pytest.mark.asyncio
+async def test_the_watermark_advances_to_the_newest_detection(
+    mocker, integration, pull_config, captured_gundi, captured_state, no_activity_logs
 ):
     route_client(
         mocker,
         {
-            PREDICTIONS_PATH: json_response(
-                [
-                    prediction("pred-2", creation_time="2026-09-05T00:00:00Z", result_ids=["result-2"]),
-                    prediction("pred-1", creation_time="2026-09-04T00:00:00Z", result_ids=["result-1"]),
-                ],
-                total=2,
-            ),
-            features_path("result-2"): [json_response([feature(1)], total=1)],
+            FEATURES_PATH: [
+                json_response(
+                    [
+                        feature(1, created_at="2026-09-04T00:00:00Z"),
+                        feature(2, created_at="2026-09-05T00:00:00Z"),
+                    ],
+                    total=2,
+                )
+            ]
         },
     )
-    config = PullEventsConfig(model_id="model-abc", prediction_selection=PredictionSelection.LATEST_ONLY)
 
-    result = await handlers.action_pull_events(integration, config)
+    result = await handlers.action_pull_events(integration, pull_config)
 
-    assert result["predictions_processed"] == 1
-    assert captured_gundi[0]["events"][0]["event_details"]["prediction_id"] == "pred-2"
+    assert result["watermark"].startswith("2026-09-05T00:00:00")
+    state = state_of(captured_state, integration)
+    # Only the newest instant's ids are remembered; everything older is
+    # excluded by the cursor itself.
+    assert state["boundary_feature_ids"] == ["result-1:2"]
+
+
+@pytest.mark.asyncio
+async def test_a_failure_partway_through_leaves_the_sent_batches_behind(
+    mocker, integration, captured_state, no_activity_logs
+):
+    """State is written per batch, not once at the end. A run that dies on the
+    second batch must not re-send the first one's events next time."""
+    calls = []
+
+    async def send(events, **kwargs):
+        calls.append(events)
+        if len(calls) == 2:
+            raise RuntimeError("gundi is down")
+        return {"created": len(events)}
+
+    mocker.patch.object(handlers.gundi_tools, "send_events_to_gundi", side_effect=send)
+    route_client(
+        mocker,
+        {
+            FEATURES_PATH: [
+                json_response(
+                    [
+                        feature(1, created_at="2026-09-04T00:00:00Z"),
+                        feature(2, created_at="2026-09-05T00:00:00Z"),
+                    ],
+                    total=2,
+                )
+            ]
+        },
+    )
+
+    with pytest.raises(RuntimeError):
+        await handlers.action_pull_events(
+            integration, PullEventsConfig(model_id="model-abc", events_per_request=1)
+        )
+
+    state = state_of(captured_state, integration)
+    assert state["last_feature_created_at"].startswith("2026-09-04T00:00:00")
+    assert state["boundary_feature_ids"] == ["result-1:1"]
 
 
 @pytest.mark.asyncio
 async def test_a_first_run_reaches_back_by_the_configured_lookback(
     mocker, integration, captured_gundi, captured_state, no_activity_logs
 ):
-    recorded = route_client(mocker, {PREDICTIONS_PATH: json_response([], total=0)})
-    config = PullEventsConfig(model_id="model-abc", lookback_days=3)
+    recorded = route_client(
+        mocker, {FEATURES_PATH: [json_response([], total=0)], PREDICTIONS_PATH: json_response([], total=0)}
+    )
 
-    await handlers.action_pull_events(integration, config)
+    await handlers.action_pull_events(
+        integration, PullEventsConfig(model_id="model-abc", lookback_days=3)
+    )
 
-    since = datetime.datetime.fromisoformat(json.loads(recorded[0].content)["creation_time"]["gte"])
+    body = json.loads(recorded[0].content)
+    since = datetime.datetime.fromisoformat(body["features"]["oe_created_at"]["gte"])
     age = datetime.datetime.now(datetime.timezone.utc) - since
     assert 2.9 < age.total_seconds() / 86400 < 3.1
 
@@ -785,15 +884,12 @@ async def test_events_are_sent_in_batches_of_the_configured_size(
     mocker, integration, captured_gundi, captured_state, no_activity_logs
 ):
     route_client(
-        mocker,
-        {
-            PREDICTIONS_PATH: json_response([prediction("pred-1", result_ids=["result-1"])], total=1),
-            features_path("result-1"): [json_response([feature(i) for i in range(5)], total=5)],
-        },
+        mocker, {FEATURES_PATH: [json_response([feature(i) for i in range(5)], total=5)]}
     )
-    config = PullEventsConfig(model_id="model-abc", events_per_request=2)
 
-    result = await handlers.action_pull_events(integration, config)
+    result = await handlers.action_pull_events(
+        integration, PullEventsConfig(model_id="model-abc", events_per_request=2)
+    )
 
     assert result["events_sent"] == 5
     assert [len(call["events"]) for call in captured_gundi] == [2, 2, 1]
@@ -803,39 +899,93 @@ async def test_events_are_sent_in_batches_of_the_configured_size(
 async def test_a_run_with_nothing_new_is_a_clean_no_op(
     mocker, integration, pull_config, captured_gundi, captured_state, no_activity_logs
 ):
-    route_client(mocker, {PREDICTIONS_PATH: json_response([], total=0)})
+    route_client(
+        mocker, {FEATURES_PATH: [json_response([], total=0)], PREDICTIONS_PATH: json_response([], total=0)}
+    )
 
     result = await handlers.action_pull_events(integration, pull_config)
 
-    assert result == {
-        "predictions_processed": 0,
-        "features_extracted": 0,
-        "events_sent": 0,
-        "since": result["since"],
-    }
+    assert result["features_read"] == 0
+    assert result["events_sent"] == 0
     assert captured_gundi == []
+
+
+@pytest.mark.asyncio
+async def test_an_empty_run_proves_the_token_still_works_before_calling_it_quiet(
+    mocker, integration, pull_config, captured_gundi, captured_state, no_activity_logs
+):
+    """The features endpoint accepts anonymous callers: an expired token gets a
+    200 carrying only the public Results, which for a private feed is zero
+    detections and no error. A run that found nothing has to rule that out."""
+    recorded = route_client(
+        mocker, {FEATURES_PATH: [json_response([], total=0)], PREDICTIONS_PATH: json_response([], total=0)}
+    )
+
+    await handlers.action_pull_events(integration, pull_config)
+
+    assert [r.url.path for r in recorded] == [FEATURES_PATH, PREDICTIONS_PATH]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_run_on_a_dead_token_fails_instead_of_looking_quiet(
+    mocker, integration, pull_config, captured_gundi, captured_state, no_activity_logs
+):
+    route_client(
+        mocker,
+        {FEATURES_PATH: [json_response([], total=0)], PREDICTIONS_PATH: httpx.Response(401, text="expired")},
+    )
+
+    with pytest.raises(IntegrationAuthError):
+        await handlers.action_pull_events(integration, pull_config)
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_sent_events_does_not_pay_for_the_token_probe(
+    mocker, integration, pull_config, captured_gundi, captured_state, no_activity_logs
+):
+    """Events arriving is itself proof the token reads private Results."""
+    recorded = route_client(mocker, {FEATURES_PATH: [json_response([feature(1)], total=1)]})
+
+    await handlers.action_pull_events(integration, pull_config)
+
+    assert [r.url.path for r in recorded] == [FEATURES_PATH]
 
 
 @pytest.mark.asyncio
 async def test_unplaceable_features_are_counted_as_read_but_not_sent(
     mocker, integration, pull_config, captured_gundi, captured_state, no_activity_logs
 ):
-    """`features_extracted` counts what the provider returned; `events_sent`
-    counts what reached Gundi. Collapsing them would hide the skips."""
+    """`features_read` counts what the provider returned; `events_sent` counts
+    what reached Gundi. Collapsing them would hide the skips."""
     placeless = feature(2)
+    placeless["geometry"] = None
+    route_client(mocker, {FEATURES_PATH: [json_response([feature(1), placeless], total=2)]})
+
+    result = await handlers.action_pull_events(integration, pull_config)
+
+    assert result["features_read"] == 2
+    assert result["events_sent"] == 1
+
+
+@pytest.mark.asyncio
+async def test_an_unplaceable_feature_still_advances_the_watermark(
+    mocker, integration, pull_config, captured_gundi, captured_state, no_activity_logs
+):
+    """It will never become an event, so re-reading it every run forever is
+    just work — and it would hold the cursor at its timestamp."""
+    placeless = feature(2, created_at="2026-09-06T00:00:00Z")
     placeless["geometry"] = None
     route_client(
         mocker,
         {
-            PREDICTIONS_PATH: json_response([prediction("pred-1", result_ids=["result-1"])], total=1),
-            features_path("result-1"): [json_response([feature(1), placeless], total=2)],
+            FEATURES_PATH: [json_response([placeless], total=1)],
+            PREDICTIONS_PATH: json_response([], total=0),
         },
     )
 
     result = await handlers.action_pull_events(integration, pull_config)
 
-    assert result["features_extracted"] == 2
-    assert result["events_sent"] == 1
+    assert result["watermark"].startswith("2026-09-06T00:00:00")
 
 
 @pytest.mark.asyncio
@@ -845,14 +995,16 @@ async def test_an_unparseable_stored_watermark_falls_back_to_the_lookback(
     """A corrupt state row should degrade to "re-read the lookback window", not
     wedge the integration."""
     captured_state[(str(integration.id), "pull_events", "no-source")] = {
-        "last_prediction_creation_time": "not-a-date",
-        "processed_prediction_ids": [],
+        "last_feature_created_at": "not-a-date",
+        "boundary_feature_ids": [],
     }
-    recorded = route_client(mocker, {PREDICTIONS_PATH: json_response([], total=0)})
+    recorded = route_client(
+        mocker, {FEATURES_PATH: [json_response([], total=0)], PREDICTIONS_PATH: json_response([], total=0)}
+    )
 
     await handlers.action_pull_events(integration, pull_config)
 
-    assert "creation_time" in json.loads(recorded[0].content)
+    assert "gte" in json.loads(recorded[0].content)["features"]["oe_created_at"]
 
 
 @pytest.mark.asyncio
@@ -861,3 +1013,68 @@ async def test_an_integration_with_no_auth_configured_says_so(integration, pull_
 
     with pytest.raises(IntegrationConfigurationError, match="authentication"):
         handlers.client_for(integration)
+
+
+# --------------------------------------------------------------------------
+# Watermark bookkeeping
+# --------------------------------------------------------------------------
+def test_the_boundary_list_resets_when_the_cursor_moves_on():
+    """Ids at an instant the cursor has passed are dead weight: `gte` on a
+    later timestamp already excludes them."""
+    watermark = handlers.Watermark()
+    watermark.advance(parsed(feature(1, created_at="2026-09-01T00:00:00Z")))
+    watermark.advance(parsed(feature(2, created_at="2026-09-01T00:00:00Z")))
+    assert watermark.boundary_ids == ["result-1:1", "result-1:2"]
+
+    watermark.advance(parsed(feature(3, created_at="2026-09-02T00:00:00Z")))
+    assert watermark.boundary_ids == ["result-1:3"]
+
+
+def test_overflowing_the_boundary_list_duplicates_rather_than_drops(mocker):
+    """When one second holds more detections than we remember, the forgotten
+    ids are re-read and re-sent next run. That is the direction to fail in: a
+    duplicate `external_source_id` is recoverable downstream, a detection that
+    was never sent is not."""
+    mocker.patch.object(handlers, "BOUNDARY_ID_MEMORY", 3)
+    watermark = handlers.Watermark()
+    for i in range(5):
+        watermark.advance(parsed(feature(i, created_at="2026-09-01T00:00:00Z")))
+
+    state = watermark.to_state()
+    assert state["boundary_feature_ids"] == ["result-1:2", "result-1:3", "result-1:4"]
+
+    # What the next run loads is the truncated list, so the forgotten ids come
+    # back as new work rather than vanishing.
+    resumed = handlers.Watermark(
+        watermark.created_at, state["boundary_feature_ids"]
+    )
+    forgotten = parsed(feature(0, created_at="2026-09-01T00:00:00Z"))
+    remembered = parsed(feature(4, created_at="2026-09-01T00:00:00Z"))
+    assert resumed.already_ingested(forgotten) is False
+    assert resumed.already_ingested(remembered) is True
+
+
+def test_two_results_sharing_a_feature_id_are_two_detections():
+    """Feature ids are unique within a Prediction Result, not across them, and
+    one search now spans many Results at once. Keyed on the bare id, feature 1
+    of result-2 would be mistaken for feature 1 of result-1 and dropped as
+    already ingested — a detection lost to a numbering coincidence."""
+    watermark = handlers.Watermark()
+    first = parsed(feature(1, result_id="result-1"))
+    second = parsed(feature(1, result_id="result-2"))
+
+    watermark.advance(first)
+
+    assert watermark.already_ingested(first) is True
+    assert watermark.already_ingested(second) is False
+
+
+def test_a_feature_with_no_created_at_cannot_move_the_cursor():
+    """It is still sent — it just cannot advance a cursor defined in terms of a
+    field it does not carry."""
+    record = feature(1)
+    record["properties"].pop("oe_created_at")
+    watermark = handlers.Watermark()
+    watermark.advance(parsed(record))
+
+    assert watermark.created_at is None

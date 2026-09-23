@@ -10,19 +10,36 @@ Three actions, in `app/actions/`:
 | --- | --- | --- |
 | `auth` | auth | Validates the API token by asking the predictions search for one record. |
 | `list_predictions` | reference | Populates a portal dropdown of predictions, newest first. |
-| `pull_events` | pull (every 4h) | The ingest. Predictions → features → Gundi events. |
+| `pull_events` | pull (every 4h) | The ingest. Detections → Gundi events. |
 
 ### The ingest
 
-The API splits *what the model ran on* from *what it found*, so a run is two
-searches deep:
+One request per run, against the endpoint OlmoEarth added for external pollers
+([olmoearth_studio#3226](https://github.com/allenai/olmoearth_studio/pull/3226)):
 
 ```
-POST /api/v1/predictions/search                                  new predictions for a model
-  -> a prediction's result ids                                   client.result_ids_for
-    -> POST /api/v1/prediction-results/{id}/features/search       GeoJSON detections, paged
-      -> Gundi events                                            one event per feature
+POST /api/v1/prediction-results/features/search    GeoJSON detections, paged
+  -> Gundi events                                  one event per feature
 ```
+
+The body has two halves and the split matters:
+
+- **`prediction_results`** picks *which* Prediction Results to read — by model,
+  project, organization or target area. This is the half OlmoEarth
+  access-controls: it resolves the filters to the set of Results the token may
+  read and scopes the feature query to it. `PullEventsConfig` requires at least
+  one of those four, because an unscoped search returns every Result the token
+  can see, and past a thousand Results the provider answers 400 rather than
+  truncating.
+- **`features`** filters the detections within those Results — the watermark,
+  the area of interest, a confidence threshold — and carries the sort and
+  paging.
+
+`features.oe_prediction_result_id` is deliberately not a field on
+`client.FeatureFilters`. The server derives that filter from
+`prediction_results`, that derivation *is* the access control, and a
+caller-supplied value is rejected with a 422. Leaving it off the model makes it
+unreachable rather than merely discouraged.
 
 Each feature becomes one Gundi event: `oe_start_time` is the `recorded_at`
 (when the model saw the thing, not when the record was written), the geometry's
@@ -33,48 +50,54 @@ rather than mixed in.
 
 ### Incremental runs
 
-The watermark is at the **prediction** level, not the feature level. A
-prediction is the unit the provider publishes, so the state row records the
-newest ingested `creation_time` plus a bounded list of recently-ingested
-prediction ids, and each new prediction is drained in full.
+The watermark is `oe_created_at` on the features themselves, which arrives in
+the same response as the detections. Three details keep it honest:
 
-Two consequences worth knowing:
+- The cursor is `gte`, not `gt`. A bulk-inserted Result stamps thousands of
+  features with one `oe_created_at`; if some of them are indexed after a run
+  has already read that second and moved past it, `gt` would never see them
+  again. `gte` re-reads the boundary second every run.
+- `boundary_feature_ids` is what stops that re-read becoming duplicate events:
+  the ids already ingested at exactly the watermark second. It is bounded, and
+  overflowing it re-sends detections rather than losing them — a duplicate
+  `external_source_id` is recoverable downstream, a detection that was never
+  sent is not.
+- Those ids are *qualified* — `result-1:7`, the same string the event carries
+  as its `external_source_id`. A bare feature id is unique only within its
+  Prediction Result, and one search now spans many at once, so keying on it
+  would drop feature 1 of the second Result as a duplicate of feature 1 of the
+  first.
 
-- The predictions search is bounded with `creation_time >= watermark`, not `>`,
-  so a prediction created in the same second as the watermark is not skipped.
-  The processed-id list is what stops it being ingested twice.
-- State is saved after *each* prediction, so a run that fails on the fifth of
-  six does not re-send the first four.
+State is saved after each batch of events, so a run that fails on the fifth
+batch of six does not re-send the first four.
 
-A feature-level watermark was the obvious alternative and is the wrong shape: a
-bulk-inserted result gives thousands of features an identical `oe_created_at`,
-and a `>` cursor on that field silently drops everything sharing the boundary
-second.
+Paging forces `sort_by=oe_created_at, sort_direction=asc` regardless of what
+the caller asked for, because offset paging over a descending sort skips a
+record whenever one is written mid-walk.
 
-Feature paging forces `sort_by=oe_created_at, sort_direction=asc` regardless of
-what the caller asked for, because offset paging over a descending sort skips a
-record whenever one is inserted mid-walk.
+### The area of interest goes on the features, not the Results
 
-### Open questions
+`prediction_results.prediction_intersects_geometry` exists and looks like the
+right place for it, but it matches through registered Areas only: a Prediction
+created from an uploaded GeoJSON keeps its footprint in a file rather than an
+Area row, so its detections never match. Enforcing an AOI there would silently
+drop exactly the detections nobody would think to look for. The AOI is applied
+to `features.intersects_geometry`, which is exact — and, now that the ingest is
+a single request, free. **Target Area ID** is the separate, explicit setting
+for pruning by registered Area.
 
-Two things in here are guesses, both marked `TODO` in the code:
+### An empty run is ambiguous, so it is checked
 
-1. **How a prediction names its result ids.** The features endpoint is keyed by
-   `prediction_result_id`, but the only documented way to find work is the
-   predictions search, which returns predictions — and the predictions response
-   schema was not part of the API sample this was written from.
-   `client.result_ids_for` probes the plausible field names and falls back to
-   assuming the prediction id *is* the result id. If that turns out to need a
-   third request (`GET /predictions/{id}/results`), it becomes a client method
-   and nothing else changes.
-2. **Area filtering on the predictions search.** Until it lands, the configured
-   area of interest is applied one level down, on the features search. Same
-   events, one extra round trip per prediction. See the `TODO(area filtering)`
-   in `build_prediction_query`.
+The features endpoint is `optional_auth` on the provider's side: an invalid or
+expired token does not 401, it degrades the caller to anonymous and returns
+only the Results marked public. For a private feed that is zero detections and
+no error — indistinguishable from a quiet day.
 
-Smaller ones: the prediction `status` value to treat as "ready" defaults to
-`completed`, and the confidence property a model writes is configurable because
-models disagree on whether it is `confidence` or `score`.
+So a run that sent no events makes one extra request to
+`/api/v1/predictions/search`, which does require a real user, before reporting
+nothing new. A dead token fails the action as an auth problem instead of
+looking like a quiet day for as long as nobody checks. The `auth` action
+validates against that same endpoint, for the same reason.
 
 ## Usage
 - Fork this repo
