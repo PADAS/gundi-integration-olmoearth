@@ -2,13 +2,17 @@
 
 Two endpoints carry this integration:
 
-  POST /api/v1/predictions/search
-      Finds prediction runs — filtered by model, project, organization and
-      creation time — newest first.
+  POST /api/v1/prediction-results/features/search
+      The ingest. Returns GeoJSON detections from every Prediction Result the
+      token can read, in one request. The body has two halves: ``prediction_
+      results`` picks *which* results to read (by model, project, area, time)
+      and is where the server enforces access control; ``features`` filters the
+      detections within them (geometry, observation window, arbitrary
+      properties) and carries the sort and paging.
 
-  POST /api/v1/prediction-results/{prediction_result_id}/features/search
-      Returns the GeoJSON features a prediction produced, filtered by
-      geometry, observation window and arbitrary feature properties.
+  POST /api/v1/predictions/search
+      Prediction runs — what the portal dropdown lists, and the request the
+      auth action uses to prove a token works.
 
 Every filter the API accepts is an object of comparison operators
 (``{"eq": ...}``, ``{"gte": ...}``) and every operator is optional. The models
@@ -17,6 +21,12 @@ so an operator we did not set is absent from the body rather than sent as an
 empty string: the documented sample shows ``{"eq": ""}``, but sent literally
 that asks for records whose field equals the empty string, which matches
 nothing.
+
+The features endpoint is `optional_auth` on the provider's side: an invalid or
+expired token does not 401, it degrades the caller to anonymous and returns
+only Results marked public. Nothing here can tell that apart from "no new
+detections", so the pull action confirms the token against the predictions
+search — which does require auth — before reporting an empty run.
 """
 import logging
 from datetime import datetime
@@ -33,15 +43,15 @@ from app.services.errors import (
     IntegrationConnectionError,
     IntegrationRateLimitError,
 )
-from app.services.utils import find_config_for_action
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
 
-# The API caps a page at some size we don't know yet; 50 is what the documented
-# sample sends for features and 100 for predictions. Stay at those defaults.
-DEFAULT_FEATURE_PAGE_SIZE = 50
+# The provider's feature page defaults to 50 if the caller says nothing, which
+# is small enough to turn one poll into hundreds of round trips. Always send a
+# size; these are what we send when the config does not override them.
+DEFAULT_FEATURE_PAGE_SIZE = 500
 DEFAULT_PREDICTION_PAGE_SIZE = 100
 
 # A runaway query (an AOI covering a continent, a model that emits millions of
@@ -175,22 +185,71 @@ class PredictionSearchRequest(_SearchRequest):
     status: Optional[KeywordFilter] = None
     workflow_type: Optional[KeywordFilter] = None
     creation_time: Optional[DatetimeFilter] = None
+    start_time: Optional[DatetimeFilter] = None
+    end_time: Optional[DatetimeFilter] = None
+    target_area_id: Optional[KeywordFilter] = None
+    intersects_geometry: Optional[Geometry] = None
     deleted_time: Optional[DatetimeFilter] = None
 
 
-class FeatureSearchRequest(_SearchRequest):
+class PredictionResultFilters(_SearchRequest):
+    """The `prediction_results` half: which Results the feature search reads.
+
+    This is the access-controlled half — the server turns these filters into
+    the set of Result ids the token may read and scopes the feature query to
+    it. An empty object is legal and means "everything this token can see",
+    which for a service user in a single-project organization is a reasonable
+    feed and for anything wider is a mistake; `PullEventsConfig` requires at
+    least one scope rather than relying on that.
+
+    `prediction_deleted_time` is deliberately absent: the provider defaults it
+    to `exists=false`, which excludes the Results of soft-deleted Predictions,
+    and that is the behaviour an ingest wants.
+    """
+
+    id: Optional[KeywordFilter] = None
+    organization_id: Optional[KeywordFilter] = None
+    access_level: Optional[KeywordFilter] = None
+    creation_time: Optional[DatetimeFilter] = None
+    updated_time: Optional[DatetimeFilter] = None
+    prediction_model_id: Optional[KeywordFilter] = None
+    prediction_project_id: Optional[KeywordFilter] = None
+    prediction_target_area_id: Optional[KeywordFilter] = None
+    prediction_start_time: Optional[DatetimeFilter] = None
+    prediction_end_time: Optional[DatetimeFilter] = None
+    prediction_intersects_geometry: Optional[Geometry] = None
+
+
+class FeatureFilters(_SearchRequest):
+    """The `features` half: which detections to return from those Results.
+
+    `oe_prediction_result_id` is *not* a field here, and its absence is the
+    point. The server derives that filter from `prediction_results` — that
+    derivation is the access control — and rejects a caller-supplied value with
+    a 422 rather than honouring or silently overwriting it. Leaving it off the
+    model means this connector cannot send one by accident.
+    """
+
     limit: int = DEFAULT_FEATURE_PAGE_SIZE
     offset: int = 0
     sort_by: str = "oe_created_at"
-    sort_direction: str = "desc"
+    sort_direction: str = "asc"
     id: Optional[KeywordFilter] = None
     intersects_geometry: Optional[Geometry] = None
-    oe_prediction_result_id: Optional[KeywordFilter] = None
     oe_prediction_result_file_id: Optional[KeywordFilter] = None
     oe_start_time: Optional[DatetimeFilter] = None
     oe_end_time: Optional[DatetimeFilter] = None
     oe_created_at: Optional[DatetimeFilter] = None
     property_filters: Optional[List[PropertyFilter]] = None
+
+
+class FeatureSearchRequest(_SearchRequest):
+    """The whole body of a cross-Result feature search."""
+
+    prediction_results: PredictionResultFilters = pydantic.Field(
+        default_factory=PredictionResultFilters
+    )
+    features: FeatureFilters = pydantic.Field(default_factory=FeatureFilters)
 
 
 # --------------------------------------------------------------------------
@@ -212,12 +271,7 @@ class ApiError(pydantic.BaseModel):
 
 
 class Prediction(pydantic.BaseModel):
-    """One prediction run.
-
-    Only `id` is required. The rest is what the documented filters imply the
-    record carries; `extra = "allow"` keeps every field we did not model, which
-    is what `result_ids_for` reads to find the prediction's result ids.
-    """
+    """One prediction run, as the dropdown and the auth check see it."""
 
     id: str
     name: Optional[str] = None
@@ -268,7 +322,8 @@ class Feature(pydantic.BaseModel):
     (`"id": 1`) while the documented request filters the same field as a
     keyword (`{"eq": ""}`). Picking one here means a feature's identity does not
     change type depending on which end of the API it came from — which matters,
-    because it ends up in the event's `external_source_id`.
+    because it ends up in the event's `external_source_id` and in the state
+    row that stops a detection being ingested twice.
     """
 
     id: Optional[str] = None
@@ -300,60 +355,6 @@ class FeatureSearchResponse(pydantic.BaseModel):
 
 
 # --------------------------------------------------------------------------
-# Resolving a prediction's result ids
-# --------------------------------------------------------------------------
-# Keys the prediction record might use to name its results. The predictions
-# search response schema was not part of the API sample this connector was
-# written from, so we probe rather than assume.
-_RESULT_ID_KEYS = ("prediction_result_ids", "result_ids", "prediction_results", "results")
-
-
-def result_ids_for(prediction: Prediction) -> List[str]:
-    """The prediction-result ids whose features belong to `prediction`.
-
-    The features endpoint is keyed by `prediction_result_id`, but the only
-    documented way to *find* work is the predictions search, which returns
-    predictions. Nothing in the documented sample links the two, so this is the
-    one seam in the connector that is a guess:
-
-      1. If the record names its results under any of `_RESULT_ID_KEYS` —
-         either as bare ids or as objects with an `id` — use those.
-      2. Otherwise fall back to the prediction's own id, which is correct if
-         the two identifiers are the same value.
-
-    TODO(confirm with the OlmoEarth team): whether a prediction has one result
-    or many, and which field names them. When the answer arrives, this function
-    is the only thing that changes — and if it turns out to need a third
-    request (e.g. `GET /predictions/{id}/results`), it becomes a client method
-    and `_collect_result_ids` in handlers.py awaits it instead.
-    """
-    extras = prediction.dict(exclude_none=True)
-    for key in _RESULT_ID_KEYS:
-        value = extras.get(key)
-        if not value:
-            continue
-        if isinstance(value, str):
-            return [value]
-        if isinstance(value, list):
-            ids = []
-            for item in value:
-                if isinstance(item, str):
-                    ids.append(item)
-                elif isinstance(item, dict) and item.get("id"):
-                    ids.append(str(item["id"]))
-            if ids:
-                return ids
-    logger.warning(
-        "Prediction %s names no prediction-result ids under any of %s; assuming the "
-        "prediction id is also its result id. If the features search 404s, this "
-        "assumption is what is wrong.",
-        prediction.id,
-        ", ".join(_RESULT_ID_KEYS),
-    )
-    return [prediction.id]
-
-
-# --------------------------------------------------------------------------
 # Client
 # --------------------------------------------------------------------------
 class OlmoEarthClient:
@@ -362,6 +363,9 @@ class OlmoEarthClient:
     Use as an async context manager so the underlying connection pool is closed
     even when an action raises partway through paging.
     """
+
+    FEATURES_PATH = "/api/v1/prediction-results/features/search"
+    PREDICTIONS_PATH = "/api/v1/predictions/search"
 
     def __init__(
         self,
@@ -462,35 +466,31 @@ class OlmoEarthClient:
 
     # -- endpoints ---------------------------------------------------------
     async def search_predictions(self, request: PredictionSearchRequest) -> PredictionSearchResponse:
-        path = "/api/v1/predictions/search"
-        payload = await self._post(path, request.as_body())
-        return self._parse(PredictionSearchResponse, payload, path)
+        payload = await self._post(self.PREDICTIONS_PATH, request.as_body())
+        return self._parse(PredictionSearchResponse, payload, self.PREDICTIONS_PATH)
 
-    async def search_features(
-        self, prediction_result_id: str, request: FeatureSearchRequest
-    ) -> FeatureSearchResponse:
-        path = f"/api/v1/prediction-results/{prediction_result_id}/features/search"
-        payload = await self._post(path, request.as_body())
-        return self._parse(FeatureSearchResponse, payload, path)
+    async def search_features(self, request: FeatureSearchRequest) -> FeatureSearchResponse:
+        payload = await self._post(self.FEATURES_PATH, request.as_body())
+        return self._parse(FeatureSearchResponse, payload, self.FEATURES_PATH)
 
     # -- paging ------------------------------------------------------------
     async def iter_features(
-        self, prediction_result_id: str, request: FeatureSearchRequest, max_features: Optional[int] = None
+        self, request: FeatureSearchRequest, max_features: Optional[int] = None
     ) -> AsyncIterator[Feature]:
         """Yield every feature matching `request`, a page at a time.
 
-        Paging is by offset, so it sorts ascending by `oe_created_at`: with the
-        `desc` default a feature created between two requests shifts every
-        later record one slot forward and the walk skips one. Ascending order
-        only ever appends beyond the window already read.
+        Paging is by offset, so it forces ascending order on `oe_created_at`:
+        with a descending sort a feature written between two requests shifts
+        every later record one slot forward and the walk skips one. Ascending
+        order only ever appends beyond the window already read.
         """
         request = request.copy(deep=True)
-        request.sort_by = "oe_created_at"
-        request.sort_direction = "asc"
-        request.offset = request.offset or 0
+        request.features.sort_by = "oe_created_at"
+        request.features.sort_direction = "asc"
+        request.features.offset = request.features.offset or 0
         yielded = 0
-        for page in range(MAX_PAGES):
-            response = await self.search_features(prediction_result_id, request)
+        for _ in range(MAX_PAGES):
+            response = await self.search_features(request)
             if not response.records:
                 return
             for feature in response.records:
@@ -498,23 +498,21 @@ class OlmoEarthClient:
                 yielded += 1
                 if max_features is not None and yielded >= max_features:
                     logger.info(
-                        "Stopped at the %s-feature cap for prediction result %s; "
-                        "the provider reported %s in total.",
-                        max_features, prediction_result_id, response.meta.total,
+                        "Stopped at the %s-feature cap; the provider reported %s in total.",
+                        max_features, response.meta.total,
                     )
                     return
             # A short page is the last page. `meta.total` is a second, cheaper
             # stop for a provider that always fills the page.
-            if len(response.records) < request.limit:
+            if len(response.records) < request.features.limit:
                 return
-            request.offset += request.limit
-            if response.meta.total is not None and request.offset >= response.meta.total:
+            request.features.offset += request.features.limit
+            if response.meta.total is not None and request.features.offset >= response.meta.total:
                 return
         logger.warning(
-            "Stopped paging features for prediction result %s after %s pages "
-            "(%s features). Narrow the query — by area, time window or a property "
-            "filter — to see the rest.",
-            prediction_result_id, MAX_PAGES, yielded,
+            "Stopped paging features after %s pages (%s features). Narrow the query "
+            "— by area, model, time window or a property filter — to see the rest.",
+            MAX_PAGES, yielded,
         )
 
 
@@ -538,6 +536,18 @@ def _classify_status_error(exc: httpx.HTTPStatusError):
     if status == 429:
         return IntegrationRateLimitError(
             f"OlmoEarth rate-limited the request. {detail}".strip(), status_code=status
+        )
+    if status == 400 and "Prediction Results" in detail:
+        # The provider caps how many Prediction Results one feature search may
+        # span and refuses rather than truncating, because a partial feature
+        # set is indistinguishable from a complete one. That is a scope this
+        # integration chose, so say which knobs narrow it.
+        return IntegrationConfigurationError(
+            "This integration's filters match more Prediction Results than "
+            "OlmoEarth will search at once. Narrow it with an area of interest, "
+            "a model, a project, or a shorter lookback. "
+            f"{detail}".strip(),
+            status_code=status,
         )
     if status == 404:
         return IntegrationBadResponseError(

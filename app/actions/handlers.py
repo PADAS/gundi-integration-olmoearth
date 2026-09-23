@@ -1,19 +1,27 @@
 """Action handlers for the OlmoEarth integration.
 
-The ingest is two searches deep, because the API splits "what did the model
-run on?" from "what did it find?":
+The ingest is one request deep. OlmoEarth resolves which Prediction Results the
+token may read from the `prediction_results` filters and queries the feature
+index once, so a run is:
 
-    predictions/search                      -> the prediction runs for a model
-      -> (a prediction's result ids)        -> see client.result_ids_for
-        -> prediction-results/{id}/features/search  -> the GeoJSON detections
-          -> Gundi events
+    prediction-results/features/search   -> GeoJSON detections, paged
+      -> Gundi events                    -> one event per feature
 
-A run is incremental at the *prediction* level rather than the feature level: a
-prediction is the unit the provider publishes, so the watermark records which
-predictions have been ingested and each new one is drained in full. That also
-sidesteps the trap in a feature-level watermark — a bulk-inserted result gives
-thousands of features the same `oe_created_at`, so a `>` cursor on that field
-drops whatever shares the boundary second.
+The watermark is `oe_created_at` on the features themselves, carried in the
+response of that same request. Two details keep it from dropping detections:
+
+  * The filter is `gte`, not `gt`. A bulk-inserted Result gives thousands of
+    features an identical `oe_created_at`; if some of them are indexed after a
+    run has already read that second and moved past it, `gt` would never see
+    them again. `gte` re-reads the boundary second every run.
+  * `boundary_feature_ids` is what stops that re-read becoming duplicate
+    events: the ids of the features already ingested at exactly the watermark
+    second. It is bounded, and overflowing it re-sends detections rather than
+    losing them.
+
+Paging forces `sort_by=oe_created_at, sort_direction=asc` regardless of what
+the caller asked for, because offset paging over a descending sort skips a
+record whenever one is written mid-walk.
 """
 import datetime
 import logging
@@ -33,7 +41,6 @@ from app.services.utils import find_config_for_action
 from .configurations import (
     AuthenticateConfig,
     ListPredictionsConfig,
-    PredictionSelection,
     PullEventsConfig,
 )
 
@@ -43,11 +50,12 @@ state_manager = IntegrationStateManager()
 
 PULL_EVENTS_ACTION_ID = "pull_events"
 
-# How many recently-ingested prediction ids to remember. The prediction search
-# filters `creation_time >= watermark` (not `>`), so predictions sharing the
-# watermark second come back every run; this list is what recognises them.
-# Bounded so the state row cannot grow without limit.
-PROCESSED_ID_MEMORY = 200
+# How many feature ids to remember at the watermark second. The feature search
+# is bounded with `oe_created_at >= watermark` (not `>`), so everything sharing
+# that second comes back every run; this list is what recognises it. Bounded so
+# the state row cannot grow without limit — and when a single second holds more
+# detections than this, the overflow is re-sent rather than dropped.
+BOUNDARY_ID_MEMORY = 5_000
 
 
 # --------------------------------------------------------------------------
@@ -75,58 +83,53 @@ def client_for(integration, auth_config: Optional[AuthenticateConfig] = None) ->
 # --------------------------------------------------------------------------
 # Query construction
 # --------------------------------------------------------------------------
-def build_prediction_query(
-    config: PullEventsConfig, since: datetime.datetime, limit: Optional[int] = None
-) -> client.PredictionSearchRequest:
-    """The predictions search for this run.
+def build_feature_search(
+    config: PullEventsConfig, since: datetime.datetime
+) -> client.FeatureSearchRequest:
+    """The one search a run makes.
 
-    `creation_time` is bounded with `gte`, not `gt`: a prediction created in the
-    same second as the watermark would otherwise be skipped. Re-seeing the
-    boundary prediction is handled by the processed-id list instead.
+    The scope half narrows which Prediction Results are read; the feature half
+    carries the watermark, the area of interest and any confidence threshold.
+
+    The area of interest goes on the *features*, not on
+    `prediction_intersects_geometry`. The Result-level geometry filter matches
+    through registered Areas only — a Prediction created from an uploaded
+    GeoJSON keeps its footprint in a file and never matches — so using it to
+    enforce an AOI would silently drop exactly the detections nobody would
+    think to look for. `target_area_id` is the field for pruning by area, and
+    it is a separate, explicit setting.
     """
-    request = client.PredictionSearchRequest(
-        sort_by="creation_time",
-        sort_direction="desc",
-        limit=limit or client.DEFAULT_PREDICTION_PAGE_SIZE,
-        model_id=client.KeywordFilter(eq=config.model_id),
-        creation_time=client.DatetimeFilter(gte=since),
-    )
+    scope = client.PredictionResultFilters()
+    if config.model_id:
+        scope.prediction_model_id = client.KeywordFilter(eq=config.model_id)
     if config.project_id:
-        request.project_id = client.KeywordFilter(eq=config.project_id)
+        scope.prediction_project_id = client.KeywordFilter(eq=config.project_id)
     if config.organization_id:
-        request.organization_id = client.OrganizationFilter(eq=config.organization_id)
-    if config.prediction_status:
-        request.status = client.KeywordFilter(eq=config.prediction_status)
-    # TODO(area filtering): the predictions search is gaining geometry and time
-    # filters. Once it has them, `config.area_of_interest` belongs here too, so
-    # a prediction covering no part of the AOI is never opened at all. Until
-    # then the AOI is applied one level down, on the features search, which
-    # gives the same events for one extra round trip per prediction.
-    return request
+        scope.organization_id = client.KeywordFilter(eq=config.organization_id)
+    if config.target_area_id:
+        scope.prediction_target_area_id = client.KeywordFilter(eq=config.target_area_id)
 
-
-def build_feature_query(config: PullEventsConfig) -> client.FeatureSearchRequest:
-    """The features search shared by every prediction result in this run.
-
-    Sort order and offset are set by `iter_features`, which owns the paging.
-    """
-    request = client.FeatureSearchRequest(limit=config.feature_page_size)
+    features = client.FeatureFilters(
+        limit=config.feature_page_size,
+        oe_created_at=client.DatetimeFilter(gte=since),
+    )
     if config.area_of_interest:
         try:
-            request.intersects_geometry = client.Geometry.parse_obj(config.area_of_interest)
+            features.intersects_geometry = client.Geometry.parse_obj(config.area_of_interest)
         except pydantic.ValidationError as e:
             raise IntegrationConfigurationError(
                 "The configured area of interest is not a valid GeoJSON geometry; "
                 "it needs a `type` and matching `coordinates`."
             ) from e
     if config.min_confidence is not None:
-        request.property_filters = [
+        features.property_filters = [
             client.PropertyFilter(
                 property_name=config.confidence_property,
                 numeric_filter=client.NumericFilter(gte=config.min_confidence),
             )
         ]
-    return request
+
+    return client.FeatureSearchRequest(prediction_results=scope, features=features)
 
 
 # --------------------------------------------------------------------------
@@ -172,12 +175,7 @@ def centroid_of(feature: client.Feature) -> Optional[Dict[str, float]]:
 # --------------------------------------------------------------------------
 # Transformation
 # --------------------------------------------------------------------------
-def transform_feature(
-    feature: client.Feature,
-    prediction: client.Prediction,
-    prediction_result_id: str,
-    config: PullEventsConfig,
-) -> Optional[dict]:
+def transform_feature(feature: client.Feature, config: PullEventsConfig) -> Optional[dict]:
     """One OlmoEarth feature as one Gundi event, or None if it cannot be placed.
 
     `recorded_at` is the observation's own `oe_start_time` — when the model saw
@@ -189,9 +187,9 @@ def transform_feature(
     location = centroid_of(feature)
     if not location:
         logger.warning(
-            "Skipping feature %s from prediction result %s: it carries no geometry "
-            "or bounding box, so it cannot be placed on a map.",
-            feature.id, prediction_result_id,
+            "Skipping feature %s: it carries no geometry or bounding box, so it "
+            "cannot be placed on a map.",
+            feature.id,
         )
         return None
 
@@ -199,62 +197,144 @@ def transform_feature(
     recorded_at = properties.oe_start_time or properties.oe_created_at
     if not recorded_at:
         logger.warning(
-            "Skipping feature %s from prediction result %s: it has neither "
-            "oe_start_time nor oe_created_at, and an event needs a timestamp.",
-            feature.id, prediction_result_id,
+            "Skipping feature %s: it has neither oe_start_time nor oe_created_at, "
+            "and an event needs a timestamp.",
+            feature.id,
         )
         return None
 
     event_details = properties.model_properties()
-    event_details.update(
-        {
-            "prediction_id": prediction.id,
-            "prediction_result_id": properties.oe_prediction_result_id or prediction_result_id,
-            "feature_id": feature.id,
-        }
-    )
+    event_details["feature_id"] = feature.id
+    if properties.oe_prediction_result_id:
+        event_details["prediction_result_id"] = properties.oe_prediction_result_id
     if properties.oe_prediction_result_file_id:
         event_details["prediction_result_file_id"] = properties.oe_prediction_result_file_id
-    if prediction.model_id:
-        event_details["model_id"] = prediction.model_id
-    if prediction.name:
-        event_details["prediction_name"] = prediction.name
+    if config.model_id:
+        event_details["model_id"] = config.model_id
     if properties.oe_end_time:
         event_details["observation_end_time"] = properties.oe_end_time.isoformat()
     if properties.oe_created_at:
         event_details["detected_at"] = properties.oe_created_at.isoformat()
 
     event = {
-        "title": _event_title(feature, prediction, config),
+        "title": _event_title(feature, config),
         "event_type": config.event_type,
         "recorded_at": recorded_at.isoformat(),
         "location": location,
         "event_details": event_details,
         # Stable across runs, so a redelivered feature is recognisable as the
         # same detection rather than a second one.
-        "external_source_id": external_id_for(feature, prediction_result_id),
+        "external_source_id": external_id_for(feature),
     }
     if config.include_geometry and feature.geometry:
         event["geometry"] = feature.geometry.dict(exclude_none=True)
     return event
 
 
-def external_id_for(feature: client.Feature, prediction_result_id: str) -> str:
-    """A feature id is only unique within its prediction result, so qualify it."""
-    return f"{prediction_result_id}:{feature.id}"
+def external_id_for(feature: client.Feature) -> str:
+    """A feature id is only unique within its Prediction Result, so qualify it.
+
+    A cross-Result search returns features from many Results at once, which is
+    exactly when an unqualified id would collide. The Result id travels on the
+    feature's own properties, so no extra lookup is needed for it.
+    """
+    result_id = feature.properties.oe_prediction_result_id
+    return f"{result_id}:{feature.id}" if result_id else str(feature.id)
 
 
-def _event_title(feature: client.Feature, prediction: client.Prediction, config: PullEventsConfig) -> str:
-    label = prediction.name or prediction.model_id or "OlmoEarth"
+def _event_title(feature: client.Feature, config: PullEventsConfig) -> str:
+    label = config.event_title_prefix or "OlmoEarth"
     return f"{label} detection {feature.id}" if feature.id is not None else f"{label} detection"
 
 
 # --------------------------------------------------------------------------
 # State
 # --------------------------------------------------------------------------
-async def _load_watermark(integration_id: str) -> Tuple[Optional[datetime.datetime], List[str]]:
+class Watermark:
+    """How far the ingest has read, and what it has already sent at that instant.
+
+    `created_at` is the newest `oe_created_at` ingested. `boundary_ids` are the
+    features already sent carrying exactly that timestamp — the set the next
+    run's `gte` re-read has to subtract.
+
+    A boundary id is the *qualified* id, the same `external_source_id` the
+    event carries. A raw feature id is only unique within its Prediction
+    Result, and one search now spans many Results at once: keyed on the bare
+    id, feature 1 of result-2 would look like feature 1 of result-1 and be
+    dropped as already ingested.
+    """
+
+    def __init__(
+        self,
+        created_at: Optional[datetime.datetime] = None,
+        boundary_ids: Optional[List[str]] = None,
+    ):
+        self.created_at = created_at
+        self.boundary_ids = list(boundary_ids or [])
+        self._boundary_lookup = set(self.boundary_ids)
+        self.overflowed = False
+
+    def already_ingested(self, feature: client.Feature) -> bool:
+        """True for a feature this watermark has already accounted for."""
+        created = feature.properties.oe_created_at
+        if self.created_at is None or created is None:
+            return False
+        return (
+            _as_utc(created) == self.created_at
+            and external_id_for(feature) in self._boundary_lookup
+        )
+
+    def advance(self, feature: client.Feature) -> None:
+        """Record that `feature` has been ingested."""
+        created = feature.properties.oe_created_at
+        if created is None:
+            # Nothing to advance to. The feature is still sent; it just cannot
+            # move a cursor that is defined in terms of a field it lacks.
+            return
+        created = _as_utc(created)
+        feature_id = external_id_for(feature)
+        if self.created_at is None or created > self.created_at:
+            self.created_at = created
+            self.boundary_ids = [feature_id]
+            self._boundary_lookup = {feature_id}
+            return
+        if created == self.created_at:
+            if feature_id not in self._boundary_lookup:
+                self.boundary_ids.append(feature_id)
+                self._boundary_lookup.add(feature_id)
+
+    def to_state(self) -> dict:
+        """The persisted form, with the boundary list bounded.
+
+        Truncation is deliberately in the duplicate direction: a forgotten id
+        at the boundary second is re-read and re-sent next run, where a `gt`
+        cursor would have skipped it silently. Gundi sees the same
+        `external_source_id` twice, which is recoverable; a missing detection
+        is not.
+        """
+        boundary = self.boundary_ids
+        if len(boundary) > BOUNDARY_ID_MEMORY:
+            if not self.overflowed:
+                logger.warning(
+                    "More than %s features share the watermark second %s; only the "
+                    "most recent %s are remembered, so the rest may be re-sent next "
+                    "run as duplicate events with the same external_source_id.",
+                    BOUNDARY_ID_MEMORY,
+                    self.created_at.isoformat() if self.created_at else None,
+                    BOUNDARY_ID_MEMORY,
+                )
+                self.overflowed = True
+            boundary = boundary[-BOUNDARY_ID_MEMORY:]
+        return {
+            "last_feature_created_at": self.created_at.isoformat() if self.created_at else None,
+            "boundary_feature_ids": boundary,
+            "updated_at": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
+        }
+
+
+async def _load_watermark(integration_id: str) -> Watermark:
     state = await state_manager.get_state(integration_id, PULL_EVENTS_ACTION_ID) or {}
-    last_seen = state.get("last_prediction_creation_time")
+    last_seen = state.get("last_feature_created_at")
     parsed = None
     if last_seen:
         try:
@@ -265,22 +345,12 @@ async def _load_watermark(integration_id: str) -> Tuple[Optional[datetime.dateti
                 "to the configured lookback.",
                 last_seen, integration_id,
             )
-    return parsed, list(state.get("processed_prediction_ids") or [])
+    return Watermark(parsed, state.get("boundary_feature_ids") or [])
 
 
-async def _save_watermark(
-    integration_id: str,
-    watermark: Optional[datetime.datetime],
-    processed_ids: List[str],
-) -> None:
+async def _save_watermark(integration_id: str, watermark: Watermark) -> None:
     await state_manager.set_state(
-        integration_id,
-        PULL_EVENTS_ACTION_ID,
-        {
-            "last_prediction_creation_time": watermark.isoformat() if watermark else None,
-            "processed_prediction_ids": processed_ids[:PROCESSED_ID_MEMORY],
-            "updated_at": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
-        },
+        integration_id, PULL_EVENTS_ACTION_ID, watermark.to_state()
     )
 
 
@@ -301,9 +371,11 @@ def _as_utc(value: datetime.datetime) -> datetime.datetime:
 async def action_auth(integration, action_config: AuthenticateConfig) -> dict:
     """Check that the token and site URL actually reach the OlmoEarth API.
 
-    The cheapest request that proves both is a predictions search asking for a
-    single record: it exercises the same host, path prefix and bearer token the
-    pull action uses, and an empty result is still a successful answer.
+    This asks the *predictions* search rather than the features search the
+    pull action uses, and that is on purpose: the features endpoint accepts
+    anonymous callers, so a dead token would come back 200 with the public
+    Results instead of a 401. The predictions search requires a real user, so
+    it gives a straight answer about the token.
     """
     logger.info(f"Executing auth action for integration {integration.id}...")
     async with client_for(integration, action_config) as api:
@@ -330,6 +402,8 @@ async def action_list_predictions(integration, action_config: ListPredictionsCon
         request.model_id = client.KeywordFilter(eq=action_config.model_id)
     if action_config.project_id:
         request.project_id = client.KeywordFilter(eq=action_config.project_id)
+    if action_config.target_area_id:
+        request.target_area_id = client.KeywordFilter(eq=action_config.target_area_id)
     if action_config.status:
         request.status = client.KeywordFilter(eq=action_config.status)
 
@@ -364,129 +438,94 @@ def _prediction_description(prediction: client.Prediction) -> Optional[str]:
 @crontab_schedule("0 */4 * * *")  # Every four hours
 @activity_logger()
 async def action_pull_events(integration, action_config: PullEventsConfig) -> dict:
-    """Ingest the features of every prediction this integration has not seen."""
+    """Ingest every detection this integration has not already seen."""
     integration_id = str(integration.id)
-    logger.info(
-        f"Executing pull_events for integration {integration_id}, "
-        f"model {action_config.model_id}..."
-    )
+    logger.info(f"Executing pull_events for integration {integration_id}...")
 
-    watermark, processed_ids = await _load_watermark(integration_id)
-    since = watermark or (
+    watermark = await _load_watermark(integration_id)
+    since = watermark.created_at or (
         datetime.datetime.now(tz=datetime.timezone.utc)
         - datetime.timedelta(days=action_config.lookback_days)
     )
+    request = build_feature_search(action_config, since)
+
+    totals = {"features_read": 0, "features_skipped": 0, "events_sent": 0}
+    batch: List[dict] = []
 
     async with client_for(integration) as api:
-        predictions = await _select_predictions(api, action_config, since, processed_ids)
-
-        if not predictions:
-            await log_action_activity(
-                integration_id=integration_id,
-                action_id=PULL_EVENTS_ACTION_ID,
-                level="INFO",
-                title="No new predictions to ingest.",
-                data={"since": since.isoformat(), "model_id": action_config.model_id},
-                config_data=action_config.dict(),
-            )
-            return {
-                "predictions_processed": 0,
-                "features_extracted": 0,
-                "events_sent": 0,
-                "since": since.isoformat(),
-            }
-
-        await log_action_activity(
-            integration_id=integration_id,
-            action_id=PULL_EVENTS_ACTION_ID,
-            level="INFO",
-            title=f"Ingesting {len(predictions)} new prediction(s).",
-            data={
-                "since": since.isoformat(),
-                "prediction_ids": [p.id for p in predictions],
-            },
-            config_data=action_config.dict(),
-        )
-
-        totals = {"predictions_processed": 0, "features_extracted": 0, "events_sent": 0}
-        # Predictions arrive newest-first; ingest oldest-first so the watermark
-        # only ever moves forward and a failure halfway leaves a consistent one.
-        for prediction in sorted(predictions, key=_creation_time_key):
-            extracted, sent = await _ingest_prediction(api, integration, prediction, action_config)
-            totals["predictions_processed"] += 1
-            totals["features_extracted"] += extracted
-            totals["events_sent"] += sent
-
-            processed_ids = [prediction.id] + [pid for pid in processed_ids if pid != prediction.id]
-            if prediction.creation_time:
-                created = _as_utc(prediction.creation_time)
-                watermark = max(watermark, created) if watermark else created
-            # Persisted per prediction, not once at the end: a failure on the
-            # fifth of six predictions must not re-send the first four.
-            await _save_watermark(integration_id, watermark, processed_ids)
-
-    totals["since"] = since.isoformat()
-    totals["watermark"] = watermark.isoformat() if watermark else None
-    return totals
-
-
-def _creation_time_key(prediction: client.Prediction) -> datetime.datetime:
-    """Sort key that tolerates a prediction with no creation time (ingest it first)."""
-    if prediction.creation_time:
-        return _as_utc(prediction.creation_time)
-    return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
-
-
-async def _select_predictions(
-    api: client.OlmoEarthClient,
-    config: PullEventsConfig,
-    since: datetime.datetime,
-    processed_ids: List[str],
-) -> List[client.Prediction]:
-    """The predictions this run should ingest, newest first."""
-    response = await api.search_predictions(build_prediction_query(config, since))
-    already_seen = set(processed_ids)
-    fresh = [p for p in response.records if p.id not in already_seen]
-    if config.prediction_selection == PredictionSelection.LATEST_ONLY:
-        return fresh[:1]
-    return fresh
-
-
-async def _ingest_prediction(
-    api: client.OlmoEarthClient,
-    integration,
-    prediction: client.Prediction,
-    config: PullEventsConfig,
-) -> Tuple[int, int]:
-    """Drain one prediction's features into Gundi. Returns (extracted, sent)."""
-    integration_id = str(integration.id)
-    feature_query = build_feature_query(config)
-    extracted = 0
-    sent = 0
-
-    for prediction_result_id in client.result_ids_for(prediction):
-        batch: List[dict] = []
         async for feature in api.iter_features(
-            prediction_result_id,
-            feature_query,
-            max_features=config.max_features_per_prediction,
+            request, max_features=action_config.max_features_per_run
         ):
-            extracted += 1
-            event = transform_feature(feature, prediction, prediction_result_id, config)
+            if watermark.already_ingested(feature):
+                # Re-read because the search is bounded with `gte`. Expected,
+                # not an anomaly: every run re-reads the watermark second.
+                totals["features_skipped"] += 1
+                continue
+            totals["features_read"] += 1
+            event = transform_feature(feature, action_config)
+            watermark.advance(feature)
             if not event:
                 continue
             batch.append(event)
-            if len(batch) >= config.events_per_request:
-                sent += await _send_events(batch, integration_id)
+            if len(batch) >= action_config.events_per_request:
+                totals["events_sent"] += await _send_events(batch, integration_id)
                 batch = []
-        if batch:
-            sent += await _send_events(batch, integration_id)
+                # Persisted per batch, not once at the end: a run that fails on
+                # the fifth batch of six must not re-send the first four.
+                await _save_watermark(integration_id, watermark)
 
-    logger.info(
-        "Prediction %s: %s feature(s) read, %s event(s) sent for integration %s.",
-        prediction.id, extracted, sent, integration_id,
+        if batch:
+            totals["events_sent"] += await _send_events(batch, integration_id)
+            await _save_watermark(integration_id, watermark)
+
+        if not totals["events_sent"]:
+            # An empty run is ambiguous on this endpoint: it accepts anonymous
+            # callers, so an expired token returns 200 with only the public
+            # Results — which for a private feed is zero detections and no
+            # error. Ask an endpoint that does require auth before calling it
+            # a quiet day.
+            await _confirm_token_still_works(api, integration_id, action_config)
+
+    await _log_run(integration_id, action_config, since, totals)
+
+    totals["since"] = since.isoformat()
+    totals["watermark"] = watermark.created_at.isoformat() if watermark.created_at else None
+    return totals
+
+
+async def _confirm_token_still_works(
+    api: client.OlmoEarthClient, integration_id: str, config: PullEventsConfig
+) -> None:
+    """Prove the token still authenticates, so an empty run means "nothing new".
+
+    Costs one request, and only on runs that found nothing — which is the only
+    time the answer is in doubt. A rejected token raises `IntegrationAuthError`
+    out of the client, which fails the action and shows up in the portal as an
+    auth problem instead of a run that quietly did nothing.
+    """
+    await api.search_predictions(client.PredictionSearchRequest(limit=1))
+
+
+async def _log_run(
+    integration_id: str, config: PullEventsConfig, since: datetime.datetime, totals: dict
+) -> None:
+    if totals["events_sent"]:
+        title = f"Ingested {totals['events_sent']} detection(s)."
+    else:
+        title = "No new detections to ingest."
+    await log_action_activity(
+        integration_id=integration_id,
+        action_id=PULL_EVENTS_ACTION_ID,
+        level="INFO",
+        title=title,
+        data={
+            "since": since.isoformat(),
+            "features_read": totals["features_read"],
+            "features_skipped": totals["features_skipped"],
+            "events_sent": totals["events_sent"],
+        },
+        config_data=config.dict(),
     )
-    return extracted, sent
 
 
 async def _send_events(events: List[dict], integration_id: str) -> int:
@@ -494,7 +533,8 @@ async def _send_events(events: List[dict], integration_id: str) -> int:
 
     `send_events_to_gundi` already retries transient Gundi failures; a failure
     that survives that propagates, which fails the action and leaves the
-    watermark where it was so the next run retries this prediction.
+    watermark where the last successful batch put it, so the next run resumes
+    there.
     """
     logger.info(f"Sending {len(events)} event(s) to Gundi for integration {integration_id}...")
     await gundi_tools.send_events_to_gundi(events=events, integration_id=integration_id)
