@@ -474,15 +474,18 @@ class OlmoEarthClient:
         return self._parse(FeatureSearchResponse, payload, self.FEATURES_PATH)
 
     # -- paging ------------------------------------------------------------
-    async def iter_features(
-        self, request: FeatureSearchRequest, max_features: Optional[int] = None
-    ) -> AsyncIterator[Feature]:
+    async def iter_features(self, request: FeatureSearchRequest) -> AsyncIterator[Feature]:
         """Yield every feature matching `request`, a page at a time.
 
         Paging is by offset, so it forces ascending order on `oe_created_at`:
         with a descending sort a feature written between two requests shifts
         every later record one slot forward and the walk skips one. Ascending
         order only ever appends beyond the window already read.
+
+        There is no feature cap here. The caller stops when it has taken enough
+        *new* detections, which is not the same count: every run re-reads the
+        watermark second, and charging those re-reads against the cap is what
+        would let a crowded second consume a whole run without progress.
         """
         request = request.copy(deep=True)
         request.features.sort_by = "oe_created_at"
@@ -496,12 +499,6 @@ class OlmoEarthClient:
             for feature in response.records:
                 yield feature
                 yielded += 1
-                if max_features is not None and yielded >= max_features:
-                    logger.info(
-                        "Stopped at the %s-feature cap; the provider reported %s in total.",
-                        max_features, response.meta.total,
-                    )
-                    return
             # A short page is the last page. `meta.total` is a second, cheaper
             # stop for a provider that always fills the page.
             if len(response.records) < request.features.limit:
@@ -542,11 +539,16 @@ def _classify_status_error(exc: httpx.HTTPStatusError):
         # span and refuses rather than truncating, because a partial feature
         # set is indistinguishable from a complete one. That is a scope this
         # integration chose, so say which knobs narrow it.
+        #
+        # The provider's own wording stays in the log, not in the message:
+        # IntegrationConfigurationError is the one connector error forwarded
+        # verbatim to the ephemeral caller, and its contract is to describe the
+        # shape of the problem without echoing values back.
+        logger.warning("OlmoEarth refused the search as too broad: %s", detail)
         return IntegrationConfigurationError(
             "This integration's filters match more Prediction Results than "
-            "OlmoEarth will search at once. Narrow it with an area of interest, "
-            "a model, a project, or a shorter lookback. "
-            f"{detail}".strip(),
+            "OlmoEarth will search at once. Narrow it with a target area, a "
+            "model, a project, or a shorter lookback.",
             status_code=status,
         )
     if status == 404:

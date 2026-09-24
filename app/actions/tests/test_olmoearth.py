@@ -470,8 +470,12 @@ async def test_too_broad_a_scope_is_reported_as_a_configuration_problem():
         }
     )
     async with client.OlmoEarthClient(BASE_URL, "t", transport=transport) as api:
-        with pytest.raises(IntegrationConfigurationError, match="area of interest"):
+        with pytest.raises(IntegrationConfigurationError, match="Narrow it") as raised:
             await api.search_features(client.FeatureSearchRequest())
+
+    # IntegrationConfigurationError is the one connector message forwarded
+    # verbatim to the ephemeral caller, so it must not echo the provider's body.
+    assert "4213" not in str(raised.value)
 
 
 @pytest.mark.asyncio
@@ -556,18 +560,6 @@ async def test_paging_sorts_ascending_so_a_new_record_cannot_shift_the_window():
     assert features["sort_direction"] == "asc"
     # The caller's own request object is left as they built it.
     assert request.features.sort_direction == "desc"
-
-
-@pytest.mark.asyncio
-async def test_paging_stops_at_the_feature_cap():
-    transport, _ = make_transport(
-        {FEATURES_PATH: [json_response([feature(i) for i in range(50)], total=1000)] * 5}
-    )
-    request = client.FeatureSearchRequest(features=client.FeatureFilters(limit=50))
-    async with client.OlmoEarthClient(BASE_URL, "t", transport=transport) as api:
-        collected = [f async for f in api.iter_features(request, max_features=75)]
-
-    assert len(collected) == 75
 
 
 @pytest.mark.asyncio
@@ -989,6 +981,30 @@ async def test_an_unplaceable_feature_still_advances_the_watermark(
 
 
 @pytest.mark.asyncio
+async def test_a_run_that_sends_nothing_still_persists_what_it_read(
+    mocker, integration, pull_config, captured_gundi, captured_state, no_activity_logs
+):
+    """Progress is progress even when none of it became an event. Left
+    unsaved, the same unplaceable features are re-read every run forever — and
+    once there are `max_features_per_run` of them the ingest never gets past
+    them at all."""
+    placeless = feature(2, created_at="2026-09-06T00:00:00Z")
+    placeless["geometry"] = None
+    route_client(
+        mocker,
+        {
+            FEATURES_PATH: [json_response([placeless], total=1)],
+            PREDICTIONS_PATH: json_response([], total=0),
+        },
+    )
+
+    await handlers.action_pull_events(integration, pull_config)
+
+    state = state_of(captured_state, integration)
+    assert state["last_feature_created_at"].startswith("2026-09-06T00:00:00")
+
+
+@pytest.mark.asyncio
 async def test_an_unparseable_stored_watermark_falls_back_to_the_lookback(
     mocker, integration, pull_config, captured_gundi, captured_state, no_activity_logs
 ):
@@ -1030,13 +1046,12 @@ def test_the_boundary_list_resets_when_the_cursor_moves_on():
     assert watermark.boundary_ids == ["result-1:3"]
 
 
-def test_overflowing_the_boundary_list_duplicates_rather_than_drops(mocker):
+def test_overflowing_the_boundary_list_duplicates_rather_than_drops():
     """When one second holds more detections than we remember, the forgotten
     ids are re-read and re-sent next run. That is the direction to fail in: a
     duplicate `external_source_id` is recoverable downstream, a detection that
     was never sent is not."""
-    mocker.patch.object(handlers, "BOUNDARY_ID_MEMORY", 3)
-    watermark = handlers.Watermark()
+    watermark = handlers.Watermark(memory=3)
     for i in range(5):
         watermark.advance(parsed(feature(i, created_at="2026-09-01T00:00:00Z")))
 
@@ -1045,9 +1060,7 @@ def test_overflowing_the_boundary_list_duplicates_rather_than_drops(mocker):
 
     # What the next run loads is the truncated list, so the forgotten ids come
     # back as new work rather than vanishing.
-    resumed = handlers.Watermark(
-        watermark.created_at, state["boundary_feature_ids"]
-    )
+    resumed = handlers.Watermark(watermark.created_at, state["boundary_feature_ids"], memory=3)
     forgotten = parsed(feature(0, created_at="2026-09-01T00:00:00Z"))
     remembered = parsed(feature(4, created_at="2026-09-01T00:00:00Z"))
     assert resumed.already_ingested(forgotten) is False
@@ -1078,3 +1091,127 @@ def test_a_feature_with_no_created_at_cannot_move_the_cursor():
     watermark.advance(parsed(record))
 
     assert watermark.created_at is None
+
+
+# --------------------------------------------------------------------------
+# Bounding boxes
+# --------------------------------------------------------------------------
+def test_a_three_dimensional_bbox_does_not_plot_altitude_as_longitude():
+    """RFC 7946 §5 orders a bbox as every minimum then every maximum, so a 3-D
+    box is [west, south, minAlt, east, north, maxAlt]. Read as a flat
+    [minLon, minLat, maxLon, maxLat], the altitude becomes the longitude."""
+    record = feature(geometry={"type": "Polygon", "coordinates": [[[0, 0], [0, 2], [2, 2], [0, 0]]]})
+    record["bbox"] = [0.0, 0.0, 10.0, 2.0, 2.0, 20.0]  # 10m and 20m are altitudes
+
+    assert handlers.centroid_of(parsed(record)) == {"lat": 1.0, "lon": 1.0}
+
+
+def test_a_bbox_crossing_the_antimeridian_stays_on_its_own_side_of_the_globe():
+    """§5.2 makes west > east legal for a box straddling 180°. Averaged as it
+    stands it comes out at longitude 0 — the far side of the planet."""
+    record = feature()
+    record["bbox"] = [170.0, -10.0, -170.0, 10.0]
+
+    assert handlers.centroid_of(parsed(record)) == {"lat": 0.0, "lon": 180.0}
+
+
+def test_an_odd_length_bbox_is_ignored_rather_than_guessed_at():
+    record = feature()
+    record["bbox"] = [0.0, 0.0, 1.0, 1.0, 5.0]
+
+    # Falls through to averaging the geometry's own positions.
+    assert handlers.centroid_of(parsed(record)) == {"lat": -51.7, "lon": -72.7}
+
+
+# --------------------------------------------------------------------------
+# Features with no id
+# --------------------------------------------------------------------------
+def test_a_feature_with_no_id_is_skipped_rather_than_given_a_shared_identity(pull_config):
+    """Everything downstream keys on external_source_id. With no id there is
+    nothing stable to build one from, and every id-less feature in a Result
+    would answer to the same one."""
+    record = feature()
+    record.pop("id")
+
+    assert handlers.transform_feature(parsed(record), pull_config) is None
+
+
+def test_two_id_less_features_do_not_suppress_each_other():
+    """Registered under a shared placeholder, the second id-less feature at an
+    instant looks like a repeat of the first and is counted as already
+    ingested."""
+    record = feature()
+    record.pop("id")
+    watermark = handlers.Watermark()
+    watermark.advance(parsed(record))
+
+    assert watermark.already_ingested(parsed(record)) is False
+    assert watermark.boundary_ids == []
+
+
+# --------------------------------------------------------------------------
+# The run cap
+# --------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_a_run_stops_at_its_cap_and_carries_the_rest_in_the_watermark(
+    mocker, integration, captured_gundi, captured_state, no_activity_logs
+):
+    route_client(
+        mocker,
+        {
+            FEATURES_PATH: [
+                json_response(
+                    [feature(i, created_at="2026-09-0%dT00:00:00Z" % (i + 1)) for i in range(4)],
+                    total=4,
+                )
+            ]
+        },
+    )
+
+    result = await handlers.action_pull_events(
+        integration, PullEventsConfig(model_id="model-abc", max_features_per_run=2)
+    )
+
+    assert result["features_read"] == 2
+    assert result["watermark"].startswith("2026-09-02T00:00:00")
+
+
+@pytest.mark.asyncio
+async def test_re_reading_the_boundary_second_does_not_consume_the_run_cap(
+    mocker, integration, captured_gundi, captured_state, no_activity_logs
+):
+    """A crowded watermark second comes back in full every run. Charged against
+    the cap, those re-reads would fill a run on their own and the ingest would
+    never reach the detections past them."""
+    config = PullEventsConfig(model_id="model-abc", max_features_per_run=2)
+    routes = {FEATURES_PATH: [json_response([feature(1), feature(2)], total=2)]}
+    route_client(mocker, routes)
+    await handlers.action_pull_events(integration, config)
+
+    # Both come back (same second), plus one genuinely new detection.
+    routes[FEATURES_PATH] = [
+        json_response([feature(1), feature(2), feature(3, created_at="2026-09-03T00:00:00Z")], total=3)
+    ]
+    route_client(mocker, routes)
+    second = await handlers.action_pull_events(integration, config)
+
+    assert second["features_skipped"] == 2
+    assert second["features_read"] == 1
+    assert second["watermark"].startswith("2026-09-03T00:00:00")
+
+
+def test_the_boundary_memory_is_never_smaller_than_a_runs_own_output():
+    """Below that a run cannot remember what it just sent: the next run forgets
+    the half it ingested, re-sends it, forgets the other half, and oscillates
+    there forever without reaching the detections past the cap."""
+    watermark = handlers.Watermark(memory=handlers.BOUNDARY_ID_MEMORY)
+    for i in range(handlers.BOUNDARY_ID_MEMORY + 10):
+        watermark.advance(parsed(feature(i, created_at="2026-09-01T00:00:00Z")))
+
+    assert len(watermark.to_state()["boundary_feature_ids"]) == handlers.BOUNDARY_ID_MEMORY
+
+    roomy = handlers.Watermark(memory=handlers.BOUNDARY_ID_MEMORY + 10)
+    for i in range(handlers.BOUNDARY_ID_MEMORY + 10):
+        roomy.advance(parsed(feature(i, created_at="2026-09-01T00:00:00Z")))
+
+    assert len(roomy.to_state()["boundary_feature_ids"]) == handlers.BOUNDARY_ID_MEMORY + 10
