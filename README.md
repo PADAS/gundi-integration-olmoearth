@@ -1,5 +1,123 @@
-# gundi-integration-action-runner
-Template repo for integration in Gundi v2.
+# gundi-integration-olmoearth
+Gundi v2 connector for the OlmoEarth prediction API, built on the action-runner
+template. The template's own documentation follows the connector section below.
+
+## The OlmoEarth connector
+
+Three actions, in `app/actions/`:
+
+| Action | Type | What it does |
+| --- | --- | --- |
+| `auth` | auth | Validates the API token by asking the predictions search for one record. |
+| `list_predictions` | reference | Populates a portal dropdown of predictions, newest first. |
+| `pull_events` | pull (every 4h) | The ingest. Detections → Gundi events. |
+
+### The ingest
+
+One request per run, against the endpoint OlmoEarth added for external pollers
+([olmoearth_studio#3226](https://github.com/allenai/olmoearth_studio/pull/3226)):
+
+```
+POST /api/v1/prediction-results/features/search    GeoJSON detections, paged
+  -> Gundi events                                  one event per feature
+```
+
+The body has two halves and the split matters:
+
+- **`prediction_results`** picks *which* Prediction Results to read — by model,
+  project, organization or target area. This is the half OlmoEarth
+  access-controls: it resolves the filters to the set of Results the token may
+  read and scopes the feature query to it. `PullEventsConfig` requires at least
+  one of those four, because an unscoped search returns every Result the token
+  can see, and past a thousand Results the provider answers 400 rather than
+  truncating.
+- **`features`** filters the detections within those Results — the watermark,
+  the area of interest, a confidence threshold — and carries the sort and
+  paging.
+
+`features.oe_prediction_result_id` is deliberately not a field on
+`client.FeatureFilters`. The server derives that filter from
+`prediction_results`, that derivation *is* the access control, and a
+caller-supplied value is rejected with a 422. Leaving it off the model makes it
+unreachable rather than merely discouraged.
+
+Each feature becomes one Gundi event: `oe_start_time` is the `recorded_at`
+(when the model saw the thing, not when the record was written), the geometry's
+centre becomes the point `location`, the full GeoJSON geometry travels
+alongside so a polygon detection stays a polygon, and the model's own
+properties land in `event_details` with the `oe_` provenance fields renamed
+rather than mixed in.
+
+### Incremental runs
+
+The watermark is `oe_created_at` on the features themselves, which arrives in
+the same response as the detections. Three details keep it honest:
+
+- The cursor is `gte`, not `gt`. A bulk-inserted Result stamps thousands of
+  features with one `oe_created_at`; if some of them are indexed after a run
+  has already read that second and moved past it, `gt` would never see them
+  again. `gte` re-reads the boundary second every run.
+- `boundary_feature_ids` is what stops that re-read becoming duplicate events:
+  the ids already ingested at exactly the watermark second. It is bounded, and
+  overflowing it re-sends detections rather than losing them — a duplicate
+  `external_source_id` is recoverable downstream, a detection that was never
+  sent is not.
+- Those ids are *qualified* — `result-1:7`, the same string the event carries
+  as its `external_source_id`. A bare feature id is unique only within its
+  Prediction Result, and one search spans many at once, so keying on it would
+  drop feature 1 of the second Result as a duplicate of feature 1 of the first.
+- **A run never stops inside a second.** This is what keeps the ingest moving,
+  and no size of boundary set can substitute for it. **Max Features Per Run**
+  is a soft cap: on reaching it the run keeps taking detections until the
+  timestamp changes, so the cursor always lands *between* groups. Stop
+  mid-second instead and the cursor sits inside a group `gte` re-reads in full
+  — and once that group is larger than the boundary set remembers, two runs
+  trade halves of it forever and never reach what lies past it. The overrun is
+  bounded by how many detections share one timestamp.
+- A re-read does not count against the cap either. Only new detections do.
+- Those ids are *qualified* — `result-1:7`, the same string the event carries
+  as its `external_source_id`. A bare feature id is unique only within its
+  Prediction Result, and one search now spans many at once, so keying on it
+  would drop feature 1 of the second Result as a duplicate of feature 1 of the
+  first.
+
+State is saved after each batch of events, so a run that fails on the fifth
+batch of six does not re-send the first four — and once more at the end
+whatever the run did, because a run whose detections were all unusable still
+read them and that progress is worth keeping. A run that changed nothing skips
+the write entirely.
+
+If paging hits its page ceiling (`client.MAX_PAGES`) with matches still unread,
+the run reports `truncated` rather than ending quietly — otherwise a stuck feed
+reads as a clean one.
+
+Paging forces `sort_by=oe_created_at, sort_direction=asc` regardless of what
+the caller asked for, because offset paging over a descending sort skips a
+record whenever one is written mid-walk.
+
+### The area of interest goes on the features, not the Results
+
+`prediction_results.prediction_intersects_geometry` exists and looks like the
+right place for it, but it matches through registered Areas only: a Prediction
+created from an uploaded GeoJSON keeps its footprint in a file rather than an
+Area row, so its detections never match. Enforcing an AOI there would silently
+drop exactly the detections nobody would think to look for. The AOI is applied
+to `features.intersects_geometry`, which is exact — and, now that the ingest is
+a single request, free. **Target Area ID** is the separate, explicit setting
+for pruning by registered Area.
+
+### An empty run is ambiguous, so it is checked
+
+The features endpoint is `optional_auth` on the provider's side: an invalid or
+expired token does not 401, it degrades the caller to anonymous and returns
+only the Results marked public. For a private feed that is zero detections and
+no error — indistinguishable from a quiet day.
+
+So a run that sent no events makes one extra request to
+`/api/v1/predictions/search`, which does require a real user, before reporting
+nothing new. A dead token fails the action as an auth problem instead of
+looking like a quiet day for as long as nobody checks. The `auth` action
+validates against that same endpoint, for the same reason.
 
 ## Usage
 - Fork this repo
