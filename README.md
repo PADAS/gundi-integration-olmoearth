@@ -61,7 +61,12 @@ the same response as the detections. Three details keep it honest:
   the ids already ingested at exactly the watermark second. It is bounded, and
   overflowing it re-sends detections rather than losing them — a duplicate
   `external_source_id` is recoverable downstream, a detection that was never
-  sent is not.
+  sent is not. The bound is never smaller than **Max Features Per Run**, so a
+  run can always remember everything it just sent; below that a crowded second
+  oscillates, each run forgetting the half it ingested and re-sending it.
+- A re-read does not count against **Max Features Per Run**. Only new
+  detections do — charging the re-reads would let one crowded second fill a
+  run on its own and the ingest would never get past it.
 - Those ids are *qualified* — `result-1:7`, the same string the event carries
   as its `external_source_id`. A bare feature id is unique only within its
   Prediction Result, and one search now spans many at once, so keying on it
