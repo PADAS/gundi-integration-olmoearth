@@ -61,12 +61,20 @@ the same response as the detections. Three details keep it honest:
   the ids already ingested at exactly the watermark second. It is bounded, and
   overflowing it re-sends detections rather than losing them — a duplicate
   `external_source_id` is recoverable downstream, a detection that was never
-  sent is not. The bound is never smaller than **Max Features Per Run**, so a
-  run can always remember everything it just sent; below that a crowded second
-  oscillates, each run forgetting the half it ingested and re-sending it.
-- A re-read does not count against **Max Features Per Run**. Only new
-  detections do — charging the re-reads would let one crowded second fill a
-  run on its own and the ingest would never get past it.
+  sent is not.
+- Those ids are *qualified* — `result-1:7`, the same string the event carries
+  as its `external_source_id`. A bare feature id is unique only within its
+  Prediction Result, and one search spans many at once, so keying on it would
+  drop feature 1 of the second Result as a duplicate of feature 1 of the first.
+- **A run never stops inside a second.** This is what keeps the ingest moving,
+  and no size of boundary set can substitute for it. **Max Features Per Run**
+  is a soft cap: on reaching it the run keeps taking detections until the
+  timestamp changes, so the cursor always lands *between* groups. Stop
+  mid-second instead and the cursor sits inside a group `gte` re-reads in full
+  — and once that group is larger than the boundary set remembers, two runs
+  trade halves of it forever and never reach what lies past it. The overrun is
+  bounded by how many detections share one timestamp.
+- A re-read does not count against the cap either. Only new detections do.
 - Those ids are *qualified* — `result-1:7`, the same string the event carries
   as its `external_source_id`. A bare feature id is unique only within its
   Prediction Result, and one search now spans many at once, so keying on it
@@ -74,7 +82,14 @@ the same response as the detections. Three details keep it honest:
   first.
 
 State is saved after each batch of events, so a run that fails on the fifth
-batch of six does not re-send the first four.
+batch of six does not re-send the first four — and once more at the end
+whatever the run did, because a run whose detections were all unusable still
+read them and that progress is worth keeping. A run that changed nothing skips
+the write entirely.
+
+If paging hits its page ceiling (`client.MAX_PAGES`) with matches still unread,
+the run reports `truncated` rather than ending quietly — otherwise a stuck feed
+reads as a clean one.
 
 Paging forces `sort_by=oe_created_at, sort_direction=asc` regardless of what
 the caller asked for, because offset paging over a descending sort skips a

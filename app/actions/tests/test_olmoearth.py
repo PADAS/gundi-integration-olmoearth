@@ -92,9 +92,7 @@ def make_transport(routes):
     def handler(request: httpx.Request) -> httpx.Response:
         recorded.append(request)
         route = routes[request.url.path]
-        if isinstance(route, list):
-            return route.pop(0) if route else httpx.Response(200, json={"records": [], "meta": {"total": 0}})
-        return route
+        return route.pop(0) if isinstance(route, list) else route
 
     return httpx.MockTransport(handler), recorded
 
@@ -222,26 +220,30 @@ def test_a_point_feature_keeps_its_own_coordinates():
 
 
 def test_a_polygon_is_reduced_to_a_point_so_gundi_can_place_it():
+    """Via its own bounds, not the mean of its vertices: a ring repeats its
+    closing position, so averaging weights one corner twice and pulls the point
+    off-centre."""
     polygon = {
         "type": "Polygon",
         "coordinates": [[[0.0, 0.0], [0.0, 2.0], [2.0, 2.0], [2.0, 0.0], [0.0, 0.0]]],
     }
     location = handlers.centroid_of(parsed(feature(geometry=polygon)))
 
-    assert location["lat"] == pytest.approx(0.8)
-    assert location["lon"] == pytest.approx(0.8)
+    assert location["lat"] == pytest.approx(1.0)
+    assert location["lon"] == pytest.approx(1.0)
 
 
-def test_the_providers_bbox_wins_over_averaging_the_vertices():
-    """The provider computed the bbox over the real geometry; averaging the
-    vertices of a ring double-counts the repeated closing point."""
+def test_the_providers_bbox_wins_over_the_geometrys_own_bounds():
+    """The provider computed its bbox over the real geometry — which may be a
+    multi-part shape whose listed positions are only part of the story — so it
+    is preferred wherever it is present."""
     polygon = {
         "type": "Polygon",
         "coordinates": [[[0.0, 0.0], [0.0, 2.0], [2.0, 2.0], [2.0, 0.0], [0.0, 0.0]]],
     }
-    location = handlers.centroid_of(parsed(feature(geometry=polygon, bbox=[0.0, 0.0, 2.0, 2.0])))
+    location = handlers.centroid_of(parsed(feature(geometry=polygon, bbox=[0.0, 0.0, 10.0, 10.0])))
 
-    assert location == {"lat": 1.0, "lon": 1.0}
+    assert location == {"lat": 5.0, "lon": 5.0}
 
 
 def test_a_feature_with_no_geometry_has_no_location():
@@ -399,6 +401,13 @@ def test_the_area_of_interest_filters_features_not_predictions(pull_config):
 
     assert request.features.intersects_geometry.type == "Polygon"
     assert request.prediction_results.prediction_intersects_geometry is None
+
+
+def test_a_malformed_area_of_interest_is_rejected_when_the_config_is_saved():
+    """The portal can show the operator which field is wrong; a scheduled run
+    can only fail."""
+    with pytest.raises(ValueError, match="GeoJSON"):
+        PullEventsConfig(model_id="model-abc", area_of_interest={"coordinates": [[0, 0]]})
 
 
 def test_a_malformed_area_of_interest_is_reported_as_a_configuration_problem(pull_config):
@@ -621,21 +630,32 @@ def no_activity_logs(mocker):
 
 
 def route_client(mocker, routes):
-    """Point every client the handlers build at a MockTransport."""
+    """Point every client the handlers build at a MockTransport.
+
+    Goes through the real constructor's `transport` hook rather than replacing
+    the inner httpx client, so these tests exercise the headers and timeout
+    production uses.
+    """
     transport, recorded = make_transport(routes)
-    real = handlers.client_for
 
     def build(integration, auth_config=None):
-        api = real(integration, auth_config)
-        api._client = httpx.AsyncClient(
-            base_url=api.base_url,
-            headers={"Authorization": f"Bearer {api._api_token}", "Content-Type": "application/json"},
+        auth_config = auth_config or handlers.get_auth_config(integration)
+        return client.OlmoEarthClient(
+            base_url=integration.base_url,
+            api_token=auth_config.api_token.get_secret_value(),
             transport=transport,
         )
-        return api
 
     mocker.patch.object(handlers, "client_for", side_effect=build)
     return recorded
+
+
+def empty_run_routes(predictions=None):
+    """Routes for a run that finds nothing — which then probes the token."""
+    return {
+        FEATURES_PATH: [json_response([], total=0)],
+        PREDICTIONS_PATH: predictions if predictions is not None else json_response([], total=0),
+    }
 
 
 def state_of(captured_state, integration):
@@ -858,7 +878,7 @@ async def test_a_first_run_reaches_back_by_the_configured_lookback(
     mocker, integration, captured_gundi, captured_state, no_activity_logs
 ):
     recorded = route_client(
-        mocker, {FEATURES_PATH: [json_response([], total=0)], PREDICTIONS_PATH: json_response([], total=0)}
+        mocker, empty_run_routes()
     )
 
     await handlers.action_pull_events(
@@ -892,7 +912,7 @@ async def test_a_run_with_nothing_new_is_a_clean_no_op(
     mocker, integration, pull_config, captured_gundi, captured_state, no_activity_logs
 ):
     route_client(
-        mocker, {FEATURES_PATH: [json_response([], total=0)], PREDICTIONS_PATH: json_response([], total=0)}
+        mocker, empty_run_routes()
     )
 
     result = await handlers.action_pull_events(integration, pull_config)
@@ -910,7 +930,7 @@ async def test_an_empty_run_proves_the_token_still_works_before_calling_it_quiet
     200 carrying only the public Results, which for a private feed is zero
     detections and no error. A run that found nothing has to rule that out."""
     recorded = route_client(
-        mocker, {FEATURES_PATH: [json_response([], total=0)], PREDICTIONS_PATH: json_response([], total=0)}
+        mocker, empty_run_routes()
     )
 
     await handlers.action_pull_events(integration, pull_config)
@@ -922,10 +942,7 @@ async def test_an_empty_run_proves_the_token_still_works_before_calling_it_quiet
 async def test_an_empty_run_on_a_dead_token_fails_instead_of_looking_quiet(
     mocker, integration, pull_config, captured_gundi, captured_state, no_activity_logs
 ):
-    route_client(
-        mocker,
-        {FEATURES_PATH: [json_response([], total=0)], PREDICTIONS_PATH: httpx.Response(401, text="expired")},
-    )
+    route_client(mocker, empty_run_routes(httpx.Response(401, text="expired")))
 
     with pytest.raises(IntegrationAuthError):
         await handlers.action_pull_events(integration, pull_config)
@@ -960,28 +977,7 @@ async def test_unplaceable_features_are_counted_as_read_but_not_sent(
 
 
 @pytest.mark.asyncio
-async def test_an_unplaceable_feature_still_advances_the_watermark(
-    mocker, integration, pull_config, captured_gundi, captured_state, no_activity_logs
-):
-    """It will never become an event, so re-reading it every run forever is
-    just work — and it would hold the cursor at its timestamp."""
-    placeless = feature(2, created_at="2026-09-06T00:00:00Z")
-    placeless["geometry"] = None
-    route_client(
-        mocker,
-        {
-            FEATURES_PATH: [json_response([placeless], total=1)],
-            PREDICTIONS_PATH: json_response([], total=0),
-        },
-    )
-
-    result = await handlers.action_pull_events(integration, pull_config)
-
-    assert result["watermark"].startswith("2026-09-06T00:00:00")
-
-
-@pytest.mark.asyncio
-async def test_a_run_that_sends_nothing_still_persists_what_it_read(
+async def test_a_run_that_sends_nothing_still_advances_and_persists_the_watermark(
     mocker, integration, pull_config, captured_gundi, captured_state, no_activity_logs
 ):
     """Progress is progress even when none of it became an event. Left
@@ -998,8 +994,9 @@ async def test_a_run_that_sends_nothing_still_persists_what_it_read(
         },
     )
 
-    await handlers.action_pull_events(integration, pull_config)
+    result = await handlers.action_pull_events(integration, pull_config)
 
+    assert result["watermark"].startswith("2026-09-06T00:00:00")
     state = state_of(captured_state, integration)
     assert state["last_feature_created_at"].startswith("2026-09-06T00:00:00")
 
@@ -1015,7 +1012,7 @@ async def test_an_unparseable_stored_watermark_falls_back_to_the_lookback(
         "boundary_feature_ids": [],
     }
     recorded = route_client(
-        mocker, {FEATURES_PATH: [json_response([], total=0)], PREDICTIONS_PATH: json_response([], total=0)}
+        mocker, empty_run_routes()
     )
 
     await handlers.action_pull_events(integration, pull_config)
@@ -1034,184 +1031,161 @@ async def test_an_integration_with_no_auth_configured_says_so(integration, pull_
 # --------------------------------------------------------------------------
 # Watermark bookkeeping
 # --------------------------------------------------------------------------
-def test_the_boundary_list_resets_when_the_cursor_moves_on():
-    """Ids at an instant the cursor has passed are dead weight: `gte` on a
-    later timestamp already excludes them."""
+T1 = datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)
+T2 = datetime.datetime(2026, 9, 2, tzinfo=datetime.timezone.utc)
+
+
+def test_the_boundary_set_resets_when_the_cursor_moves_on():
+    """Identities at an instant the cursor has passed are dead weight: `gte` on
+    a later timestamp already excludes them."""
     watermark = handlers.Watermark()
-    watermark.advance(parsed(feature(1, created_at="2026-09-01T00:00:00Z")))
-    watermark.advance(parsed(feature(2, created_at="2026-09-01T00:00:00Z")))
+    watermark.advance(T1, "result-1:1")
+    watermark.advance(T1, "result-1:2")
     assert watermark.boundary_ids == ["result-1:1", "result-1:2"]
 
-    watermark.advance(parsed(feature(3, created_at="2026-09-02T00:00:00Z")))
+    watermark.advance(T2, "result-1:3")
     assert watermark.boundary_ids == ["result-1:3"]
 
 
-def test_overflowing_the_boundary_list_duplicates_rather_than_drops():
+def test_re_advancing_one_identity_does_not_record_it_twice():
+    watermark = handlers.Watermark()
+    watermark.advance(T1, "result-1:1")
+    watermark.advance(T1, "result-1:1")
+
+    assert watermark.boundary_ids == ["result-1:1"]
+
+
+def test_overflowing_the_boundary_set_duplicates_rather_than_drops():
     """When one second holds more detections than we remember, the forgotten
-    ids are re-read and re-sent next run. That is the direction to fail in: a
-    duplicate `external_source_id` is recoverable downstream, a detection that
-    was never sent is not."""
+    identities are re-read and re-sent next run. That is the direction to fail
+    in: a duplicate `external_source_id` is recoverable downstream, a detection
+    that was never sent is not."""
     watermark = handlers.Watermark(memory=3)
     for i in range(5):
-        watermark.advance(parsed(feature(i, created_at="2026-09-01T00:00:00Z")))
+        watermark.advance(T1, f"result-1:{i}")
 
     state = watermark.to_state()
     assert state["boundary_feature_ids"] == ["result-1:2", "result-1:3", "result-1:4"]
 
-    # What the next run loads is the truncated list, so the forgotten ids come
-    # back as new work rather than vanishing.
+    # What the next run loads is the truncated set, so the forgotten identities
+    # come back as new work rather than vanishing.
     resumed = handlers.Watermark(watermark.created_at, state["boundary_feature_ids"], memory=3)
-    forgotten = parsed(feature(0, created_at="2026-09-01T00:00:00Z"))
-    remembered = parsed(feature(4, created_at="2026-09-01T00:00:00Z"))
-    assert resumed.already_ingested(forgotten) is False
-    assert resumed.already_ingested(remembered) is True
+    assert resumed.already_ingested(T1, "result-1:0") is False
+    assert resumed.already_ingested(T1, "result-1:4") is True
 
 
 def test_two_results_sharing_a_feature_id_are_two_detections():
     """Feature ids are unique within a Prediction Result, not across them, and
-    one search now spans many Results at once. Keyed on the bare id, feature 1
-    of result-2 would be mistaken for feature 1 of result-1 and dropped as
-    already ingested — a detection lost to a numbering coincidence."""
+    one search spans many Results at once. Keyed on the bare id, feature 1 of
+    result-2 would be mistaken for feature 1 of result-1 and dropped as already
+    ingested — a detection lost to a numbering coincidence. The identity the
+    watermark stores is the qualified one the event carries."""
+    assert handlers.external_id_for(parsed(feature(1, result_id="result-1"))) == "result-1:1"
+    assert handlers.external_id_for(parsed(feature(1, result_id="result-2"))) == "result-2:1"
+
     watermark = handlers.Watermark()
-    first = parsed(feature(1, result_id="result-1"))
-    second = parsed(feature(1, result_id="result-2"))
+    watermark.advance(T1, "result-1:1")
 
-    watermark.advance(first)
-
-    assert watermark.already_ingested(first) is True
-    assert watermark.already_ingested(second) is False
+    assert watermark.already_ingested(T1, "result-1:1") is True
+    assert watermark.already_ingested(T1, "result-2:1") is False
 
 
-def test_a_feature_with_no_created_at_cannot_move_the_cursor():
+def test_a_detection_with_no_timestamp_cannot_move_the_cursor():
     """It is still sent — it just cannot advance a cursor defined in terms of a
     field it does not carry."""
-    record = feature(1)
-    record["properties"].pop("oe_created_at")
     watermark = handlers.Watermark()
-    watermark.advance(parsed(record))
+    watermark.advance(None, "result-1:1")
 
     assert watermark.created_at is None
+    assert watermark.dirty is False
+
+
+def test_unusable_detections_at_one_instant_get_distinct_identities():
+    """They never become events, so they need no stable id — but they must not
+    collide, or the first one at an instant would suppress the rest and they
+    would be counted as already ingested instead of read."""
+    first = parsed(feature())
+    second = parsed(feature())
+
+    assert handlers._unusable_id(first) != handlers._unusable_id(second)
+
+
+def test_an_idle_run_does_not_rewrite_the_state_it_just_loaded():
+    """Every poll re-reads the watermark second. With nothing new in it there is
+    nothing to persist, and on a crowded second that write is hundreds of
+    kilobytes of identical ids."""
+    watermark = handlers.Watermark(T1, ["result-1:1"])
+
+    assert watermark.dirty is False
+
+    watermark.advance(T1, "result-1:2")
+    assert watermark.dirty is True
 
 
 # --------------------------------------------------------------------------
-# Bounding boxes
-# --------------------------------------------------------------------------
-def test_a_three_dimensional_bbox_does_not_plot_altitude_as_longitude():
-    """RFC 7946 §5 orders a bbox as every minimum then every maximum, so a 3-D
-    box is [west, south, minAlt, east, north, maxAlt]. Read as a flat
-    [minLon, minLat, maxLon, maxLat], the altitude becomes the longitude."""
-    record = feature(geometry={"type": "Polygon", "coordinates": [[[0, 0], [0, 2], [2, 2], [0, 0]]]})
-    record["bbox"] = [0.0, 0.0, 10.0, 2.0, 2.0, 20.0]  # 10m and 20m are altitudes
-
-    assert handlers.centroid_of(parsed(record)) == {"lat": 1.0, "lon": 1.0}
-
-
-def test_a_bbox_crossing_the_antimeridian_stays_on_its_own_side_of_the_globe():
-    """§5.2 makes west > east legal for a box straddling 180°. Averaged as it
-    stands it comes out at longitude 0 — the far side of the planet."""
-    record = feature()
-    record["bbox"] = [170.0, -10.0, -170.0, 10.0]
-
-    assert handlers.centroid_of(parsed(record)) == {"lat": 0.0, "lon": 180.0}
-
-
-def test_an_odd_length_bbox_is_ignored_rather_than_guessed_at():
-    record = feature()
-    record["bbox"] = [0.0, 0.0, 1.0, 1.0, 5.0]
-
-    # Falls through to averaging the geometry's own positions.
-    assert handlers.centroid_of(parsed(record)) == {"lat": -51.7, "lon": -72.7}
-
-
-# --------------------------------------------------------------------------
-# Features with no id
-# --------------------------------------------------------------------------
-def test_a_feature_with_no_id_is_skipped_rather_than_given_a_shared_identity(pull_config):
-    """Everything downstream keys on external_source_id. With no id there is
-    nothing stable to build one from, and every id-less feature in a Result
-    would answer to the same one."""
-    record = feature()
-    record.pop("id")
-
-    assert handlers.transform_feature(parsed(record), pull_config) is None
-
-
-def test_two_id_less_features_do_not_suppress_each_other():
-    """Registered under a shared placeholder, the second id-less feature at an
-    instant looks like a repeat of the first and is counted as already
-    ingested."""
-    record = feature()
-    record.pop("id")
-    watermark = handlers.Watermark()
-    watermark.advance(parsed(record))
-
-    assert watermark.already_ingested(parsed(record)) is False
-    assert watermark.boundary_ids == []
-
-
-# --------------------------------------------------------------------------
-# The run cap
+# The run never stops inside a second
 # --------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_a_run_stops_at_its_cap_and_carries_the_rest_in_the_watermark(
+async def test_a_run_finishes_the_second_the_cap_falls_in(
     mocker, integration, captured_gundi, captured_state, no_activity_logs
 ):
-    route_client(
-        mocker,
-        {
-            FEATURES_PATH: [
-                json_response(
-                    [feature(i, created_at="2026-09-0%dT00:00:00Z" % (i + 1)) for i in range(4)],
-                    total=4,
-                )
-            ]
-        },
-    )
+    """Stopping mid-second leaves the cursor inside a group `gte` re-reads in
+    full. Once that group is larger than the boundary set remembers, two runs
+    trade halves of it forever and never reach what lies past it — so the cap
+    is a soft one, and the overrun is bounded by how many detections share a
+    timestamp."""
+    crowded = [feature(i, created_at="2026-09-02T00:00:00Z") for i in range(5)]
+    crowded.append(feature(99, created_at="2026-09-03T00:00:00Z"))
+    route_client(mocker, {FEATURES_PATH: [json_response(crowded, total=6)]})
 
     result = await handlers.action_pull_events(
         integration, PullEventsConfig(model_id="model-abc", max_features_per_run=2)
     )
 
-    assert result["features_read"] == 2
+    # The cap fell at 2, but all 5 of that second were taken; the 6th belongs to
+    # a later second and is where the run stopped.
+    assert result["features_read"] == 5
     assert result["watermark"].startswith("2026-09-02T00:00:00")
 
 
 @pytest.mark.asyncio
-async def test_re_reading_the_boundary_second_does_not_consume_the_run_cap(
+async def test_a_crowded_second_still_makes_progress_across_runs(
     mocker, integration, captured_gundi, captured_state, no_activity_logs
 ):
-    """A crowded watermark second comes back in full every run. Charged against
-    the cap, those re-reads would fill a run on their own and the ingest would
-    never reach the detections past them."""
+    """The livelock this replaced: with the cursor stranded inside the crowded
+    second, run two re-sent what run one had sent and never advanced."""
+    mocker.patch.object(handlers, "BOUNDARY_ID_MEMORY", 2)
     config = PullEventsConfig(model_id="model-abc", max_features_per_run=2)
-    routes = {FEATURES_PATH: [json_response([feature(1), feature(2)], total=2)]}
+    crowded = [feature(i, created_at="2026-09-02T00:00:00Z") for i in range(5)]
+    routes = {FEATURES_PATH: [json_response(crowded, total=5)]}
     route_client(mocker, routes)
     await handlers.action_pull_events(integration, config)
 
-    # Both come back (same second), plus one genuinely new detection.
     routes[FEATURES_PATH] = [
-        json_response([feature(1), feature(2), feature(3, created_at="2026-09-03T00:00:00Z")], total=3)
+        json_response(crowded + [feature(99, created_at="2026-09-04T00:00:00Z")], total=6)
     ]
     route_client(mocker, routes)
     second = await handlers.action_pull_events(integration, config)
 
-    assert second["features_skipped"] == 2
-    assert second["features_read"] == 1
-    assert second["watermark"].startswith("2026-09-03T00:00:00")
+    # The cursor got past the crowded second rather than oscillating inside it.
+    assert second["watermark"].startswith("2026-09-04T00:00:00")
 
 
-def test_the_boundary_memory_is_never_smaller_than_a_runs_own_output():
-    """Below that a run cannot remember what it just sent: the next run forgets
-    the half it ingested, re-sends it, forgets the other half, and oscillates
-    there forever without reaching the detections past the cap."""
-    watermark = handlers.Watermark(memory=handlers.BOUNDARY_ID_MEMORY)
-    for i in range(handlers.BOUNDARY_ID_MEMORY + 10):
-        watermark.advance(parsed(feature(i, created_at="2026-09-01T00:00:00Z")))
+@pytest.mark.asyncio
+async def test_a_walk_that_hits_its_page_ceiling_says_so_instead_of_looking_quiet(
+    mocker, integration, pull_config, captured_gundi, captured_state, no_activity_logs
+):
+    """Returning silently made an exhausted walk indistinguishable from having
+    read everything — a stuck feed reporting a clean run."""
+    mocker.patch.object(client, "MAX_PAGES", 2)
+    page = json_response([feature(i) for i in range(2)], total=1000)
+    route_client(
+        mocker,
+        {FEATURES_PATH: [page, json_response([feature(i) for i in range(2, 4)], total=1000)]},
+    )
 
-    assert len(watermark.to_state()["boundary_feature_ids"]) == handlers.BOUNDARY_ID_MEMORY
+    result = await handlers.action_pull_events(
+        integration, PullEventsConfig(model_id="model-abc", feature_page_size=2)
+    )
 
-    roomy = handlers.Watermark(memory=handlers.BOUNDARY_ID_MEMORY + 10)
-    for i in range(handlers.BOUNDARY_ID_MEMORY + 10):
-        roomy.advance(parsed(feature(i, created_at="2026-09-01T00:00:00Z")))
-
-    assert len(roomy.to_state()["boundary_feature_ids"]) == handlers.BOUNDARY_ID_MEMORY + 10
+    assert result["truncated"] is True

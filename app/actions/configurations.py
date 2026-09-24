@@ -20,6 +20,8 @@ from app.services.utils import (
     UIOptions,
 )
 
+import app.actions.client as client
+
 from .core import (
     AuthActionConfiguration,
     ExecutableActionMixin,
@@ -50,7 +52,7 @@ class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
 class PullEventsConfig(PullActionConfiguration):
     """The ingest query.
 
-    The first five fields are the *scope*: which Prediction Results this
+    The first four fields are the *scope*: which Prediction Results this
     integration reads. They go into the `prediction_results` half of the
     feature search, which is the half OlmoEarth access-controls. At least one
     of them is required — an unscoped search returns every Result the token can
@@ -156,7 +158,7 @@ class PullEventsConfig(PullActionConfiguration):
         ),
     )
     feature_page_size: int = FieldWithUIOptions(
-        500,
+        client.DEFAULT_FEATURE_PAGE_SIZE,
         ge=1,
         le=1000,
         title="Feature Page Size",
@@ -169,6 +171,24 @@ class PullEventsConfig(PullActionConfiguration):
         title="Events Per Request",
         description="How many events to send to Gundi in one request.",
     )
+
+    @pydantic.validator("area_of_interest")
+    def area_of_interest_is_a_geometry(cls, value):
+        """Reject a malformed AOI when it is saved, not when it is next used.
+
+        Same argument as the scope check below: the portal can show the
+        operator the field they got wrong, where a scheduled run can only fail.
+        """
+        if value is None:
+            return value
+        try:
+            client.Geometry.parse_obj(value)
+        except pydantic.ValidationError as e:
+            raise ValueError(
+                "This is not a valid GeoJSON geometry; it needs a `type` and "
+                "matching `coordinates`."
+            ) from e
+        return value
 
     @pydantic.root_validator
     def at_least_one_scope(cls, values):
@@ -236,7 +256,7 @@ class ListPredictionsConfig(ReferenceActionConfiguration):
         description="Optional. List only predictions in this status.",
     )
     limit: int = pydantic.Field(
-        100,
+        client.DEFAULT_PREDICTION_PAGE_SIZE,
         ge=1,
         le=500,
         title="Limit",

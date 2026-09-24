@@ -50,13 +50,16 @@ state_manager = IntegrationStateManager()
 
 PULL_EVENTS_ACTION_ID = "pull_events"
 
-# Floor on how many feature ids to remember at the watermark second. The
+# How many detection identities to remember at the watermark second. The
 # feature search is bounded with `oe_created_at >= watermark` (not `>`), so
-# everything sharing that second comes back every run; this list is what
+# everything sharing that second comes back every run; this set is what
 # recognises it. Bounded so the state row cannot grow without limit — and when
 # a single second holds more detections than this, the overflow is re-sent
-# rather than dropped. A run raises it to its own feature cap, so a run's
-# output always fits in what the next run remembers.
+# rather than dropped.
+#
+# No constant can make that overflow impossible, because the provider decides
+# how many detections share a second. What keeps the ingest moving is not this
+# number but the rule in the run loop below: a run never stops inside a second.
 BOUNDARY_ID_MEMORY = 5_000
 
 
@@ -168,6 +171,10 @@ def _bbox_centre(bbox: List[float]) -> Optional[Dict[str, float]]:
         # §5.2: a box straddling the antimeridian has west > east. Averaged as
         # it stands, the centre lands on the opposite side of the globe.
         max_lon += 360.0
+    elif max_lon - min_lon > 180.0:
+        # The same shape arriving as loose positions rather than a declared
+        # bbox: spanning more than half the globe is the signal that it wraps.
+        min_lon, max_lon = max_lon, min_lon + 360.0
     lon = (min_lon + max_lon) / 2
     if lon > 180.0:
         lon -= 360.0
@@ -189,13 +196,20 @@ def centroid_of(feature: client.Feature) -> Optional[Dict[str, float]]:
         return centre
     if not feature.geometry:
         return None
-    positions = list(_flatten_positions(feature.geometry.coordinates))
-    if not positions:
+    # Reduce the positions to a bounding box and go through the same function,
+    # so there is exactly one place that knows longitudes wrap. Averaging the
+    # vertices directly put a shape spanning the antimeridian at longitude 0.
+    min_lon = min_lat = max_lon = max_lat = None
+    for lon, lat in _flatten_positions(feature.geometry.coordinates):
+        if min_lon is None:
+            min_lon = max_lon = lon
+            min_lat = max_lat = lat
+            continue
+        min_lon, max_lon = min(min_lon, lon), max(max_lon, lon)
+        min_lat, max_lat = min(min_lat, lat), max(max_lat, lat)
+    if min_lon is None:
         return None
-    return {
-        "lat": sum(lat for _, lat in positions) / len(positions),
-        "lon": sum(lon for lon, _ in positions) / len(positions),
-    }
+    return _bbox_centre([min_lon, min_lat, max_lon, max_lat])
 
 
 # --------------------------------------------------------------------------
@@ -265,7 +279,14 @@ def transform_feature(feature: client.Feature, config: PullEventsConfig) -> Opti
         "external_source_id": external_id_for(feature),
     }
     if config.include_geometry and feature.geometry:
-        event["geometry"] = feature.geometry.dict(exclude_none=True)
+        # Not `.dict()`: `coordinates` is typed Any, so pydantic deep-copies the
+        # whole nested array for every feature. No field under Geometry is a
+        # model, so taking the set values as they are gives the same dict.
+        event["geometry"] = {
+            name: value
+            for name, value in feature.geometry.__dict__.items()
+            if value is not None
+        }
     return event
 
 
@@ -280,16 +301,6 @@ def external_id_for(feature: client.Feature) -> str:
     return f"{result_id}:{feature.id}" if result_id else str(feature.id)
 
 
-def _boundary_id(feature: client.Feature) -> Optional[str]:
-    """The identity the watermark remembers, or None for a feature with no id.
-
-    An id-less feature never becomes an event, so it has nothing to deduplicate
-    against — and registering it under a shared placeholder would make the
-    *next* id-less feature at the same instant look like a repeat of it.
-    """
-    return None if feature.id is None else external_id_for(feature)
-
-
 def _event_title(feature: client.Feature, config: PullEventsConfig) -> str:
     label = config.event_title_prefix or "OlmoEarth"
     return f"{label} detection {feature.id}" if feature.id is not None else f"{label} detection"
@@ -301,91 +312,87 @@ def _event_title(feature: client.Feature, config: PullEventsConfig) -> str:
 class Watermark:
     """How far the ingest has read, and what it has already sent at that instant.
 
-    `created_at` is the newest `oe_created_at` ingested. `boundary_ids` are the
-    features already sent carrying exactly that timestamp — the set the next
+    `created_at` is the newest `oe_created_at` ingested. The boundary set holds
+    the identities already sent carrying exactly that timestamp — what the next
     run's `gte` re-read has to subtract.
 
-    A boundary id is the *qualified* id, the same `external_source_id` the
-    event carries. A raw feature id is only unique within its Prediction
-    Result, and one search now spans many Results at once: keyed on the bare
-    id, feature 1 of result-2 would look like feature 1 of result-1 and be
-    dropped as already ingested.
+    It takes `(created_at, external_id)` pairs rather than features: a cursor is
+    defined over those two values, and a feature that cannot supply both is not
+    this class's problem to detect. One insertion-ordered dict serves as the set
+    — membership is O(1), and the order is what `to_state()`'s truncation keeps.
+
+    An identity is the *qualified* id, the same `external_source_id` the event
+    carries. A bare feature id is unique only within its Prediction Result, and
+    one search spans many Results at once: keyed on the bare id, feature 1 of
+    result-2 would look like feature 1 of result-1 and be dropped.
     """
 
     def __init__(
         self,
         created_at: Optional[datetime.datetime] = None,
-        boundary_ids: Optional[List[str]] = None,
+        boundary_ids: Optional[Iterable[str]] = None,
         memory: int = BOUNDARY_ID_MEMORY,
     ):
         self.created_at = created_at
-        self.boundary_ids = list(boundary_ids or [])
-        self._boundary_lookup = set(self.boundary_ids)
-        # Never remember less than one run can ingest. Below that the run's own
-        # output does not fit, and a second holding more detections than this
-        # oscillates: each run forgets the half it just sent, re-sends it, and
-        # forgets the other half — never reaching the detections past the cap.
-        self.memory = max(memory, 1)
+        self._boundary: Dict[str, None] = dict.fromkeys(boundary_ids or [])
+        self.memory = memory
+        self.dirty = False
         self.overflowed = False
 
-    def already_ingested(self, feature: client.Feature) -> bool:
-        """True for a feature this watermark has already accounted for."""
-        created = feature.properties.oe_created_at
-        if self.created_at is None or created is None:
-            return False
-        feature_id = _boundary_id(feature)
-        if feature_id is None:
-            return False
-        return _as_utc(created) == self.created_at and feature_id in self._boundary_lookup
+    @property
+    def boundary_ids(self) -> List[str]:
+        return list(self._boundary)
 
-    def advance(self, feature: client.Feature) -> None:
-        """Record that `feature` has been ingested."""
-        created = feature.properties.oe_created_at
-        if created is None:
-            # Nothing to advance to. The feature is still sent; it just cannot
-            # move a cursor that is defined in terms of a field it lacks.
+    def already_ingested(self, created_at: Optional[datetime.datetime], external_id: str) -> bool:
+        """True for an identity this watermark has already accounted for."""
+        if self.created_at is None or created_at is None:
+            return False
+        return _as_utc(created_at) == self.created_at and external_id in self._boundary
+
+    def advance(self, created_at: Optional[datetime.datetime], external_id: str) -> None:
+        """Record that `external_id` has been ingested."""
+        if created_at is None:
+            # Nothing to advance to. The detection is still sent; it just cannot
+            # move a cursor defined in terms of a field it lacks.
             return
-        created = _as_utc(created)
-        feature_id = _boundary_id(feature)
-        if self.created_at is None or created > self.created_at:
-            self.created_at = created
-            self.boundary_ids = [feature_id] if feature_id else []
-            self._boundary_lookup = set(self.boundary_ids)
-            return
-        if created == self.created_at and feature_id and feature_id not in self._boundary_lookup:
-            self.boundary_ids.append(feature_id)
-            self._boundary_lookup.add(feature_id)
+        created_at = _as_utc(created_at)
+        self.dirty = True
+        if self.created_at is None or created_at > self.created_at:
+            self.created_at = created_at
+            # Identities at an instant the cursor has passed are dead weight:
+            # `gte` on a later timestamp already excludes them.
+            self._boundary = {external_id: None}
+        elif created_at == self.created_at:
+            self._boundary[external_id] = None
 
     def to_state(self) -> dict:
-        """The persisted form, with the boundary list bounded.
+        """The persisted form, with the boundary set bounded.
 
-        Truncation is deliberately in the duplicate direction: a forgotten id
-        at the boundary second is re-read and re-sent next run, where a `gt`
-        cursor would have skipped it silently. Gundi sees the same
+        Truncation is deliberately in the duplicate direction: a forgotten
+        identity at the boundary second is re-read and re-sent next run, where
+        a `gt` cursor would have skipped it silently. Gundi sees the same
         `external_source_id` twice, which is recoverable; a missing detection
         is not.
         """
         boundary = self.boundary_ids
-        if len(boundary) > self.memory:
-            if not self.overflowed:
-                logger.warning(
-                    "More than %s features share the watermark second %s; only the "
-                    "most recent %s are remembered, so the rest may be re-sent next "
-                    "run as duplicate events with the same external_source_id.",
-                    self.memory,
-                    self.created_at.isoformat() if self.created_at else None,
-                    self.memory,
-                )
-                self.overflowed = True
-            boundary = boundary[-self.memory :]
+        if len(boundary) > self.memory and not self.overflowed:
+            self.overflowed = True
+            logger.warning(
+                "More than %s detections share the watermark second %s; only the "
+                "most recent %s are remembered, so the rest are re-sent next run "
+                "as duplicate events with the same external_source_id.",
+                self.memory,
+                self.created_at.isoformat() if self.created_at else None,
+                self.memory,
+            )
         return {
             "last_feature_created_at": self.created_at.isoformat() if self.created_at else None,
-            "boundary_feature_ids": boundary,
+            "boundary_feature_ids": boundary[-self.memory :],
             "updated_at": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
         }
 
 
-async def _load_watermark(integration_id: str, memory: int = BOUNDARY_ID_MEMORY) -> Watermark:
+async def _load_watermark(integration_id: str) -> Watermark:
     state = await state_manager.get_state(integration_id, PULL_EVENTS_ACTION_ID) or {}
     last_seen = state.get("last_feature_created_at")
     parsed = None
@@ -398,18 +405,24 @@ async def _load_watermark(integration_id: str, memory: int = BOUNDARY_ID_MEMORY)
                 "to the configured lookback.",
                 last_seen, integration_id,
             )
-    return Watermark(parsed, state.get("boundary_feature_ids") or [], memory=memory)
+    return Watermark(parsed, state.get("boundary_feature_ids") or [])
 
 
 async def _save_watermark(integration_id: str, watermark: Watermark) -> None:
-    await state_manager.set_state(
-        integration_id, PULL_EVENTS_ACTION_ID, watermark.to_state()
-    )
+    """Persist the cursor, unless nothing has moved it since the last write.
+
+    An idle run reads only re-reads, advances nothing, and would otherwise
+    write back the state it just loaded — which on a crowded boundary second is
+    a few hundred kilobytes of identical ids, six times a day, per integration.
+    """
+    if not watermark.dirty:
+        return
+    await state_manager.set_state(integration_id, PULL_EVENTS_ACTION_ID, watermark.to_state())
+    watermark.dirty = False
 
 
 def _parse_datetime(value: str) -> datetime.datetime:
-    parsed = pydantic.datetime_parse.parse_datetime(value)
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=datetime.timezone.utc)
+    return _as_utc(pydantic.datetime_parse.parse_datetime(value))
 
 
 def _as_utc(value: datetime.datetime) -> datetime.datetime:
@@ -495,30 +508,50 @@ async def action_pull_events(integration, action_config: PullEventsConfig) -> di
     integration_id = str(integration.id)
     logger.info(f"Executing pull_events for integration {integration_id}...")
 
-    watermark = await _load_watermark(
-        integration_id, memory=action_config.max_features_per_run
-    )
+    watermark = await _load_watermark(integration_id)
     since = watermark.created_at or (
         datetime.datetime.now(tz=datetime.timezone.utc)
         - datetime.timedelta(days=action_config.lookback_days)
     )
     request = build_feature_search(action_config, since)
 
-    totals = {"features_read": 0, "features_skipped": 0, "events_sent": 0}
+    totals = {"features_read": 0, "features_skipped": 0, "events_sent": 0, "truncated": False}
     batch: List[dict] = []
 
     async with client_for(integration) as api:
-        async for feature in api.iter_features(request):
-            if watermark.already_ingested(feature):
-                # Re-read because the search is bounded with `gte`. Expected,
-                # not an anomaly: every run re-reads the watermark second, and
-                # a re-read is not work, so it does not count against the cap.
-                totals["features_skipped"] += 1
-                continue
-            totals["features_read"] += 1
-            event = transform_feature(feature, action_config)
-            watermark.advance(feature)
-            if event:
+        try:
+            async for feature in api.iter_features(request):
+                created_at = feature.properties.oe_created_at
+                if totals["features_read"] >= action_config.max_features_per_run and not (
+                    _same_instant(created_at, watermark.created_at)
+                ):
+                    # The cap is reached, and this detection belongs to a later
+                    # second than the one being read — a safe place to stop.
+                    logger.info(
+                        "Stopped at the %s-detection cap for this run; the watermark "
+                        "carries the rest into the next one.",
+                        action_config.max_features_per_run,
+                    )
+                    break
+
+                event = transform_feature(feature, action_config)
+                if event is None:
+                    # Unusable: no id, no geometry, or no timestamp. It still
+                    # counts as read, so the cursor can move past it.
+                    totals["features_read"] += 1
+                    watermark.advance(created_at, _unusable_id(feature))
+                    continue
+
+                external_id = event["external_source_id"]
+                if watermark.already_ingested(created_at, external_id):
+                    # Re-read because the search is bounded with `gte`. Expected,
+                    # not an anomaly: every run re-reads the watermark second, and
+                    # a re-read is not work, so it does not count against the cap.
+                    totals["features_skipped"] += 1
+                    continue
+
+                totals["features_read"] += 1
+                watermark.advance(created_at, external_id)
                 batch.append(event)
                 if len(batch) >= action_config.events_per_request:
                     totals["events_sent"] += await _send_events(batch, integration_id)
@@ -527,13 +560,13 @@ async def action_pull_events(integration, action_config: PullEventsConfig) -> di
                     # fails on the fifth batch of six must not re-send the
                     # first four.
                     await _save_watermark(integration_id, watermark)
-            if totals["features_read"] >= action_config.max_features_per_run:
-                logger.info(
-                    "Stopped at the %s-detection cap for this run; the watermark "
-                    "carries the rest into the next one.",
-                    action_config.max_features_per_run,
-                )
-                break
+        except client.FeatureWalkTruncated as truncation:
+            # The walk hit its page ceiling with matches unread. Everything
+            # yielded so far is good and is kept; the run just is not complete,
+            # and saying so is the difference between a visible problem and a
+            # stuck feed reporting a quiet day.
+            totals["truncated"] = True
+            logger.warning("%s Narrow the query to see the rest.", truncation)
 
         if batch:
             totals["events_sent"] += await _send_events(batch, integration_id)
@@ -544,13 +577,13 @@ async def action_pull_events(integration, action_config: PullEventsConfig) -> di
         # forever, and never past them once there are a capful.
         await _save_watermark(integration_id, watermark)
 
-        if not totals["events_sent"]:
+        if not totals["events_sent"] and not totals["truncated"]:
             # An empty run is ambiguous on this endpoint: it accepts anonymous
             # callers, so an expired token returns 200 with only the public
             # Results — which for a private feed is zero detections and no
             # error. Ask an endpoint that does require auth before calling it
             # a quiet day.
-            await _confirm_token_still_works(api, integration_id, action_config)
+            await api.verify_token()
 
     await _log_run(integration_id, action_config, since, totals)
 
@@ -559,17 +592,33 @@ async def action_pull_events(integration, action_config: PullEventsConfig) -> di
     return totals
 
 
-async def _confirm_token_still_works(
-    api: client.OlmoEarthClient, integration_id: str, config: PullEventsConfig
-) -> None:
-    """Prove the token still authenticates, so an empty run means "nothing new".
+def _same_instant(
+    created_at: Optional[datetime.datetime], cursor: Optional[datetime.datetime]
+) -> bool:
+    """Whether a detection belongs to the second the cursor currently names.
 
-    Costs one request, and only on runs that found nothing — which is the only
-    time the answer is in doubt. A rejected token raises `IntegrationAuthError`
-    out of the client, which fails the action and shows up in the portal as an
-    auth problem instead of a run that quietly did nothing.
+    This is what makes the run cap safe. Stopping mid-second leaves the cursor
+    inside a group that `gte` will re-read in full, so the next run re-reads
+    what this one already sent and — once a second holds more detections than
+    the boundary set remembers — the two runs trade halves forever without ever
+    reaching what lies past them. Finishing the second the cap fell in costs an
+    overrun bounded by how many detections share one timestamp, and in exchange
+    the cursor always lands *between* groups, where `gte` re-reads nothing that
+    was not fully drained.
     """
-    await api.search_predictions(client.PredictionSearchRequest(limit=1))
+    if created_at is None or cursor is None:
+        return False
+    return _as_utc(created_at) == cursor
+
+
+def _unusable_id(feature: client.Feature) -> str:
+    """A boundary identity for a detection that will never become an event.
+
+    It only has to be distinct from every real `external_source_id` and from
+    the other unusable detections at its instant, so that one cannot suppress
+    another. Nothing downstream ever sees it.
+    """
+    return f"unusable:{feature.properties.oe_prediction_result_id}:{id(feature)}"
 
 
 async def _log_run(

@@ -28,6 +28,7 @@ only Results marked public. Nothing here can tell that apart from "no new
 detections", so the pull action confirms the token against the predictions
 search — which does require auth — before reporting an empty run.
 """
+import json
 import logging
 from datetime import datetime
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -42,6 +43,7 @@ from app.services.errors import (
     IntegrationConfigurationError,
     IntegrationConnectionError,
     IntegrationRateLimitError,
+    source_status_code,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,14 +65,26 @@ MAX_PAGES = 200
 # --------------------------------------------------------------------------
 # Filter primitives
 # --------------------------------------------------------------------------
+class FeatureWalkTruncated(Exception):
+    """Paging stopped at `MAX_PAGES` with matches still unread.
+
+    Raised rather than returned because the alternative — ending the loop
+    quietly — is indistinguishable from having read everything, and the caller
+    would report a truncated run as a clean one.
+    """
+
+    def __init__(self, yielded: int):
+        super().__init__(
+            f"Stopped paging features after {MAX_PAGES} pages ({yielded} features)."
+        )
+        self.yielded = yielded
+
+
 class _Filter(pydantic.BaseModel):
     """Base for the operator objects. Unset operators are never serialized."""
 
     class Config:
         extra = "forbid"
-
-    def is_empty(self) -> bool:
-        return not self.dict(exclude_none=True)
 
 
 class KeywordFilter(_Filter):
@@ -81,13 +95,6 @@ class KeywordFilter(_Filter):
     inc: Optional[List[str]] = None
     ninc: Optional[List[str]] = None
     exists: Optional[bool] = None
-
-
-class OrganizationFilter(_Filter):
-    """Organization accepts only `eq` and `inc` (see the documented schema)."""
-
-    eq: Optional[str] = None
-    inc: Optional[List[str]] = None
 
 
 class StringFilter(_Filter):
@@ -158,7 +165,6 @@ class Geometry(pydantic.BaseModel):
 class _SearchRequest(pydantic.BaseModel):
     class Config:
         extra = "forbid"
-        json_encoders = {datetime: lambda dt: dt.isoformat()}
 
     def as_body(self) -> dict:
         """The request body with every unset operator dropped.
@@ -166,9 +172,7 @@ class _SearchRequest(pydantic.BaseModel):
         Goes through ``json()`` rather than ``dict()`` so datetimes are ISO
         strings and the body is JSON-serializable as-is.
         """
-        import json
-
-        return json.loads(self.json(exclude_none=True, exclude_defaults=False))
+        return json.loads(self.json(exclude_none=True))
 
 
 class PredictionSearchRequest(_SearchRequest):
@@ -177,7 +181,7 @@ class PredictionSearchRequest(_SearchRequest):
     limit: int = DEFAULT_PREDICTION_PAGE_SIZE
     offset: int = 0
     id: Optional[KeywordFilter] = None
-    organization_id: Optional[OrganizationFilter] = None
+    organization_id: Optional[KeywordFilter] = None
     project_id: Optional[KeywordFilter] = None
     model_id: Optional[KeywordFilter] = None
     requester_id: Optional[KeywordFilter] = None
@@ -473,6 +477,19 @@ class OlmoEarthClient:
         payload = await self._post(self.FEATURES_PATH, request.as_body())
         return self._parse(FeatureSearchResponse, payload, self.FEATURES_PATH)
 
+    async def verify_token(self) -> Optional[int]:
+        """Prove the token authenticates; report how many predictions it can see.
+
+        Asks the predictions search rather than the features search, and that
+        choice is the whole point of the method: the features endpoint is
+        `optional_auth`, so an invalid or expired token is not rejected there —
+        the caller is quietly downgraded to anonymous and gets the public
+        Results. The predictions search requires a real user, so it is the one
+        that gives a straight answer. Callers need the answer, not the reason.
+        """
+        response = await self.search_predictions(PredictionSearchRequest(limit=1))
+        return response.meta.total
+
     # -- paging ------------------------------------------------------------
     async def iter_features(self, request: FeatureSearchRequest) -> AsyncIterator[Feature]:
         """Yield every feature matching `request`, a page at a time.
@@ -490,10 +507,17 @@ class OlmoEarthClient:
         request = request.copy(deep=True)
         request.features.sort_by = "oe_created_at"
         request.features.sort_direction = "asc"
-        request.features.offset = request.features.offset or 0
+        # Serialized once: paging changes one integer, and re-encoding the whole
+        # body per page re-walks the area-of-interest geometry every time.
+        body = request.as_body()
+        limit = request.features.limit
+        offset = request.features.offset
         yielded = 0
         for _ in range(MAX_PAGES):
-            response = await self.search_features(request)
+            body["features"]["offset"] = offset
+            response = self._parse(
+                FeatureSearchResponse, await self._post(self.FEATURES_PATH, body), self.FEATURES_PATH
+            )
             if not response.records:
                 return
             for feature in response.records:
@@ -501,16 +525,12 @@ class OlmoEarthClient:
                 yielded += 1
             # A short page is the last page. `meta.total` is a second, cheaper
             # stop for a provider that always fills the page.
-            if len(response.records) < request.features.limit:
+            if len(response.records) < limit:
                 return
-            request.features.offset += request.features.limit
-            if response.meta.total is not None and request.features.offset >= response.meta.total:
+            offset += limit
+            if response.meta.total is not None and offset >= response.meta.total:
                 return
-        logger.warning(
-            "Stopped paging features after %s pages (%s features). Narrow the query "
-            "— by area, model, time window or a property filter — to see the rest.",
-            MAX_PAGES, yielded,
-        )
+        raise FeatureWalkTruncated(yielded)
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -518,7 +538,7 @@ def _is_transient(exc: BaseException) -> bool:
     if isinstance(exc, (IntegrationConnectionError, IntegrationRateLimitError)):
         return True
     if isinstance(exc, IntegrationBadResponseError):
-        return (getattr(exc, "status_code", None) or 0) >= 500
+        return (source_status_code(exc) or 0) >= 500
     return False
 
 
@@ -548,7 +568,7 @@ def _classify_status_error(exc: httpx.HTTPStatusError):
         return IntegrationConfigurationError(
             "This integration's filters match more Prediction Results than "
             "OlmoEarth will search at once. Narrow it with a target area, a "
-            "model, a project, or a shorter lookback.",
+            "model, a project or an organization.",
             status_code=status,
         )
     if status == 404:
