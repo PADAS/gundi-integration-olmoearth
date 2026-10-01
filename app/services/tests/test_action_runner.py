@@ -2371,3 +2371,276 @@ async def test_execute_action_handles_httpx_error_carrying_no_request(
     error_details = json.loads(response.body)["detail"]
     assert error_details["error"] == "Could not reach the provider — connection failed"
     assert error_details["error_type"] == "connectivity"
+
+
+@pytest.mark.asyncio
+async def test_execute_action_reports_the_runner_timeout_as_action_timed_out(
+        mocker, mock_gundi_client_v2, integration_v2, mock_config_manager,
+        mock_publish_event, mock_action_handlers,
+):
+    # The runner's own execution cap is not a provider failure and must not
+    # render as "Could not reach the provider" (see the savannahtracking and
+    # vectronic incidents of 2026-09-22).
+    import asyncio
+    _, config_model, transform = mock_action_handlers["pull_observations"]
+
+    cancelled = []
+
+    async def slow_handler(**kwargs):
+        try:
+            await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    mock_action_handlers["pull_observations"] = (slow_handler, config_model, transform)
+    mocker.patch.object(settings, "MAX_ACTION_EXECUTION_TIME", 0.01)
+    mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
+    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+
+    response = await execute_action(
+        integration_id=str(integration_v2.id),
+        action_id="pull_observations",
+    )
+
+    assert response.status_code == 504
+    error_details = json.loads(response.body)["detail"]
+    assert error_details["error"] == "Action timed out — exceeded the 0.01 s execution limit"
+    assert error_details["error_type"] == "timeout"
+    assert "Could not reach the provider" not in error_details["error"]
+    # The cap cancels the handler, as wait_for did.
+    assert cancelled == [True]
+
+
+@pytest.mark.asyncio
+async def test_execute_action_keeps_connectivity_wording_for_a_timeout_the_handler_raised(
+        mocker, mock_gundi_client_v2, integration_v2, mock_config_manager,
+        mock_publish_event, mock_action_handlers,
+):
+    # Review on #115: asyncio.wait_for re-raises an asyncio.TimeoutError that
+    # the handler itself raised (aiohttp's provider timeout), and an except
+    # clause keyed on the type relabelled it as the execution cap. Only the
+    # runner's own expired deadline may become ActionTimeoutError.
+    import asyncio
+    _, config_model, transform = mock_action_handlers["pull_observations"]
+
+    async def provider_timed_out(**kwargs):
+        raise asyncio.TimeoutError("provider request timed out")
+
+    mock_action_handlers["pull_observations"] = (provider_timed_out, config_model, transform)
+    mocker.patch.object(settings, "MAX_ACTION_EXECUTION_TIME", 540)
+    mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
+    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+
+    response = await execute_action(
+        integration_id=str(integration_v2.id),
+        action_id="pull_observations",
+    )
+
+    assert response.status_code == 500
+    error_details = json.loads(response.body)["detail"]
+    assert error_details["error"] == "Could not reach the provider — provider request timed out"
+    assert error_details["error_type"] == "connectivity"
+
+
+def test_ephemeral_handler_timeout_reports_action_timed_out_with_504(
+        mocker, mock_gundi_client_v2, mock_config_manager,
+        mock_publish_event, mock_reference_action_handler, mock_pull_observations_action_handler,
+        mock_push_action_handler, mock_generic_action_handler,
+):
+    import asyncio
+
+    async def slow_auth_handler(**kwargs):
+        await asyncio.sleep(1)
+
+    handlers = {
+        "list_species": (mock_reference_action_handler, _MockReferenceActionConfiguration, None),
+        "pull_observations": (mock_pull_observations_action_handler, MockPullActionConfiguration, None),
+        "auth": (slow_auth_handler, _MockAuthActionConfiguration, None),
+        "push_observations": (mock_push_action_handler, MockPushActionConfiguration, None),
+        "generic_lookup": (mock_generic_action_handler, _MockGenericActionConfiguration, None),
+    }
+    mocker.patch.object(settings, "MAX_ACTION_EXECUTION_TIME", 0.01)
+    mocker.patch("app.services.action_runner.action_handlers", handlers)
+    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+
+    response = api_client.post("/v1/actions/execute/", json=_ephemeral_body(action_id="auth"))
+
+    assert response.status_code == 504
+    # Runner-authored title only: the ephemeral path drops the message segment.
+    assert response.json() == {"detail": {"action_id": "auth", "error": "Action timed out"}}
+
+
+@pytest.mark.asyncio
+async def test_cancelling_execute_action_cancels_the_running_handler(
+        mocker, mock_gundi_client_v2, integration_v2, mock_config_manager,
+        mock_publish_event, mock_action_handlers,
+):
+    # Review on #115: asyncio.wait does not propagate cancellation to the task
+    # it waits on, unlike wait_for. A cancelled runner (the request or the
+    # process going away) must take its handler down with it, or the handler
+    # keeps publishing and writing state with no deadline at all.
+    import asyncio
+    _, config_model, transform = mock_action_handlers["pull_observations"]
+    started = asyncio.Event()
+    handler_events = []
+
+    async def long_handler(**kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()  # never set: runs until cancelled
+        except asyncio.CancelledError:
+            handler_events.append("cancelled")
+            raise
+        finally:
+            handler_events.append("cleaned up")
+
+    mock_action_handlers["pull_observations"] = (long_handler, config_model, transform)
+    mocker.patch.object(settings, "MAX_ACTION_EXECUTION_TIME", 540)
+    mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
+    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+
+    runner = asyncio.ensure_future(execute_action(
+        integration_id=str(integration_v2.id),
+        action_id="pull_observations",
+    ))
+    await asyncio.wait_for(started.wait(), timeout=5)
+
+    runner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await runner
+
+    # By the time the runner's cancellation propagates, the handler has been
+    # cancelled and its cleanup has run: nothing is left running unbounded.
+    assert handler_events == ["cancelled", "cleaned up"]
+
+
+@pytest.mark.asyncio
+async def test_cancelling_execute_action_during_deadline_cleanup_propagates(
+        mocker, mock_gundi_client_v2, integration_v2, mock_config_manager,
+        mock_publish_event, mock_action_handlers,
+):
+    # Cancellation of the runner while the timed-out handler is unwinding
+    # must not be mistaken for the handler's expected CancelledError.
+    import asyncio
+    _, config_model, transform = mock_action_handlers["pull_observations"]
+    cleanup_started = asyncio.Event()
+
+    async def long_handler(**kwargs):
+        try:
+            await asyncio.Event().wait()  # never set: runs until cancelled
+        finally:
+            cleanup_started.set()
+            await asyncio.Event().wait()
+
+    mock_action_handlers["pull_observations"] = (long_handler, config_model, transform)
+    mocker.patch.object(settings, "MAX_ACTION_EXECUTION_TIME", 0.01)
+    mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
+    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+
+    runner = asyncio.ensure_future(execute_action(
+        integration_id=str(integration_v2.id),
+        action_id="pull_observations",
+    ))
+    try:
+        await asyncio.wait_for(cleanup_started.wait(), timeout=5)
+        runner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await runner
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
+class _InnocentlyNamedSecretAuthConfiguration(AuthActionConfiguration):
+    username: str
+    login_code: pydantic.SecretStr
+
+
+@pytest.mark.asyncio
+async def test_handler_failure_redacts_the_stored_configurations_it_attaches(
+        mocker, mock_gundi_client_v2, mock_config_manager, mock_publish_event, mock_action_handlers,
+        integration_v2_as_dict,
+):
+    # A saved-integration failure attaches every configuration row to the
+    # IntegrationActionFailed event and the JSON response, auth row included.
+    # Secrets must be masked whether they are recognizable by name ("token")
+    # or only by the connector's model ("login_code" is a SecretStr); the rest
+    # of the configuration stays readable for whoever debugs the failure.
+    from gundi_core.schemas.v2 import Integration
+    from app.services.redaction import REDACTED
+    stored = integration_v2_as_dict
+    for row in stored["configurations"]:
+        if row["action"]["value"] == "auth":
+            row["data"] = {"username": "me@example.com", "token": "tok-123", "login_code": "code-456"}
+    integration = Integration.parse_obj(stored)
+    mock_config_manager.get_integration_details = AsyncMock(return_value=integration)
+    handler, _, _ = mock_action_handlers["pull_observations"]
+    handler.side_effect = RuntimeError("provider exploded")
+    mock_action_handlers["auth"] = (AsyncMock(), _InnocentlyNamedSecretAuthConfiguration, None)
+    mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
+    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+
+    response = api_client.post(
+        "/v1/actions/execute/",
+        json={"integration_id": str(integration.id), "action_id": "pull_observations"},
+    )
+
+    assert response.status_code == 500
+    assert "tok-123" not in response.text
+    assert "code-456" not in response.text
+    rows = {row["action"]["value"]: row["data"] for row in response.json()["detail"]["config_data"]["configurations"]}
+    assert rows["auth"] == {"username": "me@example.com", "token": REDACTED, "login_code": REDACTED}
+    assert rows["pull_events"] == {"start_datetime": "2023-11-16T00:00:00-03:00"}
+    events = _published_events_of_type(mock_publish_event, IntegrationActionFailed)
+    assert len(events) == 1
+    published_rows = {row["action"]["value"]: row["data"] for row in events[0].payload.config_data["configurations"]}
+    assert published_rows["auth"] == {"username": "me@example.com", "token": REDACTED, "login_code": REDACTED}
+    assert "tok-123" not in events[0].json()
+    assert "code-456" not in events[0].json()
+
+
+@pytest.mark.asyncio
+async def test_invalid_config_failure_redacts_the_action_config_it_attaches(
+        mocker, mock_gundi_client_v2, integration_v2, mock_config_manager,
+        mock_publish_event, mock_action_handlers,
+):
+    # A manual run whose config fails validation attaches that config (the
+    # flat action-config shape, not the configurations list) to the failure.
+    from app.services.redaction import REDACTED
+    mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
+    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    bad_config = mocker.MagicMock()
+    bad_config.data = {"lookback_days": "two", "api_key": "key-789"}
+    mock_config_manager.get_action_configuration.return_value = async_return(bad_config)
+
+    response = await execute_action(
+        integration_id=str(integration_v2.id), action_id="pull_observations", triggered_by="manual",
+    )
+
+    assert response.status_code == 422
+    assert "key-789" not in response.body.decode()
+    events = _published_events_of_type(mock_publish_event, IntegrationActionFailed)
+    assert len(events) == 1
+    assert events[0].payload.config_data == {"lookback_days": "two", "api_key": REDACTED}
