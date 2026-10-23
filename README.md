@@ -1,123 +1,133 @@
 # gundi-integration-olmoearth
-Gundi v2 connector for the OlmoEarth prediction API, built on the action-runner
-template. The template's own documentation follows the connector section below.
 
-## The OlmoEarth connector
+Prototype of a scheduled LCC change monitor using the public APIs on OlmoEarth Studio
+`develop`. It does **not** depend on Studio PR #3226 or a cross-result feature endpoint.
+One saved Gundi integration is one area/model monitor; create another integration for another area.
 
-Three actions, in `app/actions/`:
+## Configure the pilot
 
-| Action | Type | What it does |
+The Gundi action schemas generate the form. Use the integration's base URL for the
+OlmoEarth environment and configure its Authenticate action with the API token.
+
+1. Save **Collect LCC Events** (`pull_events`) using `examples/lcc-monitor.json` as a
+   starting point. Every ID and the small example polygon are placeholders. Replace the
+   project/model/organization, area, date-property name and aggregation through the form.
+2. Choose mining or other `post_change` labels in the multi-select, or enable **Select all
+   change types**. The enum is the current LCC legend, excluding nodata and `none`; verify
+   it against the selected registered model before using a different model version.
+3. Set the first prediction date and weekly/monthly/quarterly/annual frequency. Select a
+   recent start date unless you intentionally want historical catch-up. Monthly/yearly
+   slots retain the original day, clamping to the month's last day as needed.
+4. Use a model configured to polygonize `post_change` with auxiliary properties and an
+   actual ISO date field. Studio has no prediction-request vectorization flag. Raw
+   timestep indices and encoded month counts are rejected, not guessed into dates.
+5. Save **Submit LCC Predictions** (`submit_predictions`). Scheduled submission defaults
+   to disabled; enable it when ready, or run the action manually to submit one due job.
+   A manual action can incur OlmoEarth prediction charges.
+6. Configure the Gundi route/EarthRanger event type and verify polygon rendering in the
+   destination. The event carries both the polygon and a point guaranteed inside it.
+
+The prediction API requires a project. A partner project is a useful default. Organization
+is optional; when supplied it must own that project. API credentials still enforce access.
+Neither IDs nor the OlmoEarth environment are hardcoded in the connector.
+
+## Workflow
+
+| Action | Schedule | Behavior |
 | --- | --- | --- |
-| `auth` | auth | Validates the API token by asking the predictions search for one record. |
-| `list_predictions` | reference | Populates a portal dropdown of predictions, newest first. |
-| `pull_events` | pull (every 4h) | The ingest. Detections → Gundi events. |
+| `auth` | on demand | Verify token using authenticated prediction search. |
+| `list_predictions` | reference lookup | List a project's predictions for inspection. |
+| `submit_predictions` | every four hours, opt-in | Submit one due schedule slot if no job is in flight. |
+| `pull_events` | every four hours, at :15 | Poll saved jobs, filter features, and deliver events. |
+| `resolve_delivery` | manual only | Resolve a delivery whose acknowledgement was lost. |
 
-### The ingest
+Submission calls `POST /api/v1/predictions`, saves its ID, and collection polls
+`GET /api/v1/predictions/{id}` until complete. Collection reads the actual nested
+`result.id`, then pages `POST /api/v1/prediction-results/{result.id}/features/search`.
+The area and selected post-change labels filter features. Opening EarthRanger does not
+trigger inference: it displays events delivered through Gundi.
 
-One request per run, against the endpoint OlmoEarth added for external pollers
-([olmoearth_studio#3226](https://github.com/allenai/olmoearth_studio/pull/3226)):
+The model reference time is the schedule slot minus `imagery_lag_days` (14 by default;
+verify for the chosen model). Start and end are both that reference time. The model's
+own configuration determines its imagery lookbehind. Frequency does not set that
+lookbehind or imply event-date precision. Annual sampling is not a promise of exhaustive
+annual coverage. Missed slots catch up oldest first, with at most one job in flight.
 
-```
-POST /api/v1/prediction-results/features/search    GeoJSON detections, paged
-  -> Gundi events                                  one event per feature
-```
+## Dates and repeated detections
 
-The body has two halves and the split matters:
+- `recorded_at` uses the verified polygon date property, encoded as UTC midnight.
+  Preserve its month/day precision and aggregation in `event_details`; it is an estimate.
+- `first_discovered_at` is when the connector found the polygon. A late-discovered change
+  is retained even if its estimated date predates the last poll.
+- `changes_since`, if set, is a fixed initial event-date cutoff. It never advances as a cursor.
+- Selected classes and delivery settings are snapshotted per submitted job. Changing the
+  class selection affects future jobs, not a half-read result or already delivered history.
+- Project/model/area/schedule/date semantics changes require a new monitor integration,
+  preserving old jobs instead of silently mixing identities.
 
-- **`prediction_results`** picks *which* Prediction Results to read — by model,
-  project, organization or target area. This is the half OlmoEarth
-  access-controls: it resolves the filters to the set of Results the token may
-  read and scopes the feature query to it. `PullEventsConfig` requires at least
-  one of those four, because an unscoped search returns every Result the token
-  can see, and past a thousand Results the provider answers 400 rather than
-  truncating.
-- **`features`** filters the detections within those Results — the watermark,
-  the area of interest, a confidence threshold — and carries the sort and
-  paging.
+Every new event gets a deterministic `event_details.external_event_id`. Gundi's
+`external_source_id` identifies the monitor, **not** a per-event idempotency key. Store
+Gundi's returned `object_id` separately after acknowledged delivery. See the
+[Gundi API guide](https://support.earthranger.com/en_US/become-a-data-provider/gundi-api).
 
-`features.oe_prediction_result_id` is deliberately not a field on
-`client.FeatureFilters`. The server derives that filter from
-`prediction_results`, that derivation *is* the access control, and a
-caller-supplied value is rejected with a 422. Leaving it off the model makes it
-unreachable rather than merely discouraged.
+For consecutive predictions, the prototype suppresses a repeat when exactly one previously
+known polygon has the same class, estimated date within `date_tolerance_days`, and polygon
+intersection-over-union at least `overlap_threshold`. It records the new observation
+locally; it does not PATCH the delivered EarthRanger event. Multiple matches create an event
+with `ambiguous_match_count` for review. This is a regional, planar-overlap heuristic,
+not a general change-tracking algorithm: inspect splits, merges, geometry drift and dates
+in the pilot. Antimeridian-spanning AOIs are rejected. Geometry is selected by intersection,
+not clipped to the AOI. Nearby separate polygons from the same prediction remain separate.
 
-Each feature becomes one Gundi event: `oe_start_time` is the `recorded_at`
-(when the model saw the thing, not when the record was written), the geometry's
-centre becomes the point `location`, the full GeoJSON geometry travels
-alongside so a polygon detection stays a polygon, and the model's own
-properties land in `event_details` with the `oe_` provenance fields renamed
-rather than mixed in.
+## Recovery and completeness
 
-### Incremental runs
+Redis holds the job ledger, per-result offset, event history and a delivery outbox under
+`lcc_monitor_v1`. Configure durable Redis persistence/backups before a real deployment.
+There is no prediction-creation or feature-time watermark: late-completing jobs remain
+tracked. An action lock and shorter execution timeout prevent the two schedules from
+writing this state concurrently.
 
-The watermark is `oe_created_at` on the features themselves, which arrives in
-the same response as the detections. Three details keep it honest:
+Before submission the connector saves its exact request and unique name. It never retries
+an ambiguous creation POST. The next submission action searches that name within the
+project/model and recovers a single matching ID. Zero or multiple matches require an
+operator to reconcile the saved job; they never cause an automatic second POST.
 
-- The cursor is `gte`, not `gt`. A bulk-inserted Result stamps thousands of
-  features with one `oe_created_at`; if some of them are indexed after a run
-  has already read that second and moved past it, `gt` would never see them
-  again. `gte` re-reads the boundary second every run.
-- `boundary_feature_ids` is what stops that re-read becoming duplicate events:
-  the ids already ingested at exactly the watermark second. It is bounded, and
-  overflowing it re-sends detections rather than losing them — a duplicate
-  `external_source_id` is recoverable downstream, a detection that was never
-  sent is not.
-- Those ids are *qualified* — `result-1:7`, the same string the event carries
-  as its `external_source_id`. A bare feature id is unique only within its
-  Prediction Result, and one search spans many at once, so keying on it would
-  drop feature 1 of the second Result as a duplicate of feature 1 of the first.
-- **A run never stops inside a second.** This is what keeps the ingest moving,
-  and no size of boundary set can substitute for it. **Max Features Per Run**
-  is a soft cap: on reaching it the run keeps taking detections until the
-  timestamp changes, so the cursor always lands *between* groups. Stop
-  mid-second instead and the cursor sits inside a group `gte` re-reads in full
-  — and once that group is larger than the boundary set remembers, two runs
-  trade halves of it forever and never reach what lies past it. The overrun is
-  bounded by how many detections share one timestamp.
-- A re-read does not count against the cap either. Only new detections do.
-- Those ids are *qualified* — `result-1:7`, the same string the event carries
-  as its `external_source_id`. A bare feature id is unique only within its
-  Prediction Result, and one search now spans many at once, so keying on it
-  would drop feature 1 of the second Result as a duplicate of feature 1 of the
-  first.
+A page's payload is stored before delivery. The Gundi POST is attempted once. A successful
+acknowledgement saves every returned object ID before committing the page offset. If the
+outcome is unknown, the outbox stays `sending` and subsequent collection pauses rather
+than potentially creating duplicates. **Resolve LCC Delivery** requires the exact batch ID:
 
-State is saved after each batch of events, so a run that fails on the fifth
-batch of six does not re-send the first four — and once more at the end
-whatever the run did, because a run whose detections were all unusable still
-read them and that progress is worth keeping. A run that changed nothing skips
-the write entirely.
+- `confirmed_delivered`: supply each Gundi object ID in outbox order; the next collection
+  commits the page without resending.
+- `confirmed_not_delivered`: only after checking the entire batch, permit the next collection
+  to send the saved payload again.
+- Partial delivery requires manual reconciliation of the whole batch first. Do not mark it
+  wholly undelivered. There is no claim of automatic exactly-once delivery.
 
-If paging hits its page ceiling (`client.MAX_PAGES`) with matches still unread,
-the run reports `truncated` rather than ending quietly — otherwise a stuck feed
-reads as a clean one.
+The page budget pauses with a saved offset. Reaching Elasticsearch's 10,000-feature window
+marks the job `needs_export` and blocks new submissions; it is never reported complete.
+Use a smaller AOI for the prototype. Empty vector results complete normally; raster-only
+results and malformed dates fail visibly. Upstream vectorization can itself remove/cap
+polygons: use an uncapped model and inspect its sieve/simplification settings for the pilot.
 
-Paging forces `sort_by=oe_created_at, sort_direction=asc` regardless of what
-the caller asked for, because offset paging over a descending sort skips a
-record whenever one is written mid-walk.
+History is bounded at 1,000 jobs and 10,000 known events and stops visibly at those limits.
+It does not evict identities and silently resend old events. A durable indexed event store,
+large-result export, and downstream event updates are follow-up work.
 
-### The area of interest goes on the features, not the Results
+## Verification
 
-`prediction_results.prediction_intersects_geometry` exists and looks like the
-right place for it, but it matches through registered Areas only: a Prediction
-created from an uploaded GeoJSON keeps its footprint in a file rather than an
-Area row, so its detections never match. Enforcing an AOI there would silently
-drop exactly the detections nobody would think to look for. The AOI is applied
-to `features.intersects_geometry`, which is exact — and, now that the ingest is
-a single request, free. **Target Area ID** is the separate, explicit setting
-for pruning by registered Area.
+Run `pytest` for the full suite, or `pytest app/actions/tests/test_olmoearth.py -q` for
+connector contracts. Tests use mocked HTTP and state; no paid predictions or Gundi events
+are created. They cover submission/reconciliation, real nested result IDs, out-of-order
+completion, filtering, date validation, paging/resumption, interrupted delivery, receipt
+validation, and repeat polygons across predictions.
 
-### An empty run is ambiguous, so it is checked
-
-The features endpoint is `optional_auth` on the provider's side: an invalid or
-expired token does not 401, it degrades the caller to anonymous and returns
-only the Results marked public. For a private feed that is zero detections and
-no error — indistinguishable from a quiet day.
-
-So a run that sent no events makes one extra request to
-`/api/v1/predictions/search`, which does require a real user, before reporting
-nothing new. A dead token fails the action as an auth problem instead of
-looking like a quiet day for as long as nobody checks. The `auth` action
-validates against that same endpoint, for the same reason.
+For the live pilot, use one small AOI and mining, submit two successive reference dates,
+check the actual date-property encoding, then inspect events and repeated polygons in
+EarthRanger. Environment, credentials, project/model, actual AOI and the model's date
+semantics must be provided before that validation. The older PR's cross-result polling
+configuration is replaced by this form; re-register the integration actions and configure
+it afresh rather than copying old watermark state.
 
 ## Usage
 - Fork this repo

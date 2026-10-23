@@ -1,37 +1,9 @@
-"""HTTP client for the OlmoEarth prediction API.
+"""Typed client for the prediction and per-result feature APIs on Studio develop."""
 
-Two endpoints carry this integration:
-
-  POST /api/v1/prediction-results/features/search
-      The ingest. Returns GeoJSON detections from every Prediction Result the
-      token can read, in one request. The body has two halves: ``prediction_
-      results`` picks *which* results to read (by model, project, area, time)
-      and is where the server enforces access control; ``features`` filters the
-      detections within them (geometry, observation window, arbitrary
-      properties) and carries the sort and paging.
-
-  POST /api/v1/predictions/search
-      Prediction runs — what the portal dropdown lists, and the request the
-      auth action uses to prove a token works.
-
-Every filter the API accepts is an object of comparison operators
-(``{"eq": ...}``, ``{"gte": ...}``) and every operator is optional. The models
-below mirror that shape, and requests are serialized with ``exclude_none=True``
-so an operator we did not set is absent from the body rather than sent as an
-empty string: the documented sample shows ``{"eq": ""}``, but sent literally
-that asks for records whose field equals the empty string, which matches
-nothing.
-
-The features endpoint is `optional_auth` on the provider's side: an invalid or
-expired token does not 401, it degrades the caller to anonymous and returns
-only Results marked public. Nothing here can tell that apart from "no new
-detections", so the pull action confirms the token against the predictions
-search — which does require auth — before reporting an empty run.
-"""
 import json
 import logging
 from datetime import datetime
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 import pydantic
@@ -55,29 +27,6 @@ DEFAULT_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
 # size; these are what we send when the config does not override them.
 DEFAULT_FEATURE_PAGE_SIZE = 500
 DEFAULT_PREDICTION_PAGE_SIZE = 100
-
-# A runaway query (an AOI covering a continent, a model that emits millions of
-# detections) would otherwise page forever and blow the action's memory. Every
-# paging helper stops here and says so.
-MAX_PAGES = 200
-
-
-# --------------------------------------------------------------------------
-# Filter primitives
-# --------------------------------------------------------------------------
-class FeatureWalkTruncated(Exception):
-    """Paging stopped at `MAX_PAGES` with matches still unread.
-
-    Raised rather than returned because the alternative — ending the loop
-    quietly — is indistinguishable from having read everything, and the caller
-    would report a truncated run as a clean one.
-    """
-
-    def __init__(self, yielded: int):
-        super().__init__(
-            f"Stopped paging features after {MAX_PAGES} pages ({yielded} features)."
-        )
-        self.yielded = yielded
 
 
 class _Filter(pydantic.BaseModel):
@@ -189,51 +138,10 @@ class PredictionSearchRequest(_SearchRequest):
     status: Optional[KeywordFilter] = None
     workflow_type: Optional[KeywordFilter] = None
     creation_time: Optional[DatetimeFilter] = None
-    start_time: Optional[DatetimeFilter] = None
-    end_time: Optional[DatetimeFilter] = None
-    target_area_id: Optional[KeywordFilter] = None
-    intersects_geometry: Optional[Geometry] = None
     deleted_time: Optional[DatetimeFilter] = None
 
 
-class PredictionResultFilters(_SearchRequest):
-    """The `prediction_results` half: which Results the feature search reads.
-
-    This is the access-controlled half — the server turns these filters into
-    the set of Result ids the token may read and scopes the feature query to
-    it. An empty object is legal and means "everything this token can see",
-    which for a service user in a single-project organization is a reasonable
-    feed and for anything wider is a mistake; `PullEventsConfig` requires at
-    least one scope rather than relying on that.
-
-    `prediction_deleted_time` is deliberately absent: the provider defaults it
-    to `exists=false`, which excludes the Results of soft-deleted Predictions,
-    and that is the behaviour an ingest wants.
-    """
-
-    id: Optional[KeywordFilter] = None
-    organization_id: Optional[KeywordFilter] = None
-    access_level: Optional[KeywordFilter] = None
-    creation_time: Optional[DatetimeFilter] = None
-    updated_time: Optional[DatetimeFilter] = None
-    prediction_model_id: Optional[KeywordFilter] = None
-    prediction_project_id: Optional[KeywordFilter] = None
-    prediction_target_area_id: Optional[KeywordFilter] = None
-    prediction_start_time: Optional[DatetimeFilter] = None
-    prediction_end_time: Optional[DatetimeFilter] = None
-    prediction_intersects_geometry: Optional[Geometry] = None
-
-
-class FeatureFilters(_SearchRequest):
-    """The `features` half: which detections to return from those Results.
-
-    `oe_prediction_result_id` is *not* a field here, and its absence is the
-    point. The server derives that filter from `prediction_results` — that
-    derivation is the access control — and rejects a caller-supplied value with
-    a 422 rather than honouring or silently overwriting it. Leaving it off the
-    model means this connector cannot send one by accident.
-    """
-
+class FeatureSearchRequest(_SearchRequest):
     limit: int = DEFAULT_FEATURE_PAGE_SIZE
     offset: int = 0
     sort_by: str = "oe_created_at"
@@ -245,15 +153,6 @@ class FeatureFilters(_SearchRequest):
     oe_end_time: Optional[DatetimeFilter] = None
     oe_created_at: Optional[DatetimeFilter] = None
     property_filters: Optional[List[PropertyFilter]] = None
-
-
-class FeatureSearchRequest(_SearchRequest):
-    """The whole body of a cross-Result feature search."""
-
-    prediction_results: PredictionResultFilters = pydantic.Field(
-        default_factory=PredictionResultFilters
-    )
-    features: FeatureFilters = pydantic.Field(default_factory=FeatureFilters)
 
 
 # --------------------------------------------------------------------------
@@ -274,6 +173,11 @@ class ApiError(pydantic.BaseModel):
         extra = "allow"
 
 
+class PredictionResult(pydantic.BaseModel):
+    id: str
+    file_formats: List[str] = pydantic.Field(default_factory=list)
+
+
 class Prediction(pydantic.BaseModel):
     """One prediction run, as the dropdown and the auth check see it."""
 
@@ -287,6 +191,8 @@ class Prediction(pydantic.BaseModel):
     workflow_type: Optional[str] = None
     creation_time: Optional[datetime] = None
     deleted_time: Optional[datetime] = None
+    result: Optional[PredictionResult] = None
+    error_message: Optional[str] = None
 
     class Config:
         extra = "allow"
@@ -326,7 +232,7 @@ class Feature(pydantic.BaseModel):
     (`"id": 1`) while the documented request filters the same field as a
     keyword (`{"eq": ""}`). Picking one here means a feature's identity does not
     change type depending on which end of the API it came from — which matters,
-    because it ends up in the event's `external_source_id` and in the state
+    because it ends up in the event's provenance identity and in the state
     row that stops a detection being ingested twice.
     """
 
@@ -362,13 +268,13 @@ class FeatureSearchResponse(pydantic.BaseModel):
 # Client
 # --------------------------------------------------------------------------
 class OlmoEarthClient:
-    """Thin async wrapper over the two search endpoints.
+    """Async transport for prediction lifecycle and feature searches.
 
     Use as an async context manager so the underlying connection pool is closed
     even when an action raises partway through paging.
     """
 
-    FEATURES_PATH = "/api/v1/prediction-results/features/search"
+    FEATURES_PATH = "/api/v1/prediction-results/{result_id}/features/search"
     PREDICTIONS_PATH = "/api/v1/predictions/search"
 
     def __init__(
@@ -413,23 +319,21 @@ class OlmoEarthClient:
 
     # -- transport ---------------------------------------------------------
     async def _post(self, path: str, body: dict) -> dict:
-        """POST a search body and return the decoded response.
+        return await self._request("POST", path, body)
 
-        Retries transport failures, 429 and 5xx; a 4xx is a definite answer and
-        fails immediately. Failures come back as `IntegrationError` subclasses
-        so the runner records a classified status on the integration rather
-        than an opaque traceback.
-        """
+    async def _request(
+        self, method: str, path: str, body: Optional[dict] = None, attempts: int = 3
+    ) -> dict:
         async for attempt in stamina.retry_context(
             on=_is_transient,
-            attempts=3,
+            attempts=attempts,
             wait_initial=2.0,
             wait_max=20.0,
             wait_jitter=2.0,
         ):
             with attempt:
                 try:
-                    response = await self._client.post(path, json=body)
+                    response = await self._client.request(method, path, json=body)
                     response.raise_for_status()
                 except httpx.HTTPStatusError as e:
                     raise _classify_status_error(e) from e
@@ -452,30 +356,56 @@ class OlmoEarthClient:
             raise IntegrationBadResponseError(
                 f"OlmoEarth returned an unexpected response shape from {path}: {e}"
             ) from e
-        # A 200 can still carry errors alongside records. Records present means
-        # a partial result worth keeping; an error with nothing to show for it
-        # is a failure.
-        if parsed.errors and not parsed.records:
-            detail = "; ".join(
-                filter(None, (f"{e.code or 'error'}: {e.message or ''}".strip(" :") for e in parsed.errors))
-            )
-            raise IntegrationBadResponseError(f"OlmoEarth rejected the search: {detail}")
         if parsed.errors:
-            logger.warning(
-                "OlmoEarth returned %s error(s) alongside %s record(s) from %s: %s",
-                len(parsed.errors), len(parsed.records), path,
-                [e.dict(exclude_none=True) for e in parsed.errors],
+            raise IntegrationBadResponseError(
+                f"OlmoEarth returned incomplete results from {path}."
             )
         return parsed
 
     # -- endpoints ---------------------------------------------------------
-    async def search_predictions(self, request: PredictionSearchRequest) -> PredictionSearchResponse:
+    async def search_predictions(
+        self, request: PredictionSearchRequest
+    ) -> PredictionSearchResponse:
         payload = await self._post(self.PREDICTIONS_PATH, request.as_body())
         return self._parse(PredictionSearchResponse, payload, self.PREDICTIONS_PATH)
 
-    async def search_features(self, request: FeatureSearchRequest) -> FeatureSearchResponse:
-        payload = await self._post(self.FEATURES_PATH, request.as_body())
-        return self._parse(FeatureSearchResponse, payload, self.FEATURES_PATH)
+    async def get_prediction(self, prediction_id: str) -> Prediction:
+        path = f"/api/v1/predictions/{prediction_id}"
+        return self._one_prediction(await self._request("GET", path), path)
+
+    async def create_prediction(self, body: dict) -> Prediction:
+        path = "/api/v1/predictions"
+        # Studio has no idempotency key: an ambiguous POST must be reconciled, never retried.
+        return self._one_prediction(
+            await self._request("POST", path, body, attempts=1), path
+        )
+
+    def _one_prediction(self, payload: dict, path: str) -> Prediction:
+        response = self._parse(PredictionSearchResponse, payload, path)
+        if len(response.records) != 1:
+            raise IntegrationBadResponseError(f"Expected one prediction from {path}.")
+        return response.records[0]
+
+    async def project_organization(self, project_id: str) -> str:
+        path = f"/api/v1/projects/{project_id}"
+        payload = await self._request("GET", path)
+        records = payload.get("records", [])
+        if (
+            payload.get("errors")
+            or len(records) != 1
+            or not records[0].get("organization_id")
+        ):
+            raise IntegrationBadResponseError(
+                "Project has no organization or returned an incomplete response."
+            )
+        return records[0]["organization_id"]
+
+    async def search_features(
+        self, result_id: str, request: FeatureSearchRequest
+    ) -> FeatureSearchResponse:
+        path = self.FEATURES_PATH.format(result_id=result_id)
+        payload = await self._post(path, request.as_body())
+        return self._parse(FeatureSearchResponse, payload, path)
 
     async def verify_token(self) -> Optional[int]:
         """Prove the token authenticates; report how many predictions it can see.
@@ -489,48 +419,6 @@ class OlmoEarthClient:
         """
         response = await self.search_predictions(PredictionSearchRequest(limit=1))
         return response.meta.total
-
-    # -- paging ------------------------------------------------------------
-    async def iter_features(self, request: FeatureSearchRequest) -> AsyncIterator[Feature]:
-        """Yield every feature matching `request`, a page at a time.
-
-        Paging is by offset, so it forces ascending order on `oe_created_at`:
-        with a descending sort a feature written between two requests shifts
-        every later record one slot forward and the walk skips one. Ascending
-        order only ever appends beyond the window already read.
-
-        There is no feature cap here. The caller stops when it has taken enough
-        *new* detections, which is not the same count: every run re-reads the
-        watermark second, and charging those re-reads against the cap is what
-        would let a crowded second consume a whole run without progress.
-        """
-        request = request.copy(deep=True)
-        request.features.sort_by = "oe_created_at"
-        request.features.sort_direction = "asc"
-        # Serialized once: paging changes one integer, and re-encoding the whole
-        # body per page re-walks the area-of-interest geometry every time.
-        body = request.as_body()
-        limit = request.features.limit
-        offset = request.features.offset
-        yielded = 0
-        for _ in range(MAX_PAGES):
-            body["features"]["offset"] = offset
-            response = self._parse(
-                FeatureSearchResponse, await self._post(self.FEATURES_PATH, body), self.FEATURES_PATH
-            )
-            if not response.records:
-                return
-            for feature in response.records:
-                yield feature
-                yielded += 1
-            # A short page is the last page. `meta.total` is a second, cheaper
-            # stop for a provider that always fills the page.
-            if len(response.records) < limit:
-                return
-            offset += limit
-            if response.meta.total is not None and offset >= response.meta.total:
-                return
-        raise FeatureWalkTruncated(yielded)
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -548,35 +436,21 @@ def _classify_status_error(exc: httpx.HTTPStatusError):
     detail = _response_detail(exc.response)
     if status in (401, 403):
         return IntegrationAuthError(
-            f"OlmoEarth rejected the API token ({status}). {detail}".strip(), status_code=status
+            f"OlmoEarth rejected the API token ({status}). {detail}".strip(),
+            status_code=status,
         )
     if status == 429:
         return IntegrationRateLimitError(
             f"OlmoEarth rate-limited the request. {detail}".strip(), status_code=status
         )
-    if status == 400 and "Prediction Results" in detail:
-        # The provider caps how many Prediction Results one feature search may
-        # span and refuses rather than truncating, because a partial feature
-        # set is indistinguishable from a complete one. That is a scope this
-        # integration chose, so say which knobs narrow it.
-        #
-        # The provider's own wording stays in the log, not in the message:
-        # IntegrationConfigurationError is the one connector error forwarded
-        # verbatim to the ephemeral caller, and its contract is to describe the
-        # shape of the problem without echoing values back.
-        logger.warning("OlmoEarth refused the search as too broad: %s", detail)
-        return IntegrationConfigurationError(
-            "This integration's filters match more Prediction Results than "
-            "OlmoEarth will search at once. Narrow it with a target area, a "
-            "model, a project or an organization.",
-            status_code=status,
-        )
     if status == 404:
         return IntegrationBadResponseError(
-            f"OlmoEarth has no record at {exc.request.url.path}. {detail}".strip(), status_code=status
+            f"OlmoEarth has no record at {exc.request.url.path}. {detail}".strip(),
+            status_code=status,
         )
     return IntegrationBadResponseError(
-        f"OlmoEarth returned {status} for {exc.request.url.path}. {detail}".strip(), status_code=status
+        f"OlmoEarth returned {status} for {exc.request.url.path}. {detail}".strip(),
+        status_code=status,
     )
 
 
