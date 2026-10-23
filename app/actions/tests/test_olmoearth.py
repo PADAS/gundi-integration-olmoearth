@@ -11,6 +11,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.actions import client, handlers
+from app.actions.change_events import parse_change_date
 from app.actions.configurations import (
     Cadence,
     PullEventsConfig,
@@ -18,12 +19,11 @@ from app.actions.configurations import (
     SubmitPredictionsConfig,
 )
 from app.actions.monitor import (
-    Job,
     Monitor,
     build_feature_query,
-    parse_change_date,
     schedule_slot,
 )
+from app.actions.monitor_state import Job
 from app.services.errors import (
     IntegrationAuthError,
     IntegrationBadResponseError,

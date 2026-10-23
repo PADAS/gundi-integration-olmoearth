@@ -1,14 +1,10 @@
-"""Persisted prediction jobs and a resumable event outbox for one regional LCC monitor."""
+"""Orchestrate prediction submission, result collection, and recoverable delivery."""
 
 import calendar
-import hashlib
 import json
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable
 from uuid import NAMESPACE_URL, uuid5
-
-from pydantic import BaseModel, Field
-from shapely.geometry import shape
 
 from app.services.errors import (
     IntegrationBadResponseError,
@@ -17,8 +13,8 @@ from app.services.errors import (
 )
 from app.services.gundi import valid_event_receipts
 
+from .change_events import prepare_event
 from .client import (
-    Feature,
     FeatureSearchRequest,
     KeywordFilter,
     OlmoEarthClient,
@@ -26,75 +22,11 @@ from .client import (
     PropertyFilter,
     StringFilter,
 )
-from .configurations import Cadence, PullEventsConfig, polygon_geometry
+from .configurations import Cadence, PullEventsConfig
+from .monitor_state import STATE_ACTION, Job, MonitorState, Outbox, monitor_identity
 
-STATE_ACTION = "lcc_monitor_v1"
 MAX_JOBS = 1000
-MAX_EVENTS = 10000
 RESULT_WINDOW = 10000
-
-
-class Job(BaseModel):
-    name: str
-    request: dict
-    config: PullEventsConfig
-    prediction_id: Optional[str] = None
-    result_id: Optional[str] = None
-    status: str = "submitting"
-    offset: int = 0
-    error: Optional[str] = None
-
-
-class KnownEvent(BaseModel):
-    external_id: str
-    geometry: dict
-    change_type: str
-    change_date: date
-    first_seen_at: datetime
-    last_seen_at: datetime
-    last_prediction_id: str
-    observations: int = 1
-    gundi_object_id: Optional[str] = None
-
-
-class Outbox(BaseModel):
-    batch_id: str
-    delivery_status: str = "pending"
-    receipts: list[str] = Field(default_factory=list)
-    job_name: str
-    events: list[dict]
-    known_events: list[KnownEvent]
-    next_offset: int
-    complete: bool
-
-
-class MonitorState(BaseModel):
-    identity: str
-    next_slot: int = 0
-    jobs: list[Job] = Field(default_factory=list)
-    known_events: list[KnownEvent] = Field(default_factory=list)
-    outbox: Optional[Outbox] = None
-
-
-def monitor_identity(config: PullEventsConfig, base_url: str) -> str:
-    fields = {
-        "project_id",
-        "organization_id",
-        "model_id",
-        "area_of_interest",
-        "schedule_start",
-        "cadence",
-        "imagery_lag_days",
-        "change_date_property",
-        "change_date_aggregation",
-        "change_date_precision",
-        "event_type",
-    }
-    return hashlib.sha256(
-        (
-            base_url.rstrip("/") + "\n" + config.json(include=fields, sort_keys=True)
-        ).encode()
-    ).hexdigest()
 
 
 def schedule_slot(config: PullEventsConfig, index: int) -> date:
@@ -107,24 +39,6 @@ def schedule_slot(config: PullEventsConfig, index: int) -> date:
     year, month = divmod(anchor.year * 12 + anchor.month - 1 + months, 12)
     month += 1
     return date(year, month, min(anchor.day, calendar.monthrange(year, month)[1]))
-
-
-def parse_change_date(value) -> date:
-    if not isinstance(value, str):
-        raise IntegrationBadResponseError(
-            "LCC change date must be an ISO date string; encoded months and timestep indices are unsupported."
-        )
-    try:
-        if len(value) == 10:
-            return date.fromisoformat(value)
-        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if stamp.tzinfo is None:
-            raise ValueError("Missing timezone")
-        return stamp.astimezone(timezone.utc).date()
-    except ValueError as exc:
-        raise IntegrationBadResponseError(
-            "LCC change date is missing or is not an ISO date/time."
-        ) from exc
 
 
 def build_feature_query(config: PullEventsConfig, offset: int) -> FeatureSearchRequest:
@@ -364,7 +278,13 @@ class Monitor:
                 known = [event.copy(deep=True) for event in self.state.known_events]
                 events = []
                 for feature in response.records:
-                    event = self.prepare_event(feature, job, known)
+                    event = prepare_event(
+                        feature,
+                        job,
+                        known,
+                        integration_id=self.integration_id,
+                        now=self.now,
+                    )
                     if event:
                         events.append(event)
                 self.state.outbox = Outbox(
@@ -395,98 +315,4 @@ class Monitor:
                 }
                 for j in self.state.jobs
             ],
-        }
-
-    def prepare_event(
-        self, feature: Feature, job: Job, known: list[KnownEvent]
-    ) -> Optional[dict]:
-        if feature.id is None or feature.geometry is None:
-            raise IntegrationBadResponseError(
-                "A detection has no stable feature ID or polygon geometry."
-            )
-        geometry = feature.geometry.dict(exclude_none=True)
-        try:
-            polygon_geometry(geometry)
-        except ValueError as exc:
-            raise IntegrationBadResponseError(
-                "Detection geometry is not a valid regional polygon."
-            ) from exc
-        props = feature.properties.model_properties()
-        change_type = props.get("post_change")
-        if change_type not in job.config.selected_types:
-            return None
-        changed = parse_change_date(props.get(job.config.change_date_property))
-        if job.config.changes_since and changed < job.config.changes_since:
-            return None
-        geom = shape(geometry)
-        external_id = str(
-            uuid5(NAMESPACE_URL, f"{self.integration_id}:{job.result_id}:{feature.id}")
-        )
-        if any(event.external_id == external_id for event in known):
-            return None
-        matches = []
-        for previous in known:
-            if (
-                previous.change_type != change_type
-                or previous.last_prediction_id == job.prediction_id
-            ):
-                continue
-            if (
-                abs((previous.change_date - changed).days)
-                > job.config.date_tolerance_days
-            ):
-                continue
-            old_geom = shape(previous.geometry)
-            if not geom.intersects(old_geom):
-                continue
-            union = geom.union(old_geom).area
-            iou = geom.intersection(old_geom).area / union if union else 0
-            if iou >= job.config.overlap_threshold:
-                matches.append(previous)
-        if len(matches) == 1:
-            previous = matches[0]
-            previous.last_seen_at = self.now
-            previous.last_prediction_id = job.prediction_id
-            previous.observations += 1
-            return None
-        if len(known) >= MAX_EVENTS:
-            raise IntegrationConfigurationError(
-                "Prototype event history is full; migrate to a durable event store before collecting more."
-            )
-        known.append(
-            KnownEvent(
-                external_id=external_id,
-                geometry=geometry,
-                change_type=change_type,
-                change_date=changed,
-                first_seen_at=self.now,
-                last_seen_at=self.now,
-                last_prediction_id=job.prediction_id,
-            )
-        )
-        point = geom.representative_point()
-        props.update(
-            {
-                "prediction_id": job.prediction_id,
-                "prediction_result_id": job.result_id,
-                "oerun_prediction_result_id": feature.properties.oe_prediction_result_id,
-                "external_event_id": external_id,
-                "feature_id": feature.id,
-                "model_id": str(job.config.model_id),
-                "first_discovered_at": self.now.isoformat(),
-                "estimated_change_date": changed.isoformat(),
-                "change_date_precision": job.config.change_date_precision,
-                "change_date_aggregation": job.config.change_date_aggregation,
-                "prediction_reference_time": job.request["start_time"],
-                "ambiguous_match_count": len(matches),
-            }
-        )
-        return {
-            "title": f"OlmoEarth: {change_type.replace('_', ' ')}",
-            "event_type": job.config.event_type,
-            "source": f"olmoearth-monitor:{self.integration_id}",
-            "recorded_at": datetime.combine(changed, time(), timezone.utc).isoformat(),
-            "location": {"lat": point.y, "lon": point.x},
-            "geometry": geometry,
-            "event_details": props,
         }

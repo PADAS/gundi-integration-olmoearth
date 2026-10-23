@@ -124,6 +124,20 @@ History is bounded at 1,000 jobs and 10,000 known events and stops visibly at th
 It does not evict identities and silently resend old events. A durable indexed event store,
 large-result export, and downstream event updates are follow-up work.
 
+## Code layout
+
+- `app/routers/actions.py`: shared HTTP routes for executing Gundi actions.
+- `app/actions/configurations.py`: partner form settings and validation.
+- `app/actions/client.py`: OlmoEarth HTTP requests and API payload schemas.
+- `app/actions/handlers.py`: connects Gundi actions to the monitor.
+- `app/actions/monitor.py`: submission, collection, pagination and delivery recovery.
+- `app/actions/monitor_state.py`: persisted jobs, events, outbox and monitor identity.
+- `app/actions/change_events.py`: date parsing, repeat matching and event construction.
+
+Event preparation updates a page-local copy of known events; the monitor persists
+that copy with the outbox. This keeps polygon logic independent of network and
+storage while preserving the delivery/checkpoint boundary.
+
 ## Verification
 
 Run `pytest` for the full suite, or `pytest app/actions/tests/test_olmoearth.py -q` for

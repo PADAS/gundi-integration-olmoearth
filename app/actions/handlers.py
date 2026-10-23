@@ -19,7 +19,8 @@ from .configurations import (
     ResolveDeliveryConfig,
     SubmitPredictionsConfig,
 )
-from .monitor import STATE_ACTION, Monitor
+from .monitor import Monitor
+from .monitor_state import STATE_ACTION
 
 state_manager = IntegrationStateManager()
 
