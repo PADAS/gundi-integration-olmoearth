@@ -637,8 +637,8 @@ async def test_event_and_monitor_id_are_separate(config, api, store):
     api.search_features.return_value = page([feature()])
     await monitor.collect()
     event = monitor.send.call_args.args[0][0]
-    assert event["external_source_id"] == "olmoearth-monitor:integration-1"
-    assert event["event_details"]["external_event_id"] != event["external_source_id"]
+    assert event["source"] == "olmoearth-monitor:integration-1"
+    assert event["event_details"]["external_event_id"] != event["source"]
 
 
 def test_portal_schema_and_example_keep_environment_and_ids_configurable():

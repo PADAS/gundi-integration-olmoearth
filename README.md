@@ -65,8 +65,8 @@ annual coverage. Missed slots catch up oldest first, with at most one job in fli
 - Project/model/area/schedule/date semantics changes require a new monitor integration,
   preserving old jobs instead of silently mixing identities.
 
-Every new event gets a deterministic `event_details.external_event_id`. Gundi's
-`external_source_id` identifies the monitor, **not** a per-event idempotency key. Store
+Every new event gets a deterministic `event_details.external_event_id`. Gundi's REST
+`source` identifies the monitor, **not** a per-event idempotency key. Store
 Gundi's returned `object_id` separately after acknowledged delivery. See the
 [Gundi API guide](https://support.earthranger.com/en_US/become-a-data-provider/gundi-api).
 

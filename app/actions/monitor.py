@@ -475,7 +475,7 @@ class Monitor:
         return {
             "title": f"OlmoEarth: {change_type.replace('_', ' ')}",
             "event_type": job.config.event_type,
-            "external_source_id": f"olmoearth-monitor:{self.integration_id}",
+            "source": f"olmoearth-monitor:{self.integration_id}",
             "recorded_at": datetime.combine(changed, time(), timezone.utc).isoformat(),
             "location": {"lat": point.y, "lon": point.x},
             "geometry": geometry,
