@@ -211,3 +211,31 @@ async def send_messages_to_gundi(messages: List[dict], **kwargs) -> dict:
     assert integration_id, "integration_id is required"
     sensors_api_client = await _get_sensors_api_client(integration_id=str(integration_id))
     return await sensors_api_client.post_messages(data=messages)
+
+
+def valid_event_receipts(receipts, expected_count: int) -> bool:
+    """Require one distinct, usable acknowledgement per event in batch order."""
+    return (
+        isinstance(receipts, list)
+        and len(receipts) == expected_count
+        and all(isinstance(value, str) and bool(value.strip()) for value in receipts)
+        and len(set(receipts)) == len(receipts)
+    )
+
+
+async def send_events_once_to_gundi(events: List[dict], integration_id: str) -> list[str]:
+    """Submit an outbox batch once; its owner reconciles ambiguous delivery instead of retrying."""
+    from .errors import IntegrationBadResponseError
+
+    _block_if_ephemeral("send_events_once_to_gundi")
+    sender = await _get_sensors_api_client(integration_id=integration_id)
+    response = await sender.post_events(data=events)
+    if not isinstance(response, list) or len(response) != len(events) or any(
+        not isinstance(item, dict) or not isinstance(item.get("object_id"), str) or not item["object_id"] or item.get("errors")
+        for item in response
+    ):
+        raise IntegrationBadResponseError("Gundi did not acknowledge every event; reconcile the outbox before retrying.")
+    receipts = [item["object_id"] for item in response]
+    if not valid_event_receipts(receipts, len(events)):
+        raise IntegrationBadResponseError("Gundi returned invalid or duplicate object IDs; reconcile the outbox before retrying.")
+    return receipts

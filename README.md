@@ -1,5 +1,160 @@
-# gundi-integration-action-runner
-Template repo for integration in Gundi v2.
+# gundi-integration-olmoearth
+
+Prototype of a scheduled LCC change monitor using the public APIs on OlmoEarth Studio
+`develop`. It does **not** depend on Studio PR #3226 or a cross-result feature endpoint.
+One saved Gundi integration is one area/model monitor; create another integration for another area.
+
+See the [component and workflow overview](docs/gundi-earthranger-workflow.md) for diagrams,
+application roles, credentials, and planned reusable-area support.
+
+## View and run
+
+The PR contains a backend connector; it does not deploy a website. Gundi's portal
+renders the registered action schemas as forms. See [local development](local/LOCAL_DEVELOPMENT.md#viewing-the-olmoearth-prototype)
+for API browsing, the services needed for the real form, and staging setup.
+
+## Configure the pilot
+
+The Gundi action schemas generate the form. Use the integration's base URL for the
+OlmoEarth environment and configure its Authenticate action with the API token.
+[Placeholder examples](examples/README.md) cover both settings and the separate
+Gundi runner credentials.
+
+1. Save **Collect LCC Events** (`pull_events`) using `examples/lcc-monitor.json` as a
+   starting point. Every ID and the small example polygon are placeholders. Replace the
+   project/model/organization, area, date-property name and aggregation through the form.
+2. Choose mining or other `post_change` labels in the multi-select, or enable **Select all
+   change types**. The enum is the current LCC legend, excluding nodata and `none`; verify
+   it against the selected registered model before using a different model version.
+3. Set the first prediction date and weekly/monthly/quarterly/annual frequency. Select a
+   recent start date unless you intentionally want historical catch-up. Monthly/yearly
+   slots retain the original day, clamping to the month's last day as needed.
+4. Use a model configured to polygonize `post_change` with auxiliary properties and an
+   actual ISO date field. Studio has no prediction-request vectorization flag. Raw
+   timestep indices and encoded month counts are rejected, not guessed into dates.
+5. Save **Submit LCC Predictions** (`submit_predictions`). Scheduled submission defaults
+   to disabled; enable it when ready, or run the action manually to submit one due job.
+   A manual action can incur OlmoEarth prediction charges.
+6. Configure the Gundi route/EarthRanger event type and verify polygon rendering in the
+   destination. The event carries both the polygon and a point guaranteed inside it.
+
+The prediction API requires a project. A partner project is a useful default. Organization
+is optional; when supplied it must own that project. API credentials still enforce access.
+Neither IDs nor the OlmoEarth environment are hardcoded in the connector.
+
+## Workflow
+
+| Action | Schedule | Behavior |
+| --- | --- | --- |
+| `auth` | on demand | Verify token using authenticated prediction search. |
+| `list_predictions` | reference lookup | List a project's predictions for inspection. |
+| `submit_predictions` | every four hours, opt-in | Submit one due schedule slot if no job is in flight. |
+| `pull_events` | every four hours, at :15 | Poll saved jobs, filter features, and deliver events. |
+| `resolve_delivery` | manual only | Resolve a delivery whose acknowledgement was lost. |
+
+Submission calls `POST /api/v1/predictions`, saves its ID, and collection polls
+`GET /api/v1/predictions/{id}` until complete. Collection reads the actual nested
+`result.id`, then pages `POST /api/v1/prediction-results/{result.id}/features/search`.
+The area and selected post-change labels filter features. Opening EarthRanger does not
+trigger inference: it displays events delivered through Gundi.
+
+The model reference time is the schedule slot minus `imagery_lag_days` (14 by default;
+verify for the chosen model). Start and end are both that reference time. The model's
+own configuration determines its imagery lookbehind. Frequency does not set that
+lookbehind or imply event-date precision. Annual sampling is not a promise of exhaustive
+annual coverage. Missed slots catch up oldest first, with at most one job in flight.
+
+## Dates and repeated detections
+
+- `recorded_at` uses the verified polygon date property, encoded as UTC midnight.
+  Preserve its month/day precision and aggregation in `event_details`; it is an estimate.
+- `first_discovered_at` is when the connector found the polygon. A late-discovered change
+  is retained even if its estimated date predates the last poll.
+- `changes_since`, if set, is a fixed initial event-date cutoff. It never advances as a cursor.
+- Selected classes and delivery settings are snapshotted per submitted job. Changing the
+  class selection affects future jobs, not a half-read result or already delivered history.
+- Environment/project/model/area/schedule/date semantics changes require a new monitor integration,
+  preserving old jobs instead of silently mixing identities.
+
+Every new event gets a deterministic `event_details.external_event_id`. Gundi's REST
+`source` identifies the monitor, **not** a per-event idempotency key. Store
+Gundi's returned `object_id` separately after acknowledged delivery. See the
+[Gundi API guide](https://support.earthranger.com/en_US/become-a-data-provider/gundi-api).
+
+For consecutive predictions, the prototype suppresses a repeat when exactly one previously
+known polygon has the same class, estimated date within `date_tolerance_days`, and polygon
+intersection-over-union at least `overlap_threshold`. It records the new observation
+locally; it does not PATCH the delivered EarthRanger event. Multiple matches create an event
+with `ambiguous_match_count` for review. This is a regional, planar-overlap heuristic,
+not a general change-tracking algorithm: inspect splits, merges, geometry drift and dates
+in the pilot. Antimeridian-spanning AOIs are rejected. Geometry is selected by intersection,
+not clipped to the AOI. Nearby separate polygons from the same prediction remain separate.
+
+## Recovery and completeness
+
+Redis holds the job ledger, per-result offset, event history and a delivery outbox under
+`lcc_monitor_v1`. Configure durable Redis persistence/backups before a real deployment.
+There is no prediction-creation or feature-time watermark: late-completing jobs remain
+tracked. An action lock and shorter execution timeout prevent the two schedules from
+writing this state concurrently.
+
+Before submission the connector saves its exact request and unique name. Explicit
+400/401/403/404/422/429 rejections preserve the schedule slot for the next attempt;
+timeouts, server errors and malformed success responses remain ambiguous. It never retries
+an ambiguous creation POST. The next submission action searches that name within the
+project/model and recovers a single matching ID. Zero or multiple matches require an
+operator to reconcile the saved job; they never cause an automatic second POST.
+
+A page's payload is stored before delivery. The Gundi POST is attempted once. A successful
+acknowledgement saves every returned object ID before committing the page offset. If the
+outcome is unknown, the outbox stays `sending` and subsequent collection pauses rather
+than potentially creating duplicates. **Resolve LCC Delivery** requires the exact batch ID:
+
+- `confirmed_delivered`: supply each Gundi object ID in outbox order; the next collection
+  commits the page without resending.
+- `confirmed_not_delivered`: only after checking the entire batch, permit the next collection
+  to send the saved payload again.
+- Partial delivery requires manual reconciliation of the whole batch first. Do not mark it
+  wholly undelivered. There is no claim of automatic exactly-once delivery.
+
+The page budget pauses with a saved offset. Reaching Elasticsearch's 10,000-feature window
+marks the job `needs_export` and blocks new submissions; it is never reported complete.
+Use a smaller AOI for the prototype. Empty vector results complete normally; raster-only
+results and malformed dates fail visibly. Upstream vectorization can itself remove/cap
+polygons: use an uncapped model and inspect its sieve/simplification settings for the pilot.
+
+History is bounded at 1,000 jobs and 10,000 known events and stops visibly at those limits.
+It does not evict identities and silently resend old events. A durable indexed event store,
+large-result export, and downstream event updates are follow-up work.
+
+## Code layout
+
+- `app/routers/actions.py`: shared HTTP routes for executing Gundi actions.
+- `app/actions/configurations.py`: partner form settings and validation.
+- `app/actions/client.py`: OlmoEarth HTTP requests and API payload schemas.
+- `app/actions/handlers.py`: connects Gundi actions to the monitor.
+- `app/actions/monitor.py`: submission, collection, pagination and delivery recovery.
+- `app/actions/monitor_state.py`: persisted jobs, events, outbox and monitor identity.
+- `app/actions/change_events.py`: date parsing, repeat matching and event construction.
+
+Event preparation updates a page-local copy of known events; the monitor persists
+that copy with the outbox. This keeps polygon logic independent of network and
+storage while preserving the delivery/checkpoint boundary.
+
+## Verification
+
+Run `pytest` for the full suite, or `pytest app/actions/tests/test_olmoearth.py -q` for
+connector contracts. Tests use mocked HTTP and state; no paid predictions or Gundi events
+are created. They cover submission/reconciliation, real nested result IDs, out-of-order
+completion, filtering, date validation, paging/resumption, interrupted delivery, receipt
+validation, and repeat polygons across predictions.
+
+For the live pilot, use one small AOI and mining, submit two successive reference dates,
+check the actual date-property encoding, then inspect events and repeated polygons in
+EarthRanger. Environment, credentials, project/model, actual AOI and the model's date
+semantics must be provided before that validation. The older PR's cross-result polling
+configuration is replaced by this form; re-register the integration actions and configure
+it afresh rather than copying old watermark state.
 
 ## Usage
 - Fork this repo
