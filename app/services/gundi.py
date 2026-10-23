@@ -213,6 +213,16 @@ async def send_messages_to_gundi(messages: List[dict], **kwargs) -> dict:
     return await sensors_api_client.post_messages(data=messages)
 
 
+def valid_event_receipts(receipts, expected_count: int) -> bool:
+    """Require one distinct, usable acknowledgement per event in batch order."""
+    return (
+        isinstance(receipts, list)
+        and len(receipts) == expected_count
+        and all(isinstance(value, str) and bool(value.strip()) for value in receipts)
+        and len(set(receipts)) == len(receipts)
+    )
+
+
 async def send_events_once_to_gundi(events: List[dict], integration_id: str) -> list[str]:
     """Submit an outbox batch once; its owner reconciles ambiguous delivery instead of retrying."""
     from .errors import IntegrationBadResponseError
@@ -225,4 +235,7 @@ async def send_events_once_to_gundi(events: List[dict], integration_id: str) -> 
         for item in response
     ):
         raise IntegrationBadResponseError("Gundi did not acknowledge every event; reconcile the outbox before retrying.")
-    return [item["object_id"] for item in response]
+    receipts = [item["object_id"] for item in response]
+    if not valid_event_receipts(receipts, len(events)):
+        raise IntegrationBadResponseError("Gundi returned invalid or duplicate object IDs; reconcile the outbox before retrying.")
+    return receipts

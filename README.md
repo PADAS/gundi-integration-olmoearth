@@ -4,6 +4,12 @@ Prototype of a scheduled LCC change monitor using the public APIs on OlmoEarth S
 `develop`. It does **not** depend on Studio PR #3226 or a cross-result feature endpoint.
 One saved Gundi integration is one area/model monitor; create another integration for another area.
 
+## View and run
+
+The PR contains a backend connector; it does not deploy a website. Gundi's portal
+renders the registered action schemas as forms. See [local development](local/LOCAL_DEVELOPMENT.md#viewing-the-olmoearth-prototype)
+for API browsing, the services needed for the real form, and staging setup.
+
 ## Configure the pilot
 
 The Gundi action schemas generate the form. Use the integration's base URL for the
@@ -62,7 +68,7 @@ annual coverage. Missed slots catch up oldest first, with at most one job in fli
 - `changes_since`, if set, is a fixed initial event-date cutoff. It never advances as a cursor.
 - Selected classes and delivery settings are snapshotted per submitted job. Changing the
   class selection affects future jobs, not a half-read result or already delivered history.
-- Project/model/area/schedule/date semantics changes require a new monitor integration,
+- Environment/project/model/area/schedule/date semantics changes require a new monitor integration,
   preserving old jobs instead of silently mixing identities.
 
 Every new event gets a deterministic `event_details.external_event_id`. Gundi's REST
@@ -87,7 +93,9 @@ There is no prediction-creation or feature-time watermark: late-completing jobs 
 tracked. An action lock and shorter execution timeout prevent the two schedules from
 writing this state concurrently.
 
-Before submission the connector saves its exact request and unique name. It never retries
+Before submission the connector saves its exact request and unique name. Explicit
+400/401/403/404/422/429 rejections preserve the schedule slot for the next attempt;
+timeouts, server errors and malformed success responses remain ambiguous. It never retries
 an ambiguous creation POST. The next submission action searches that name within the
 project/model and recovers a single matching ID. Zero or multiple matches require an
 operator to reconcile the saved job; they never cause an automatic second POST.

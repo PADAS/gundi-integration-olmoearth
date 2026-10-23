@@ -33,6 +33,15 @@ def get_auth_config(integration) -> AuthenticateConfig:
     return AuthenticateConfig.parse_obj(config.data)
 
 
+def get_monitor_config(integration) -> PullEventsConfig:
+    saved = find_config_for_action(integration.configurations, "pull_events")
+    if not saved:
+        raise IntegrationConfigurationError(
+            "Save the Collect LCC Events monitor configuration first."
+        )
+    return PullEventsConfig.parse_obj(saved.data)
+
+
 def client_for(integration, auth_config=None) -> client.OlmoEarthClient:
     auth_config = auth_config or get_auth_config(integration)
     return client.OlmoEarthClient(
@@ -117,14 +126,7 @@ async def run_monitor(
 async def action_submit_predictions(
     integration, action_config: SubmitPredictionsConfig
 ) -> dict:
-    saved = find_config_for_action(integration.configurations, "pull_events")
-    if not saved:
-        raise IntegrationConfigurationError(
-            "Save the Collect LCC Events monitor configuration before submitting predictions."
-        )
-    return await run_monitor(
-        integration, PullEventsConfig.parse_obj(saved.data), "submit"
-    )
+    return await run_monitor(integration, get_monitor_config(integration), "submit")
 
 
 @action_title("Collect LCC Events")
@@ -139,9 +141,6 @@ async def action_pull_events(integration, action_config: PullEventsConfig) -> di
 async def action_resolve_delivery(
     integration, action_config: ResolveDeliveryConfig
 ) -> dict:
-    saved = find_config_for_action(integration.configurations, "pull_events")
-    if not saved:
-        raise IntegrationConfigurationError("Save the monitor configuration first.")
     return await run_monitor(
-        integration, PullEventsConfig.parse_obj(saved.data), "resolve", action_config
+        integration, get_monitor_config(integration), "resolve", action_config
     )

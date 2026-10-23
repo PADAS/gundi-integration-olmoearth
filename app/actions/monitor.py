@@ -13,7 +13,9 @@ from shapely.geometry import shape
 from app.services.errors import (
     IntegrationBadResponseError,
     IntegrationConfigurationError,
+    IntegrationError,
 )
+from app.services.gundi import valid_event_receipts
 
 from .client import (
     Feature,
@@ -74,7 +76,7 @@ class MonitorState(BaseModel):
     outbox: Optional[Outbox] = None
 
 
-def monitor_identity(config: PullEventsConfig) -> str:
+def monitor_identity(config: PullEventsConfig, base_url: str) -> str:
     fields = {
         "project_id",
         "organization_id",
@@ -89,7 +91,9 @@ def monitor_identity(config: PullEventsConfig) -> str:
         "event_type",
     }
     return hashlib.sha256(
-        config.json(include=fields, sort_keys=True).encode()
+        (
+            base_url.rstrip("/") + "\n" + config.json(include=fields, sort_keys=True)
+        ).encode()
     ).hexdigest()
 
 
@@ -157,13 +161,13 @@ class Monitor:
 
     async def load(self):
         raw = await self.store.get_state(self.integration_id, STATE_ACTION)
-        identity = monitor_identity(self.config)
+        identity = monitor_identity(self.config, self.api.base_url)
         self.state = (
             MonitorState.parse_obj(raw) if raw else MonitorState(identity=identity)
         )
         if self.state.identity != identity:
             raise IntegrationConfigurationError(
-                "Model, area, project, date semantics or schedule changed. Create a new monitor integration to preserve existing jobs and event identity."
+                "Environment, model, area, project, date semantics or schedule changed. Create a new monitor integration to preserve existing jobs and event identity."
             )
 
     async def save(self):
@@ -237,7 +241,16 @@ class Monitor:
         self.state.jobs.append(job)
         self.state.next_slot += 1
         await self.save()
-        prediction = await self.api.create_prediction(body)
+        try:
+            prediction = await self.api.create_prediction(body)
+        except IntegrationError as exc:
+            # Explicit pre-creation rejections are safe to retry on the next action.
+            # Timeouts, 5xx, and malformed successful replies remain ambiguous.
+            if exc.status_code in {400, 401, 403, 404, 422, 429}:
+                self.state.jobs.remove(job)
+                self.state.next_slot -= 1
+                await self.save()
+            raise
         job.prediction_id = prediction.id
         job.status = "pending"
         await self.save()
@@ -255,7 +268,7 @@ class Monitor:
             box.delivery_status = "sending"
             await self.save()
             box.receipts = await self.send(box.events)
-            if len(box.receipts) != len(box.events):
+            if not valid_event_receipts(box.receipts, len(box.events)):
                 raise IntegrationBadResponseError(
                     "Gundi did not acknowledge every event in the outbox."
                 )
@@ -287,11 +300,7 @@ class Monitor:
             )
         if resolution.outcome == "confirmed_delivered":
             ids = resolution.gundi_object_ids
-            if (
-                len(ids) != len(box.events)
-                or len(set(ids)) != len(ids)
-                or any(not value.strip() for value in ids)
-            ):
+            if not valid_event_receipts(ids, len(box.events)):
                 raise IntegrationConfigurationError(
                     "Provide one distinct Gundi object ID for every outbox event, in order."
                 )

@@ -78,6 +78,7 @@ def store():
 @pytest.fixture
 def api():
     api = AsyncMock(spec=client.OlmoEarthClient)
+    api.base_url = "https://example.test"
     api.verify_token.return_value = 0
     api.create_prediction.return_value = prediction("p1", status="pending")
     api.get_prediction.return_value = prediction("p1")
@@ -657,3 +658,66 @@ def test_portal_schema_and_example_keep_environment_and_ids_configurable():
     assert schema["properties"]["post_change_types"]["uniqueItems"] is True
     assert PullEventsConfig.ui_schema()["post_change_types"]["ui:widget"] == "select"
     assert parsed.selected_types == ["mining"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 422, 429])
+async def test_rejected_submission_preserves_slot_for_retry(config, api, store, status):
+    api.create_prediction.side_effect = IntegrationAuthError(
+        "Rejected", status_code=status
+    )
+    with pytest.raises(IntegrationAuthError):
+        await make_monitor(config, api, store).submit()
+    assert store.value["next_slot"] == 0
+    assert store.value["jobs"] == []
+    api.create_prediction.side_effect = None
+    await make_monitor(config, api, store).submit()
+    assert store.value["next_slot"] == 1
+    assert store.value["jobs"][0]["prediction_id"] == "p1"
+    api.search_predictions.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_environment_change_cannot_reuse_saved_jobs(config, api, store):
+    await seed(config, api, store)
+    api.base_url = "https://another-environment.test"
+    with pytest.raises(IntegrationConfigurationError, match="Environment"):
+        await make_monitor(config, api, store).collect()
+    api.get_prediction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("receipts", [[" ", "id2"], ["id1", "id1"]])
+async def test_invalid_receipts_pause_outbox(config, api, store, receipts):
+    monitor = await seed(config, api, store)
+    api.search_features.return_value = page([feature("f1"), feature("f2")])
+    monitor.send = AsyncMock(return_value=receipts)
+    with pytest.raises(IntegrationBadResponseError):
+        await monitor.collect()
+    assert store.value["outbox"]["delivery_status"] == "sending"
+    assert store.value["jobs"][0]["offset"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,retryable_slot", [(401, True), (422, True), (503, False)]
+)
+async def test_submission_http_rejection_vs_ambiguous_failure(
+    config, store, status, retryable_slot
+):
+    calls = []
+
+    def route(request):
+        calls.append(request)
+        return httpx.Response(status, json={"detail": "failure"})
+
+    async with client.OlmoEarthClient(
+        "https://example.test", "token", transport=httpx.MockTransport(route)
+    ) as api:
+        from app.services.errors import IntegrationError
+
+        with pytest.raises(IntegrationError):
+            await make_monitor(config, api, store).submit()
+    assert len(calls) == 1
+    assert store.value["next_slot"] == (0 if retryable_slot else 1)
+    assert bool(store.value["jobs"]) is not retryable_slot
