@@ -14,6 +14,8 @@ for API browsing, the services needed for the real form, and staging setup.
 
 The Gundi action schemas generate the form. Use the integration's base URL for the
 OlmoEarth environment and configure its Authenticate action with the API token.
+[Placeholder examples](examples/README.md) cover both settings and the separate
+Gundi runner credentials.
 
 1. Save **Collect LCC Events** (`pull_events`) using `examples/lcc-monitor.json` as a
    starting point. Every ID and the small example polygon are placeholders. Replace the
