@@ -4,6 +4,9 @@ Prototype of a scheduled LCC change monitor using the public APIs on OlmoEarth S
 `develop`. It does **not** depend on Studio PR #3226 or a cross-result feature endpoint.
 One saved Gundi integration is one area/model monitor; create another integration for another area.
 
+See the [component and workflow overview](docs/gundi-earthranger-workflow.md) for diagrams,
+application roles, credentials, and planned reusable-area support.
+
 ## View and run
 
 The PR contains a backend connector; it does not deploy a website. Gundi's portal
