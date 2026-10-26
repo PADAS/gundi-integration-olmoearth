@@ -25,3 +25,22 @@ route/destination, not in this connector.
 Save Submit LCC Predictions with `run_on_schedule` disabled until the pilot is
 ready. The `run_on_schedule` field in the Collect configuration only controls
 collection; it does not enable prediction submission.
+
+## Production pilot — supplied October 26, 2026
+
+`lcc-monitor-production-pilot.json` records the project and model supplied by Rachel:
+
+- Project: `6205704f-b09e-432b-af61-d68b1ebe018f`
+- Model: `f96ef025-780e-4393-9083-e732a324670e`
+- [Studio model page](https://olmoearth.allenai.org/projects/6205704f-b09e-432b-af61-d68b1ebe018f/models/f96ef025-780e-4393-9083-e732a324670e)
+
+This is a configuration draft, not a ready-to-run integration. The AOI remains
+the example polygon, the date property/aggregation remain placeholders, and
+cadence, start date, imagery lag, precision and event type remain unconfirmed
+example settings. The optional organization ID is omitted until known. Collection
+is disabled on schedule in this draft; keep submission disabled too.
+
+Confirm the production API base URL separately from the Studio UI URL, enter the
+OlmoEarth token in Authenticate, and inspect the model's vector output and ISO
+change-date semantics before running. Gundi credentials and destination setup
+are still required. No live inference is initiated by adding this file.
