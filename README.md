@@ -83,8 +83,9 @@ Gundi's returned `object_id` separately after acknowledged delivery. See the
 
 For consecutive predictions, the prototype suppresses a repeat when exactly one previously
 known polygon has the same class, estimated date within `date_tolerance_days`, and polygon
-intersection-over-union at least `overlap_threshold`. It records the new observation
-locally; it does not PATCH the delivered EarthRanger event. Multiple matches create an event
+intersection-over-union at least `overlap_threshold`, and that was first seen in an earlier
+prediction (a polygon split into several features counts as one observation). It records the
+new observation locally; it does not PATCH the delivered EarthRanger event. Multiple matches create an event
 with `ambiguous_match_count` for review. This is a regional, planar-overlap heuristic,
 not a general change-tracking algorithm: inspect splits, merges, geometry drift and dates
 in the pilot. Antimeridian-spanning AOIs are rejected. Geometry is selected by intersection,
@@ -138,8 +139,8 @@ continue. Use a smaller AOI for the prototype. Empty vector results complete nor
 A raster-only result, a changed result ID, or a detection with an invalid polygon or
 malformed date marks only that job `failed` at the offending page (no detection is
 skipped silently); the run reports the error after the other jobs are collected. Upstream
-vectorization can itself remove/cap
-polygons: use an uncapped model and inspect its sieve/simplification settings for the pilot.
+vectorization can itself remove/cap polygons: use an uncapped model and inspect its
+sieve/simplification settings for the pilot.
 
 The job ledger is bounded at 1,000 jobs and stops visibly at that limit. Event history is
 never evicted, so old detections are never silently resent. Large-result export and
@@ -156,6 +157,11 @@ downstream event updates are follow-up work.
 - `app/actions/monitor_store.py`: the Redis ledger, event hash and date indexes.
 - `app/actions/delivery.py`: one-shot Gundi delivery and receipt validation.
 - `app/actions/change_events.py`: date parsing, repeat matching and event construction.
+
+Shared runner code in `app/services` comes from the upstream action-runner template, so
+changes there stay small and general: `IntegrationStateManager.key()`/`.lock()`,
+`gundi.get_gundi_sender()`, and a public `retry_policies.retryable_status`. Existing state
+key names and send helpers are unchanged.
 
 Event preparation works on a page-local stage: copies of the candidate events the page can
 match, plus the events it creates or updates. The monitor stores that stage's changes in
