@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+import pytest_asyncio
 from pydantic import ValidationError
 
 from app.actions import client, handlers
@@ -23,7 +24,7 @@ from app.actions.monitor import (
     build_feature_query,
     schedule_slot,
 )
-from app.actions.monitor_state import Job
+from app.actions.monitor_state import Job, KnownEvent
 from app.services.errors import (
     IntegrationAuthError,
     IntegrationBadResponseError,
@@ -59,20 +60,48 @@ def config():
     )
 
 
-class MemoryState:
+class MemoryMonitorStore:
+    """In-memory MonitorStore with the same contract as RedisMonitorStore."""
+
     def __init__(self):
-        self.value = {}
+        self.ledger = None
+        self.legacy = None
+        self.events = {}
 
-    async def get_state(self, *args):
-        return copy.deepcopy(self.value)
+    async def load_ledger(self):
+        return copy.deepcopy(self.ledger)
 
-    async def set_state(self, *args):
-        self.value = copy.deepcopy(args[-1])
+    async def load_legacy(self):
+        return copy.deepcopy(self.legacy)
+
+    async def save_ledger(self, ledger):
+        self.ledger = copy.deepcopy(ledger)
+
+    async def known_ids(self, external_ids):
+        return {external_id for external_id in external_ids if external_id in self.events}
+
+    async def candidates(self, change_type, start, end):
+        return [
+            KnownEvent.parse_obj(event)
+            for event in self.events.values()
+            if event["change_type"] == change_type
+            and start <= dt.date.fromisoformat(event["change_date"]) <= end
+        ]
+
+    async def commit(self, ledger, events):
+        for event in events:
+            self.events[event.external_id] = json.loads(event.json())
+        self.ledger = copy.deepcopy(ledger)
+
+    @property
+    def value(self):
+        """The ledger plus committed events, for assertions."""
+        return {**(self.ledger or {}), "known_events": list(self.events.values())}
 
 
 @pytest.fixture
 def store():
-    return MemoryState()
+    return MemoryMonitorStore()
 
 
 @pytest.fixture
@@ -741,7 +770,7 @@ def two_jobs(config):
 @pytest.mark.asyncio
 async def test_invalid_feature_fails_only_its_own_job(config, api, store):
     config.pages_per_poll = 2
-    monitor = await seed(config, api, store, two_jobs(config))
+    await seed(config, api, store, two_jobs(config))
     api.get_prediction.side_effect = [prediction("bad", result_id="rb"), prediction("good")]
     api.search_features.side_effect = [page([feature(changed=145)]), page([feature()])]
     with pytest.raises(IntegrationBadResponseError):
@@ -885,3 +914,185 @@ async def test_project_organization_parses_typed_response():
         "https://example.test", "token", transport=httpx.MockTransport(route)
     ) as http:
         assert await http.project_organization(PROJECT) == ORG
+
+
+def known(external_id, change_date="2026-09-10", change_type="mining", **fields):
+    return KnownEvent(
+        external_id=external_id,
+        geometry=AREA,
+        change_type=change_type,
+        change_date=change_date,
+        first_seen_at=NOW,
+        last_seen_at=NOW,
+        last_prediction_id="p0",
+        **fields,
+    )
+
+
+@pytest.mark.asyncio
+async def test_page_reads_only_candidates_within_date_tolerance(config, api, store):
+    monitor = await seed(config, api, store)
+    await store.commit(
+        store.ledger, [known("near", "2026-09-01"), known("far", "2025-01-01")]
+    )
+    store.candidates = AsyncMock(wraps=store.candidates)
+    api.search_features.return_value = page([feature(changed="2026-09-10")])
+    await monitor.collect()
+    (change_type, start, end), _ = store.candidates.call_args
+    assert change_type == "mining"
+    assert start == dt.date(2026, 8, 10) and end == dt.date(2026, 10, 11)
+
+
+@pytest.mark.asyncio
+async def test_undelivered_page_commits_no_event_history(config, api, store):
+    monitor = await seed(config, api, store)
+    api.search_features.return_value = page([feature()])
+    monitor.send.side_effect = RuntimeError("lost")
+    with pytest.raises(RuntimeError):
+        await monitor.collect()
+    assert store.events == {}
+    assert len(store.ledger["outbox"]["new_events"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_accepted_page_commits_events_with_receipts(config, api, store):
+    monitor = await seed(config, api, store)
+    api.search_features.return_value = page([feature()])
+    await monitor.collect()
+    (event,) = store.events.values()
+    assert event["gundi_object_id"] == "gundi-" + event["external_id"]
+    assert store.ledger["outbox"] is None
+
+
+@pytest.mark.asyncio
+async def test_single_blob_state_migrates_with_its_outbox(config, api, store):
+    seeded = await seed(config, api, store)
+    committed = known("committed")
+    repeat = committed.copy(update={"observations": 2, "last_prediction_id": "p1"})
+    staged_new = known("staged", "2026-09-20")
+    legacy = dict(store.ledger)
+    legacy["jobs"][0].pop("reference_time")
+    legacy["jobs"][0]["request"] = {"start_time": "2026-10-01T00:00:00Z"}
+    legacy["known_events"] = [json.loads(committed.json())]
+    legacy["outbox"] = {
+        "batch_id": "batch",
+        "delivery_status": "pending",
+        "job_name": "job",
+        "events": [{"event_details": {"external_event_id": "staged"}}],
+        "known_events": [json.loads(e.json()) for e in (repeat, staged_new)],
+        "next_offset": 1,
+        "complete": True,
+    }
+    store.ledger, store.legacy = None, legacy
+    monitor = make_monitor(config, api, store)
+    await monitor.load()
+    box = monitor.state.outbox
+    assert [e.external_id for e in box.new_events] == ["staged"]
+    assert [e.observations for e in box.updated_events] == [2]
+    assert monitor.state.jobs[0].reference_time == "2026-10-01T00:00:00Z"
+    assert set(store.events) == {"committed"}
+    monitor.send.side_effect = None
+    monitor.send.return_value = ["gundi-staged"]
+    await monitor.collect()
+    assert store.events["committed"]["observations"] == 2
+    assert store.events["staged"]["gundi_object_id"] == "gundi-staged"
+    assert seeded.state.identity == store.ledger["identity"]
+
+
+@pytest.mark.asyncio
+async def test_lock_yields_false_on_ephemeral_path():
+    from app.services.activity_logger import ephemeral_run
+
+    token = ephemeral_run.set(True)
+    try:
+        async with handlers.state_manager.lock("i", "a", ttl_seconds=5) as acquired:
+            assert acquired is False
+    finally:
+        ephemeral_run.reset(token)
+
+
+@pytest_asyncio.fixture
+async def redis_state_manager():
+    from app.services.state import IntegrationStateManager
+
+    manager = IntegrationStateManager(db=15)
+    try:
+        await manager.db_client.ping()
+    except Exception:
+        pytest.skip("No Redis server reachable for the store contract test")
+    await manager.db_client.flushdb()
+    yield manager
+    await manager.db_client.flushdb()
+    await manager.db_client.aclose()
+
+
+async def check_store_contract(any_store):
+    assert await any_store.load_ledger() is None
+    await any_store.commit(
+        {"identity": "x"},
+        [
+            known("a", "2026-09-01"),
+            known("b", "2026-09-30"),
+            known("c", "2026-09-10", change_type="new_road"),
+        ],
+    )
+    assert await any_store.load_ledger() == {"identity": "x"}
+    found = await any_store.candidates(
+        "mining", dt.date(2026, 8, 25), dt.date(2026, 9, 15)
+    )
+    assert [e.external_id for e in found] == ["a"]
+    assert await any_store.known_ids(["a", "c", "missing"]) == {"a", "c"}
+    await any_store.commit({"identity": "y"}, [known("a", "2026-09-01", observations=3)])
+    (updated,) = await any_store.candidates(
+        "mining", dt.date(2026, 9, 1), dt.date(2026, 9, 1)
+    )
+    assert updated.observations == 3
+    await any_store.save_ledger({"identity": "z"})
+    assert await any_store.load_ledger() == {"identity": "z"}
+
+
+@pytest.mark.asyncio
+async def test_memory_store_contract():
+    await check_store_contract(MemoryMonitorStore())
+
+
+@pytest.mark.asyncio
+async def test_redis_store_contract(redis_state_manager):
+    from app.actions.monitor_store import RedisMonitorStore
+
+    await check_store_contract(RedisMonitorStore(redis_state_manager, "integration-1"))
+
+
+@pytest.mark.asyncio
+async def test_redis_lock_excludes_a_second_run(redis_state_manager):
+    async with redis_state_manager.lock("i", "a", ttl_seconds=30) as first:
+        async with redis_state_manager.lock("i", "a", ttl_seconds=30) as second:
+            assert (first, second) == (True, False)
+    async with redis_state_manager.lock("i", "a", ttl_seconds=30) as again:
+        assert again is True
+
+
+@pytest.mark.asyncio
+async def test_monitor_repeat_detection_on_redis(config, api, redis_state_manager):
+    from app.actions.monitor_store import RedisMonitorStore
+
+    store = RedisMonitorStore(redis_state_manager, "integration-1")
+    monitor = await seed(config, api, store)
+    api.search_features.return_value = page([feature()])
+    assert (await monitor.collect())["events_sent"] == 1
+    monitor.state.jobs.append(
+        Job(
+            name="second",
+            reference_time="2026-10-08T00:00:00Z",
+            config=config,
+            prediction_id="p2",
+            status="pending",
+        )
+    )
+    await monitor.save()
+    api.get_prediction.return_value = prediction("p2", result_id="r2")
+    api.search_features.return_value = page([feature("again", changed="2026-09-12")])
+    assert (await monitor.collect())["events_sent"] == 0
+    (event,) = await store.candidates("mining", dt.date(2026, 9, 1), dt.date(2026, 9, 30))
+    assert event.observations == 2 and event.gundi_object_id
+    assert (await store.load_ledger())["outbox"] is None

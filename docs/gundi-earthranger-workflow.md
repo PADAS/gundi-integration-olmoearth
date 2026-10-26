@@ -26,7 +26,7 @@ flowchart TD
     Scheduler[Gundi scheduler] --> Messages[Messaging / PubSub]
     Messages --> Runner[Our OlmoEarth action runner]
     Config --> Runner
-    Runner <--> Redis[Redis: jobs, progress, known events, outbox]
+    Runner <--> Redis[Redis: ledger + outbox, event hash, date indexes]
     Runner -->|Create and poll predictions| OE[OlmoEarth API and inference]
     OE -->|Vector polygons and properties| Runner
     Runner -->|Send filtered events| Ingest[Gundi ingestion API]

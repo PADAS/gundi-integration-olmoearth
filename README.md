@@ -92,8 +92,20 @@ not clipped to the AOI. Nearby separate polygons from the same prediction remain
 
 ## Recovery and completeness
 
-Redis holds the job ledger, per-result offset, event history and a delivery outbox under
-`lcc_monitor_v1`. Configure durable Redis persistence/backups before a real deployment.
+Redis holds the monitor under `integration_state.<integration>.lcc_monitor_v1.*`:
+
+- `ledger`: jobs, per-result offsets, schedule position and the delivery outbox.
+- `events`: a hash of known events (polygon, change type and date, observations, Gundi ID).
+- `by_date.<change_type>`: a sorted set of event IDs scored by change date. Repeat matching
+  reads only events of the same type within `date_tolerance_days`, so cost tracks local
+  density rather than total history, and history has no size cap.
+- `lock`: the run lock (`IntegrationStateManager.lock`).
+
+A page's outbox carries only its new and updated events. Once Gundi accepts the batch, those
+events, their index entries and the advanced job offset are written in one Redis transaction.
+State saved by the earlier single-value layout (`...lcc_monitor_v1.no-source`) is migrated on
+first load and left in place as a backup. Configure durable Redis persistence/backups before
+a real deployment: losing the event history means already-delivered detections are resent.
 There is no prediction-creation or feature-time watermark: late-completing jobs remain
 tracked. An action lock and shorter execution timeout prevent the two schedules from
 writing this state concurrently.
@@ -126,12 +138,13 @@ marks the job `needs_export`; it is never reported complete, but later scheduled
 continue. Use a smaller AOI for the prototype. Empty vector results complete normally.
 A raster-only result, a changed result ID, or a detection with an invalid polygon or
 malformed date marks only that job `failed` at the offending page (no detection is
-skipped silently); the run reports the error after the other jobs are collected. Upstream vectorization can itself remove/cap
+skipped silently); the run reports the error after the other jobs are collected. Upstream
+vectorization can itself remove/cap
 polygons: use an uncapped model and inspect its sieve/simplification settings for the pilot.
 
-History is bounded at 1,000 jobs and 10,000 known events and stops visibly at those limits.
-It does not evict identities and silently resend old events. A durable indexed event store,
-large-result export, and downstream event updates are follow-up work.
+The job ledger is bounded at 1,000 jobs and stops visibly at that limit. Event history is
+never evicted, so old detections are never silently resent. Large-result export and
+downstream event updates are follow-up work.
 
 ## Code layout
 
@@ -141,11 +154,13 @@ large-result export, and downstream event updates are follow-up work.
 - `app/actions/handlers.py`: connects Gundi actions to the monitor.
 - `app/actions/monitor.py`: submission, collection, pagination and delivery recovery.
 - `app/actions/monitor_state.py`: persisted jobs, events, outbox and monitor identity.
+- `app/actions/monitor_store.py`: the Redis ledger, event hash and date indexes.
 - `app/actions/change_events.py`: date parsing, repeat matching and event construction.
 
-Event preparation updates a page-local copy of known events; the monitor persists
-that copy with the outbox. This keeps polygon logic independent of network and
-storage while preserving the delivery/checkpoint boundary.
+Event preparation works on a page-local stage: copies of the candidate events the page can
+match, plus the events it creates or updates. The monitor stores that stage's changes in
+the outbox and commits them only after delivery. This keeps polygon logic independent of
+network and storage while preserving the delivery/checkpoint boundary.
 
 ## Verification
 
@@ -154,6 +169,10 @@ connector contracts. Tests use mocked HTTP and state; no paid predictions or Gun
 are created. They cover submission/reconciliation, real nested result IDs, out-of-order
 completion, filtering, date validation, paging/resumption, interrupted delivery, receipt
 validation, and repeat polygons across predictions.
+
+The Redis store and lock tests run only when a Redis server is reachable at
+`REDIS_HOST`/`REDIS_PORT`; they use database 15 and flush it. Otherwise they skip. For
+example, `docker run -d --rm -p 6390:6379 redis:7-alpine` then `REDIS_PORT=6390 pytest`.
 
 For the live pilot, use one small AOI and mining, submit two successive reference dates,
 check the actual date-property encoding, then inspect events and repeated polygons in

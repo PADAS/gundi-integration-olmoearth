@@ -23,8 +23,12 @@ from .configurations import (
 )
 from .monitor import Monitor
 from .monitor_state import STATE_ACTION
+from .monitor_store import RedisMonitorStore
 
 state_manager = IntegrationStateManager()
+RUN_LOCK_TTL_SECONDS = 900
+# Margin for the cancelled run to unwind (close clients, release) inside the TTL.
+RUN_TIMEOUT_SECONDS = RUN_LOCK_TTL_SECONDS - 300
 
 
 def get_auth_config(integration) -> AuthenticateConfig:
@@ -94,25 +98,22 @@ async def run_monitor(
             "Save this integration before running the monitor."
         )
     integration_id = str(integration.id)
-    lock = state_manager.db_client.lock(
-        f"{STATE_ACTION}:lock:{integration_id}", timeout=900, blocking=False
-    )
-    if not await lock.acquire():
-        return {"status": "already_running"}
-    try:
+    async with state_manager.lock(
+        integration_id, STATE_ACTION, ttl_seconds=RUN_LOCK_TTL_SECONDS
+    ) as acquired:
+        if not acquired:
+            return {"status": "already_running"}
         async with client_for(integration) as api:
             monitor = Monitor(
                 integration_id,
                 config,
                 api,
-                state_manager,
+                RedisMonitorStore(state_manager, integration_id),
                 partial(send_events_once_to_gundi, integration_id=integration_id),
                 datetime.now(timezone.utc),
             )
             # Finish/cancel before the shared lock expires, even on a stalled provider.
-            return await asyncio.wait_for(work(monitor), timeout=600)
-    finally:
-        await lock.release()
+            return await asyncio.wait_for(work(monitor), timeout=RUN_TIMEOUT_SECONDS)
 
 
 @action_title("Submit LCC Predictions")

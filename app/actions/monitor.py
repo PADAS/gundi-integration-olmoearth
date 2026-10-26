@@ -3,7 +3,7 @@
 import calendar
 import json
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Optional
 from uuid import NAMESPACE_URL, uuid5
 
 from app.services.errors import (
@@ -13,7 +13,13 @@ from app.services.errors import (
 )
 from app.services.gundi import EventsNotSentError, valid_event_receipts
 
-from .change_events import InvalidFeatureError, prepare_event
+from .change_events import (
+    EventStage,
+    InvalidFeatureError,
+    candidate_windows,
+    event_id,
+    prepare_event,
+)
 from .client import (
     FeatureSearchRequest,
     KeywordFilter,
@@ -26,14 +32,15 @@ from .client import (
 from .configurations import Cadence, PullEventsConfig
 from .monitor_state import (
     ACTIVE_JOB_STATUSES,
-    STATE_ACTION,
     DeliveryStatus,
     Job,
     JobStatus,
+    KnownEvent,
     MonitorState,
     Outbox,
     monitor_identity,
 )
+from .monitor_store import MonitorStore
 
 MAX_JOBS = 1000
 RESULT_WINDOW = 10000
@@ -76,20 +83,22 @@ class Monitor:
         integration_id: str,
         config: PullEventsConfig,
         api: OlmoEarthClient,
-        state_manager,
+        store: MonitorStore,
         send: Callable[[list[dict]], Awaitable[list[str]]],
         now: datetime,
     ):
         self.integration_id = integration_id
         self.config = config
         self.api = api
-        self.store = state_manager
+        self.store = store
         self.send = send
         self.now = now.astimezone(timezone.utc)
         self.state: MonitorState
 
     async def load(self):
-        raw = await self.store.get_state(self.integration_id, STATE_ACTION)
+        raw = await self.store.load_ledger()
+        if raw is None:
+            raw = await self._migrate_legacy()
         identity = monitor_identity(self.config, self.api.base_url)
         self.state = (
             MonitorState.parse_obj(raw) if raw else MonitorState(identity=identity)
@@ -99,10 +108,38 @@ class Monitor:
                 "Environment, model, area, project, date semantics or schedule changed. Create a new monitor integration to preserve existing jobs and event identity."
             )
 
+    def _ledger(self) -> dict:
+        return json.loads(self.state.json())
+
     async def save(self):
-        await self.store.set_state(
-            self.integration_id, STATE_ACTION, json.loads(self.state.json())
-        )
+        await self.store.save_ledger(self._ledger())
+
+    async def _migrate_legacy(self) -> Optional[dict]:
+        """Move single-blob state into the ledger + per-event layout, once.
+
+        The old blob is left in place as a backup; it is never read again once
+        the ledger exists.
+        """
+        legacy = await self.store.load_legacy()
+        if not legacy:
+            return None
+        events = [KnownEvent.parse_obj(e) for e in legacy.pop("known_events", [])]
+        box = legacy.get("outbox")
+        if box and "known_events" in box:
+            # The old outbox carried the whole staged history; keep only its changes.
+            committed = {event.external_id: event for event in events}
+            staged = [KnownEvent.parse_obj(e) for e in box.pop("known_events")]
+            box["new_events"] = [
+                json.loads(e.json()) for e in staged if e.external_id not in committed
+            ]
+            box["updated_events"] = [
+                json.loads(e.json())
+                for e in staged
+                if e.external_id in committed and e != committed[e.external_id]
+            ]
+        ledger = json.loads(MonitorState.parse_obj(legacy).json())
+        await self.store.commit(ledger, events)
+        return ledger
 
     async def _release_slot(self, job: Job):
         """Forget a submission Studio never created, so its slot is submitted again."""
@@ -156,7 +193,7 @@ class Monitor:
         }
         job = Job(
             name=name,
-            request=body,
+            reference_time=reference,
             config=self.config.copy(deep=True),
             submitted_at=self.now,
         )
@@ -234,15 +271,14 @@ class Monitor:
                 )
             box.delivery_status = DeliveryStatus.ACCEPTED
             await self.save()
-        by_id = {record.external_id: record for record in box.known_events}
+        by_id = {record.external_id: record for record in box.new_events}
         for event, object_id in zip(box.events, box.receipts):
             by_id[event["event_details"]["external_event_id"]].gundi_object_id = object_id
-        self.state.known_events = box.known_events
         job = next(j for j in self.state.jobs if j.name == box.job_name)
         job.offset = box.next_offset
         job.status = JobStatus.COMPLETE if box.complete else JobStatus.COLLECTING
         self.state.outbox = None
-        await self.save()
+        await self.store.commit(self._ledger(), box.new_events + box.updated_events)
         return len(box.events)
 
     async def resolve_delivery(self, resolution) -> dict:
@@ -272,6 +308,16 @@ class Monitor:
             box.delivery_status = DeliveryStatus.PENDING
         await self.save()
         return {"batch_id": box.batch_id, "status": box.delivery_status.value}
+
+    async def _stage(self, job: Job, features: list) -> EventStage:
+        """Fetch only the committed history this page's features can touch."""
+        candidates = []
+        for change_type, (start, end) in candidate_windows(features, job).items():
+            candidates += await self.store.candidates(change_type, start, end)
+        known_ids = await self.store.known_ids(
+            event_id(self.integration_id, job, f) for f in features if f.id is not None
+        )
+        return EventStage(candidates, known_ids)
 
     async def _stop_job(self, job: Job, status: JobStatus, error: str):
         job.status = status
@@ -340,7 +386,7 @@ class Monitor:
                     break
                 # A short page proves exhaustion. ES totals can be lower bounds at 10,000.
                 complete = len(response.records) < query.limit
-                known = [event.copy(deep=True) for event in self.state.known_events]
+                stage = await self._stage(job, response.records)
                 try:
                     events = [
                         event
@@ -349,7 +395,7 @@ class Monitor:
                             event := prepare_event(
                                 feature,
                                 job,
-                                known,
+                                stage,
                                 shapes,
                                 integration_id=self.integration_id,
                                 now=self.now,
@@ -372,7 +418,8 @@ class Monitor:
                     ),
                     job_name=job.name,
                     events=events,
-                    known_events=known,
+                    new_events=stage.new,
+                    updated_events=list(stage.updated.values()),
                     next_offset=job.offset + len(response.records),
                     complete=complete,
                 )

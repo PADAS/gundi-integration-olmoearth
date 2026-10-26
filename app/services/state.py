@@ -1,7 +1,11 @@
 import json
 import logging
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
+
 import stamina
 import redis.asyncio as redis
+from redis.exceptions import LockError
 from app import settings
 from .activity_logger import ephemeral_run
 from .retry_policies import REDIS_RETRY
@@ -31,10 +35,51 @@ class IntegrationStateManager:
         db = kwargs.get("db", settings.REDIS_STATE_DB)
         self.db_client = redis.Redis(host=host, port=port, db=db)
 
+    @staticmethod
+    def key(integration_id: str, action_id: str, source_id: str = "no-source") -> str:
+        """The Redis key for one piece of an integration's state."""
+        return f"integration_state.{integration_id}.{action_id}.{source_id}"
+
+    @asynccontextmanager
+    async def lock(
+        self, integration_id: str, action_id: str, *, ttl_seconds: int
+    ) -> AsyncIterator[bool]:
+        """Hold a non-blocking, owner-checked lock for one integration's action.
+
+        Yields True if this caller holds the lock, False if another run does
+        (or on the ephemeral path, where nothing may be written). The lock
+        expires after ttl_seconds, so keep the guarded work shorter than that;
+        releasing a lock that already expired only logs a warning.
+        """
+        if _skip_on_ephemeral_run("lock", integration_id, action_id):
+            yield False
+            return
+        lock = self.db_client.lock(
+            self.key(integration_id, action_id, "lock"),
+            timeout=ttl_seconds,
+            blocking=False,
+        )
+        async for attempt in stamina.retry_context(**REDIS_RETRY):
+            with attempt:
+                acquired = await lock.acquire()
+        if not acquired:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            try:
+                await lock.release()
+            except LockError:
+                logger.warning(
+                    f"Lock for action '{action_id}' on integration '{integration_id}' "
+                    "expired before release; the guarded work outlived its TTL."
+                )
+
     async def get_state(self, integration_id: str, action_id: str, source_id: str = "no-source") -> dict:
         async for attempt in stamina.retry_context(**REDIS_RETRY):
             with attempt:
-                json_value = await self.db_client.get(f"integration_state.{integration_id}.{action_id}.{source_id}")
+                json_value = await self.db_client.get(self.key(integration_id, action_id, source_id))
         value = json.loads(json_value) if json_value else {}
         return value
 
@@ -44,7 +89,7 @@ class IntegrationStateManager:
         async for attempt in stamina.retry_context(**REDIS_RETRY):
             with attempt:
                 await self.db_client.set(
-                    f"integration_state.{integration_id}.{action_id}.{source_id}",
+                    self.key(integration_id, action_id, source_id),
                     json.dumps(state, default=str)
                 )
 
@@ -65,7 +110,7 @@ class IntegrationStateManager:
         async for attempt in stamina.retry_context(**REDIS_RETRY):
             with attempt:
                 was_set = await self.db_client.set(
-                    f"integration_state.{integration_id}.{action_id}.{source_id}",
+                    self.key(integration_id, action_id, source_id),
                     "1",
                     ex=ttl_seconds,
                     nx=True,
@@ -78,7 +123,7 @@ class IntegrationStateManager:
         async for attempt in stamina.retry_context(**REDIS_RETRY):
             with attempt:
                 await self.db_client.delete(
-                    f"integration_state.{integration_id}.{action_id}.{source_id}"
+                    self.key(integration_id, action_id, source_id)
                 )
 
     def __str__(self):

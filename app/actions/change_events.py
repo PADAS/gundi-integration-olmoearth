@@ -1,23 +1,17 @@
 """Validate polygon changes, match repeat detections, and build Gundi event payloads."""
 
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
 from uuid import NAMESPACE_URL, uuid5
 
 from shapely.geometry import shape
 from shapely.geometry.base import BaseGeometry
 
-from app.services.errors import (
-    IntegrationBadResponseError,
-    IntegrationConfigurationError,
-)
+from app.services.errors import IntegrationBadResponseError
 
 from .client import Feature
 from .configurations import polygon_shape
 from .monitor_state import Job, KnownEvent
-
-MAX_EVENTS = 10000
-
 
 class InvalidFeatureError(IntegrationBadResponseError):
     """A detection in a result is unusable; retrying the same page cannot fix it."""
@@ -41,20 +35,61 @@ def parse_change_date(value) -> date:
         ) from exc
 
 
+def event_id(integration_id: str, job: Job, feature: Feature) -> str:
+    """The stable Gundi external ID for one detection in one prediction result."""
+    return str(uuid5(NAMESPACE_URL, f"{integration_id}:{job.result_id}:{feature.id}"))
+
+
+def candidate_windows(features: list[Feature], job: Job) -> dict[str, tuple[date, date]]:
+    """Per change type, the change-date range any repeat of these features can fall in.
+
+    Features that prepare_event would skip or reject are ignored here; it reports them.
+    """
+    dates: dict[str, list[date]] = {}
+    for feature in features:
+        props = feature.properties.model_properties()
+        change_type = props.get("post_change")
+        if change_type not in job.config.selected_types:
+            continue
+        try:
+            changed = parse_change_date(props.get(job.config.change_date_property))
+        except InvalidFeatureError:
+            continue
+        dates.setdefault(change_type, []).append(changed)
+    tolerance = timedelta(days=job.config.date_tolerance_days)
+    return {
+        change_type: (min(found) - tolerance, max(found) + tolerance)
+        for change_type, found in dates.items()
+    }
+
+
+class EventStage:
+    """One page's view of event history: committed candidates plus staged changes.
+
+    Nothing here is persisted until the page's outbox is accepted and committed.
+    """
+
+    def __init__(self, candidates: list[KnownEvent], known_ids: set[str]):
+        # Copies, so a page that is never committed leaves no trace.
+        self.candidates = [event.copy() for event in candidates]
+        self.known_ids = set(known_ids)
+        self.new: list[KnownEvent] = []
+        self.updated: dict[str, KnownEvent] = {}
+
+
 def prepare_event(
     feature: Feature,
     job: Job,
-    known: list[KnownEvent],
+    stage: EventStage,
     shapes: dict[str, BaseGeometry],
     *,
     integration_id: str,
     now: datetime,
 ) -> Optional[dict]:
-    """Build a new event or record a repeat in the caller's staged history.
+    """Build a new event or record a repeat in the page's staged history.
 
-    Mutates only ``known``, the page-local copy committed with the delivery outbox,
-    and ``shapes``, a cache of known-event geometries keyed by external ID.
-    This function performs no persistence or network operations.
+    Mutates only ``stage`` and ``shapes``, a cache of known-event geometries keyed
+    by external ID. This function performs no persistence or network operations.
     """
     if feature.id is None or feature.geometry is None:
         raise InvalidFeatureError(
@@ -74,13 +109,11 @@ def prepare_event(
         raise InvalidFeatureError(
             f"Detection {feature.id} geometry is not a valid regional polygon."
         ) from exc
-    external_id = str(
-        uuid5(NAMESPACE_URL, f"{integration_id}:{job.result_id}:{feature.id}")
-    )
-    if any(event.external_id == external_id for event in known):
+    external_id = event_id(integration_id, job, feature)
+    if external_id in stage.known_ids:
         return None
     matches = []
-    for previous in known:
+    for previous in stage.candidates:
         # Detections from the same run are distinct polygons, never repeats.
         if (
             previous.change_type != change_type
@@ -105,12 +138,10 @@ def prepare_event(
         if previous.last_prediction_id != job.prediction_id:
             previous.last_prediction_id = job.prediction_id
             previous.observations += 1
+        stage.updated[previous.external_id] = previous
         return None
-    if len(known) >= MAX_EVENTS:
-        raise IntegrationConfigurationError(
-            "Prototype event history is full; migrate to a durable event store before collecting more."
-        )
-    known.append(
+    stage.known_ids.add(external_id)
+    stage.new.append(
         KnownEvent(
             external_id=external_id,
             geometry=geometry,
@@ -136,7 +167,7 @@ def prepare_event(
             "estimated_change_date": changed.isoformat(),
             "change_date_precision": job.config.change_date_precision,
             "change_date_aggregation": job.config.change_date_aggregation,
-            "prediction_reference_time": job.request["start_time"],
+            "prediction_reference_time": job.reference_time,
             "ambiguous_match_count": len(matches),
         }
     )

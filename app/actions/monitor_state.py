@@ -33,7 +33,7 @@ class DeliveryStatus(str, Enum):
 
 class Job(BaseModel):
     name: str
-    request: dict
+    reference_time: str
     config: PullEventsConfig
     prediction_id: Optional[str] = None
     result_id: Optional[str] = None
@@ -41,6 +41,14 @@ class Job(BaseModel):
     submitted_at: Optional[datetime] = None
     offset: int = 0
     error: Optional[str] = None
+
+    @root_validator(pre=True)
+    def reference_time_from_request(cls, values):
+        # Jobs saved before reference_time existed kept the whole request body.
+        request = values.pop("request", None)
+        if request and "reference_time" not in values:
+            values["reference_time"] = request["start_time"]
+        return values
 
 
 class KnownEvent(BaseModel):
@@ -63,21 +71,30 @@ class KnownEvent(BaseModel):
 
 
 class Outbox(BaseModel):
+    """One page's delivery and the event-history changes it commits.
+
+    The history changes are applied only once Gundi has accepted ``events``,
+    together with the job's new offset, in a single store transaction.
+    """
+
     batch_id: str
     delivery_status: DeliveryStatus = DeliveryStatus.PENDING
     receipts: list[str] = Field(default_factory=list)
     job_name: str
     events: list[dict]
-    known_events: list[KnownEvent]
+    new_events: list[KnownEvent] = Field(default_factory=list)
+    updated_events: list[KnownEvent] = Field(default_factory=list)
     next_offset: int
     complete: bool
 
 
 class MonitorState(BaseModel):
+    """The ledger: everything except the event history, which the store keeps
+    per event so a page reads and writes only the events it touches."""
+
     identity: str
     next_slot: int = 0
     jobs: list[Job] = Field(default_factory=list)
-    known_events: list[KnownEvent] = Field(default_factory=list)
     outbox: Optional[Outbox] = None
 
 
