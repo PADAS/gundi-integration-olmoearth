@@ -23,8 +23,8 @@ from .monitor import Monitor
 from .monitor_state import STATE_ACTION
 
 state_manager = IntegrationStateManager()
-# The runner cancels every action after MAX_ACTION_EXECUTION_TIME; the margin lets a
-# cancelled run unwind and release the lock before it could expire under it.
+# The runner cancels every action after MAX_ACTION_EXECUTION_TIME, so a run always
+# releases the lock before it expires; the expiry only frees a lock a crash left behind.
 RUN_LOCK_TTL_SECONDS = settings.MAX_ACTION_EXECUTION_TIME + 300
 
 
@@ -67,11 +67,13 @@ async def run_monitor(
     work: Callable[[Monitor], Awaitable[dict]],
 ) -> dict:
     integration_id = str(integration.id)
-    async with state_manager.lock(
-        integration_id, STATE_ACTION, ttl_seconds=RUN_LOCK_TTL_SECONDS
-    ) as acquired:
-        if not acquired:
-            return {"status": "already_running"}
+    # Every action rewrites the one ledger value, so runs must not overlap (a manual
+    # run, or a PubSub redelivery, can start while another is in progress).
+    if not await state_manager.set_if_absent(
+        integration_id, STATE_ACTION, source_id="lock", ttl_seconds=RUN_LOCK_TTL_SECONDS
+    ):
+        return {"status": "already_running"}
+    try:
         async with client_for(integration) as api:
             monitor = Monitor(
                 integration_id,
@@ -82,6 +84,8 @@ async def run_monitor(
                 datetime.now(timezone.utc),
             )
             return await work(monitor)
+    finally:
+        await state_manager.delete_state(integration_id, STATE_ACTION, source_id="lock")
 
 
 @action_title("Submit LCC Predictions")

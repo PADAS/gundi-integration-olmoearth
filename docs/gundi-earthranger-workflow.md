@@ -61,7 +61,7 @@ A late-finishing prediction can therefore report an older change. Every detectio
 
 ## State and delivery
 
-Each monitor's state is one value in the runner's Redis, `integration_state.<integration>.lcc_monitor_v1.no-source`, written through the template's `IntegrationStateManager.set_state`, plus a short-lived `...lcc_monitor_v1.lock` key while a run holds the lock. Only this connector uses these keys; the Redis server and the other integrations' state are unaffected.
+Each monitor's state is one value in the runner's Redis, `integration_state.<integration>.lcc_monitor_v1.no-source`, written through the template's `IntegrationStateManager.set_state`, plus a short-lived `...lcc_monitor_v1.lock` key (the template's `set_if_absent`) while a run holds the lock. Only this connector uses these keys; the Redis server and the other integrations' state are unaffected.
 
 ```mermaid
 flowchart LR
@@ -126,9 +126,9 @@ Do not put real secrets in notes or committed examples. An EarthRanger admin log
 | Shared `routers/actions.py` | Runner HTTP action endpoints |
 | Shared services | Gundi authentication/configuration, Redis and ingestion |
 
-Changes to the shared runner code (`app/services`, from the upstream action-runner template) are two additions: `IntegrationStateManager.lock()` and `gundi.get_gundi_sender()` (a retried client lookup). Existing state keys and send helpers are unchanged.
+The shared runner code (`app/services`, from the upstream action-runner template) is unchanged; the connector only calls its existing helpers.
 
-The implementation is on `olmoearth-integration` in PR #2, based on the fork's `main` (the fork has no `develop`). The latest revision passes 429 local tests, including lock and end-to-end monitor tests against a disposable Redis (`OLMOEARTH_TEST_REDIS_URL`); without it those 2 skip. This proves mocked contracts/workflows, not a live end-to-end deployment. No live prediction or event has been sent in this work. Studio PR #3226 and a new cross-result/events API are not prerequisites.
+The implementation is on `olmoearth-integration` in PR #2, based on the fork's `main` (the fork has no `develop`). The latest revision passes 428 local tests, including an end-to-end monitor test against a disposable Redis (`OLMOEARTH_TEST_REDIS_URL`); without it that test skips. This proves mocked contracts/workflows, not a live end-to-end deployment. No live prediction or event has been sent in this work. Studio PR #3226 and a new cross-result/events API are not prerequisites.
 
 ## Pilot completion criteria
 

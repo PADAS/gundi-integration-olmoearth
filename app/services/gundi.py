@@ -211,14 +211,3 @@ async def send_messages_to_gundi(messages: List[dict], **kwargs) -> dict:
     assert integration_id, "integration_id is required"
     sensors_api_client = await _get_sensors_api_client(integration_id=str(integration_id))
     return await sensors_api_client.post_messages(data=messages)
-
-
-@stamina.retry(**GUNDI_API_RETRY)
-async def get_gundi_sender(integration_id: str) -> GundiDataSenderClient:
-    """A sensors-API client for the integration, for callers that post on their own terms.
-
-    Only the API-key lookup is retried; whatever the caller sends with the client
-    is not, so a caller that must not resend a batch can fetch the client first
-    and post exactly once.
-    """
-    return await _get_sensors_api_client(integration_id=str(integration_id))

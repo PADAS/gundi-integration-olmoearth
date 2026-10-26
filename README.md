@@ -111,9 +111,9 @@ Configure durable Redis persistence/backups before a real deployment: losing it 
 site is reported as new again.
 
 There is no prediction-creation or feature-time watermark: late-completing jobs remain
-tracked. A run lock (`IntegrationStateManager.lock`), held a few minutes longer than the
-runner's action timeout (`MAX_ACTION_EXECUTION_TIME`), prevents the two schedules from writing
-this state concurrently. Only one prediction is in flight at a time, so a collection run pages
+tracked. A run lock (the template's `set_if_absent`, expiring a few minutes after the
+runner's `MAX_ACTION_EXECUTION_TIME`) stops overlapping runs, such as a manual run or a
+PubSub redelivery, from overwriting each other's saves. Only one prediction is in flight at a time, so a collection run pages
 that one job. A changed environment or monitor setting is refused with the names of the
 settings that differ.
 
@@ -162,9 +162,8 @@ export and downstream event updates are follow-up work.
 - `app/actions/delivery.py`: one-shot Gundi delivery and acknowledgement check.
 - `app/actions/change_events.py`: date parsing, site IDs and event construction.
 
-Shared runner code in `app/services` comes from the upstream action-runner template, so
-changes there are two additions: `IntegrationStateManager.lock()` and
-`gundi.get_gundi_sender()`. Existing state keys and send helpers are unchanged.
+Shared runner code in `app/services` comes from the upstream action-runner template and is
+unchanged; the connector only calls its existing helpers.
 
 Event preparation works on a page-local stage: the committed site records plus copies of the
 ones the page touches. The monitor stores that stage's changes in
@@ -179,8 +178,8 @@ are created. They cover submission recovery by name, real nested result IDs, fil
 date validation, paging/resumption, interrupted delivery, acknowledgement checks, and
 site marking across predictions.
 
-The real-Redis lock and monitor tests run only when `OLMOEARTH_TEST_REDIS_URL` points at a
-disposable Redis database, which they flush; otherwise they skip. For example,
+The real-Redis monitor test runs only when `OLMOEARTH_TEST_REDIS_URL` points at a
+disposable Redis database, which it flushes; otherwise it skips. For example,
 `docker run -d --rm -p 6390:6379 redis:7-alpine`, then
 `OLMOEARTH_TEST_REDIS_URL=redis://127.0.0.1:6390/15 pytest`.
 

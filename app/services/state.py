@@ -1,11 +1,7 @@
 import json
 import logging
-from contextlib import asynccontextmanager
-from typing import AsyncIterator
-
 import stamina
 import redis.asyncio as redis
-from redis.exceptions import LockError
 from app import settings
 from .activity_logger import ephemeral_run
 from .retry_policies import REDIS_RETRY
@@ -34,38 +30,6 @@ class IntegrationStateManager:
         port = kwargs.get("port", settings.REDIS_PORT)
         db = kwargs.get("db", settings.REDIS_STATE_DB)
         self.db_client = redis.Redis(host=host, port=port, db=db)
-
-    @asynccontextmanager
-    async def lock(
-        self, integration_id: str, action_id: str, *, ttl_seconds: int
-    ) -> AsyncIterator[bool]:
-        """Hold a non-blocking, owner-checked lock for one integration's action.
-
-        Yields True if this caller holds the lock, False if another run does.
-        The lock expires after ttl_seconds, so keep the guarded work shorter than
-        that; releasing a lock that already expired only logs a warning.
-
-        A Redis error while acquiring raises rather than being retried: after a
-        lost reply the retry would find this caller's own key and wrongly report
-        the lock as held by another run.
-        """
-        lock = self.db_client.lock(
-            f"integration_state.{integration_id}.{action_id}.lock",
-            timeout=ttl_seconds,
-            blocking=False,
-        )
-        acquired = await lock.acquire()
-        try:
-            yield acquired
-        finally:
-            if acquired:
-                try:
-                    await lock.release()
-                except LockError:
-                    logger.warning(
-                        f"Lock for action '{action_id}' on integration '{integration_id}' "
-                        "expired before release; the guarded work outlived its TTL."
-                    )
 
     async def get_state(self, integration_id: str, action_id: str, source_id: str = "no-source") -> dict:
         async for attempt in stamina.retry_context(**REDIS_RETRY):

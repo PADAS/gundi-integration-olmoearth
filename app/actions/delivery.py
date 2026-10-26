@@ -2,10 +2,21 @@
 
 from typing import Optional
 
+import stamina
 from gundi_client_v2.client import GundiDataSenderClient
 
 from app.services.errors import IntegrationBadResponseError
-from app.services.gundi import get_gundi_sender
+from app.services.gundi import GUNDI_API_RETRY, _get_sensors_api_client
+
+
+@stamina.retry(**GUNDI_API_RETRY)
+async def get_gundi_client(integration_id: str) -> GundiDataSenderClient:
+    """The template's client lookup, retried on its own.
+
+    ``send_events_to_gundi`` retries the lookup and the POST together, which could
+    send a batch twice, so delivery fetches the client here and posts exactly once.
+    """
+    return await _get_sensors_api_client(integration_id=str(integration_id))
 
 
 class GundiEventSender:
@@ -22,7 +33,7 @@ class GundiEventSender:
 
     async def prepare(self) -> None:
         if self._client is None:
-            self._client = await get_gundi_sender(self.integration_id)
+            self._client = await get_gundi_client(self.integration_id)
 
     async def post(self, events: list[dict]) -> None:
         """POST the batch once; raise unless Gundi acknowledged every event."""

@@ -531,19 +531,24 @@ async def test_incomplete_api_responses_are_not_checkpointed(payload):
 
 @pytest.mark.asyncio
 async def test_lock_prevents_overlapping_actions(config, mocker):
-    lock = SimpleNamespace(acquire=AsyncMock(return_value=False), release=AsyncMock())
-    mocker.patch.object(handlers.state_manager.db_client, "lock", return_value=lock)
+    mocker.patch.object(
+        handlers.state_manager, "set_if_absent", AsyncMock(return_value=False)
+    )
+    release = mocker.patch.object(handlers.state_manager, "delete_state", AsyncMock())
     api_factory = mocker.patch.object(handlers, "client_for")
     assert await handlers.run_monitor(
         SimpleNamespace(id="integration-1"), config, Monitor.submit
     ) == {"status": "already_running"}
     api_factory.assert_not_called()
+    release.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_lock_released_after_failure(config, mocker):
-    lock = SimpleNamespace(acquire=AsyncMock(return_value=True), release=AsyncMock())
-    mocker.patch.object(handlers.state_manager.db_client, "lock", return_value=lock)
+    mocker.patch.object(
+        handlers.state_manager, "set_if_absent", AsyncMock(return_value=True)
+    )
+    release = mocker.patch.object(handlers.state_manager, "delete_state", AsyncMock())
     mocker.patch.object(
         handlers, "client_for", side_effect=RuntimeError("test failure")
     )
@@ -551,7 +556,7 @@ async def test_lock_released_after_failure(config, mocker):
         await handlers.run_monitor(
             SimpleNamespace(id="integration-1"), config, Monitor.submit
         )
-    lock.release.assert_awaited_once()
+    release.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -749,15 +754,6 @@ async def redis_state_manager():
 
 
 @pytest.mark.asyncio
-async def test_redis_lock_excludes_a_second_run(redis_state_manager):
-    async with redis_state_manager.lock("i", "a", ttl_seconds=30) as first:
-        async with redis_state_manager.lock("i", "a", ttl_seconds=30) as second:
-            assert (first, second) == (True, False)
-    async with redis_state_manager.lock("i", "a", ttl_seconds=30) as again:
-        assert again is True
-
-
-@pytest.mark.asyncio
 async def test_monitor_site_tracking_on_redis(config, api, redis_state_manager):
     from app.actions.monitor_state import STATE_ACTION
 
@@ -798,7 +794,7 @@ async def test_event_sender_posts_once_and_reuses_its_client(mocker):
         post_events=AsyncMock(side_effect=httpx.ReadTimeout("lost acknowledgement"))
     )
     lookup = mocker.patch(
-        "app.actions.delivery.get_gundi_sender", AsyncMock(return_value=client_)
+        "app.actions.delivery.get_gundi_client", AsyncMock(return_value=client_)
     )
     sender = GundiEventSender("integration-1")
     await sender.prepare()
@@ -817,7 +813,7 @@ async def test_event_sender_rejects_unclean_acknowledgement(mocker, response):
     from app.actions.delivery import GundiEventSender
 
     client_ = SimpleNamespace(post_events=AsyncMock(return_value=response))
-    mocker.patch("app.actions.delivery.get_gundi_sender", AsyncMock(return_value=client_))
+    mocker.patch("app.actions.delivery.get_gundi_client", AsyncMock(return_value=client_))
     sender = GundiEventSender("integration-1")
     await sender.prepare()
     with pytest.raises(IntegrationBadResponseError):
