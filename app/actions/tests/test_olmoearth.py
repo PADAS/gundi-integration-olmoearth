@@ -325,41 +325,78 @@ async def test_failed_delivery_replays_identical_outbox_then_advances(
     assert store.value["outbox"] is None
 
 
-@pytest.mark.asyncio
-async def test_repeat_polygon_in_next_prediction_is_not_another_event(
-    config, api, store
-):
-    monitor = await seed(config, api, store)
-    api.search_features.return_value = page([feature()])
-    await monitor.collect()
+async def run_second_prediction(monitor, config, api, features):
     monitor.state.jobs.append(
         pending_job(config, "p2", name="second", reference_time="2026-10-08T00:00:00Z")
     )
     await monitor.save()
     api.get_prediction.return_value = prediction("p2", result_id="r2")
-    api.search_features.return_value = page(
-        [feature("different-feature-id", changed="2026-09-12")]
+    api.search_features.return_value = page(features)
+    return await monitor.collect()
+
+
+@pytest.mark.asyncio
+async def test_repeat_detection_is_sent_and_marked_seen_before(config, api, store):
+    monitor = await seed(config, api, store)
+    api.search_features.return_value = page([feature()])
+    first = await monitor.collect()
+    assert first["detections_by_kind"] == {"new_site": 1}
+    result = await run_second_prediction(
+        monitor, config, api, [feature("different-feature-id", changed="2026-09-12")]
     )
+    assert result["events_sent"] == 1
+    assert result["detections_by_kind"] == {"seen_before": 1}
+    event = monitor.sender.post.call_args.args[0][0]
+    assert event["title"] == "OlmoEarth: mining (seen before, 2 predictions)"
+    details = event["event_details"]
+    assert details["detection_kind"] == "seen_before"
+    assert details["site_predictions"] == 2
+    assert details["site_first_seen_at"].startswith("2026-10-23")
+    (site,) = store.value["sites"].values()
+    assert site["predictions"] == 2
+
+
+@pytest.mark.asyncio
+async def test_new_change_type_at_known_site_is_marked(config, api, store):
+    config = PullEventsConfig.parse_obj(
+        {**config.dict(), "post_change_types": ["mining", "new_road"]}
+    )
+    monitor = await seed(config, api, store)
+    api.search_features.return_value = page([feature()])
+    await monitor.collect()
+    await run_second_prediction(monitor, config, api, [feature("road", change_type="new_road")])
+    event = monitor.sender.post.call_args.args[0][0]
+    assert event["title"] == "OlmoEarth: new road (new change at known site)"
+    assert event["event_details"]["site_change_types"] == ["mining", "new_road"]
+
+
+@pytest.mark.asyncio
+async def test_detections_in_one_prediction_never_count_as_repeats(config, api, store):
+    monitor = await seed(config, api, store)
+    api.search_features.return_value = page([feature("part-a"), feature("part-b")])
     result = await monitor.collect()
-    assert result["events_sent"] == 0
-    assert result["repeats_recorded"] == 1
-    assert len(store.value["known_events"]) == 1
-    assert store.value["known_events"][0]["observations"] == 2
-    monitor.sender.post.assert_awaited_once()
+    assert result["detections_by_kind"] == {"new_site": 2}
+    (site,) = store.value["sites"].values()
+    assert site["predictions"] == 1
 
 
 @pytest.mark.asyncio
-async def test_distinct_date_creates_a_new_event(config, api, store):
+async def test_distant_detection_is_a_different_site(config, api, store):
     monitor = await seed(config, api, store)
-    api.search_features.return_value = page([feature()])
-    await monitor.collect()
-    monitor.state.jobs.append(
-        pending_job(config, "p2", name="second", reference_time="2026-10-08T00:00:00Z")
-    )
-    await monitor.save()
-    api.get_prediction.return_value = prediction("p2", result_id="r2")
-    api.search_features.return_value = page([feature("f2", changed="2026-02-01")])
-    assert (await monitor.collect())["events_sent"] == 1
+    elsewhere = {
+        "type": "Polygon",
+        "coordinates": [[[20, 20], [20.01, 20], [20.01, 20.01], [20, 20.01], [20, 20]]],
+    }
+    api.search_features.return_value = page([feature(), feature("far", geometry=elsewhere)])
+    result = await monitor.collect()
+    assert result["detections_by_kind"] == {"new_site": 2}
+    assert result["known_sites"] == 2
+
+
+def test_site_id_is_a_standard_geohash():
+    from app.actions.change_events import geohash
+
+    assert geohash(57.64911, 10.40744, 11) == "u4pruydqqvj"
 
 
 @pytest.mark.asyncio
@@ -531,7 +568,7 @@ async def test_confirmed_delivery_commits_without_reposting(config, api, store):
     )
     await monitor.collect()
     monitor.sender.post.assert_awaited_once()
-    assert len(store.value["known_events"]) == 1
+    assert len(store.value["sites"]) == 1
     assert store.value["jobs"][0]["status"] == "complete"
 
 
@@ -655,22 +692,6 @@ async def test_stopped_job_does_not_block_next_submission(config, api, store, st
 
 
 @pytest.mark.asyncio
-async def test_polygon_split_in_later_run_is_one_repeat(config, api, store):
-    monitor = await seed(config, api, store)
-    api.search_features.return_value = page([feature()])
-    await monitor.collect()
-    monitor.state.jobs.append(
-        pending_job(config, "p2", name="second", reference_time="2026-10-08T00:00:00Z")
-    )
-    await monitor.save()
-    api.get_prediction.return_value = prediction("p2", result_id="r2")
-    api.search_features.return_value = page([feature("part-a"), feature("part-b")])
-    result = await monitor.collect()
-    assert result["events_sent"] == 0
-    assert store.value["known_events"][0]["observations"] == 2
-
-
-@pytest.mark.asyncio
 async def test_project_organization_parses_typed_response():
     def route(request):
         return httpx.Response(
@@ -690,8 +711,8 @@ async def test_undelivered_page_commits_no_event_history(config, api, store):
     monitor.sender.post.side_effect = RuntimeError("lost")
     with pytest.raises(RuntimeError):
         await monitor.collect()
-    assert store.value["known_events"] == []
-    assert len(store.value["outbox"]["new_events"]) == 1
+    assert store.value["sites"] == {}
+    assert len(store.value["outbox"]["site_updates"]) == 1
 
 
 @pytest.mark.asyncio
@@ -699,8 +720,8 @@ async def test_accepted_page_commits_its_events(config, api, store):
     monitor = await seed(config, api, store)
     api.search_features.return_value = page([feature()])
     result = await monitor.collect()
-    assert len(store.value["known_events"]) == 1
-    assert result["known_events"] == 1
+    assert len(store.value["sites"]) == 1
+    assert result["known_sites"] == 1
     assert store.value["outbox"] is None
 
 
@@ -737,7 +758,7 @@ async def test_redis_lock_excludes_a_second_run(redis_state_manager):
 
 
 @pytest.mark.asyncio
-async def test_monitor_repeat_detection_on_redis(config, api, redis_state_manager):
+async def test_monitor_site_tracking_on_redis(config, api, redis_state_manager):
     from app.actions.monitor_state import STATE_ACTION
 
     monitor = await seed(config, api, redis_state_manager)
@@ -749,10 +770,10 @@ async def test_monitor_repeat_detection_on_redis(config, api, redis_state_manage
     await monitor.save()
     api.get_prediction.return_value = prediction("p2", result_id="r2")
     api.search_features.return_value = page([feature("again", changed="2026-09-12")])
-    assert (await monitor.collect())["events_sent"] == 0
+    assert (await monitor.collect())["detections_by_kind"] == {"seen_before": 1}
     ledger = await redis_state_manager.get_state("integration-1", STATE_ACTION)
-    (event,) = ledger["known_events"]
-    assert event["observations"] == 2
+    (site,) = ledger["sites"].values()
+    assert site["predictions"] == 2
     assert ledger["outbox"] is None
 
 

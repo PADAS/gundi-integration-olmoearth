@@ -79,26 +79,36 @@ Every new event gets a deterministic `event_details.external_event_id`. Gundi's 
 `source` identifies the monitor, **not** a per-event idempotency key. See the
 [Gundi API guide](https://support.earthranger.com/en_US/become-a-data-provider/gundi-api).
 
-For consecutive predictions, the prototype suppresses a repeat when exactly one previously
-known polygon has the same class, estimated date within 31 days, and polygon
-intersection-over-union at least 0.7 (`DATE_TOLERANCE_DAYS` and `OVERLAP_THRESHOLD` in
-`change_events.py`), and that was first seen in an earlier
-prediction (a polygon split into several features counts as one observation). It records the
-new observation locally and reports `repeats_recorded` in the collection result; it does not PATCH the delivered EarthRanger event. Multiple matches create an event
-with `ambiguous_match_count` for review. This is a regional, planar-overlap heuristic,
-not a general change-tracking algorithm: inspect splits, merges, geometry drift and dates
-in the pilot. Antimeridian-spanning AOIs are rejected. Geometry is selected by intersection,
-not clipped to the AOI. Nearby separate polygons from the same prediction remain separate.
+Every monitored detection is sent as an event; nothing is suppressed. Each one carries a
+`site_id`, the 7-character geohash (a cell about 150 m across) of a point inside its
+polygon, and is marked by how it relates to earlier predictions:
+
+| `detection_kind` | When | Title |
+| --- | --- | --- |
+| `new_site` | No earlier prediction reported this site | `OlmoEarth: mining (new site)` |
+| `new_change_type` | The site is known, but not with this change type | `OlmoEarth: new road (new change at known site)` |
+| `seen_before` | The site was reported with this change type before | `OlmoEarth: mining (seen before, 3 predictions)` |
+
+EarthRanger has no filtering for these today, so the title carries the marker; the
+details also include `site_first_seen_at`, `site_predictions` and `site_change_types`.
+Detections from the same prediction never count as repeats of each other, and each
+collection run reports `detections_by_kind`. Gundi's v2 event schema has no priority
+field, so repeats cannot be colored lower.
+
+`site_id` is a stand-in until OlmoEarth assigns its own site or change-track IDs. A site
+that drifts or grows across a cell edge gets a second ID and is reported as new, and two
+unrelated changes in one cell share an ID. Nothing PATCHes a delivered EarthRanger event.
+Antimeridian-spanning AOIs are rejected. Geometry is selected by intersection, not clipped
+to the AOI.
 
 ## Recovery and completeness
 
 Each monitor's state is one Redis value, `integration_state.<integration>.lcc_monitor_v1.no-source`,
 written through `IntegrationStateManager.set_state`: the jobs and their per-result offsets,
-the schedule position, the known events (polygon, change type and date, observations), and
-the delivery outbox. Because it is one value, every save is atomic. History is bounded at
-10,000 known events and stops visibly there; it is never evicted, so old detections are never
-silently resent. Configure durable Redis persistence/backups before a real deployment: losing
-it means already-delivered detections are resent.
+the schedule position, one small record per known site (first seen, change types, number of
+predictions), and the delivery outbox. Because it is one value, every save is atomic.
+Configure durable Redis persistence/backups before a real deployment: losing it means every
+site is reported as new again.
 
 There is no prediction-creation or feature-time watermark: late-completing jobs remain
 tracked. A run lock (`IntegrationStateManager.lock`), held a few minutes longer than the
@@ -150,14 +160,14 @@ export and downstream event updates are follow-up work.
 - `app/actions/monitor.py`: submission, collection, pagination and delivery recovery.
 - `app/actions/monitor_state.py`: the persisted ledger (jobs, events, outbox) and monitor identity.
 - `app/actions/delivery.py`: one-shot Gundi delivery and acknowledgement check.
-- `app/actions/change_events.py`: date parsing, repeat matching and event construction.
+- `app/actions/change_events.py`: date parsing, site IDs and event construction.
 
 Shared runner code in `app/services` comes from the upstream action-runner template, so
 changes there are two additions: `IntegrationStateManager.lock()` and
 `gundi.get_gundi_sender()`. Existing state keys and send helpers are unchanged.
 
-Event preparation works on a page-local stage: the committed events it can match, plus the
-events it creates and copies of those it updates. The monitor stores that stage's changes in
+Event preparation works on a page-local stage: the committed site records plus copies of the
+ones the page touches. The monitor stores that stage's changes in
 the outbox and commits them only after delivery. This keeps polygon logic independent of
 network and storage while preserving the delivery/checkpoint boundary.
 
@@ -167,7 +177,7 @@ Run `pytest` for the full suite, or `pytest app/actions/tests/test_olmoearth.py 
 connector contracts. Tests use mocked HTTP and state; no paid predictions or Gundi events
 are created. They cover submission recovery by name, real nested result IDs, filtering,
 date validation, paging/resumption, interrupted delivery, acknowledgement checks, and
-repeat polygons across predictions.
+site marking across predictions.
 
 The real-Redis lock and monitor tests run only when `OLMOEARTH_TEST_REDIS_URL` points at a
 disposable Redis database, which they flush; otherwise they skip. For example,

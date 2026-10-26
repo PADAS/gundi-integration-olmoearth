@@ -48,31 +48,29 @@ class Job(BaseModel):
     error: Optional[str] = None
 
 
-class KnownEvent(BaseModel):
-    external_id: str
-    geometry: dict
-    change_type: str
-    change_date: date
+class SiteRecord(BaseModel):
+    """What has been alerted at one site (a ``site_id`` cell) across predictions."""
+
     first_seen_at: datetime
-    last_seen_at: datetime
     first_prediction_id: str
     last_prediction_id: str
-    observations: int = 1
+    # Each change type seen at the site, with the prediction that first reported it.
+    change_types: dict[str, str] = Field(default_factory=dict)
+    predictions: int = 1
 
 
 class Outbox(BaseModel):
-    """One page's delivery and the event-history changes it commits.
+    """One page's delivery and the site-history changes it commits.
 
-    The history changes are applied only once Gundi has accepted ``events``,
-    in the same ledger write that advances the job's offset.
+    The site changes are applied only once Gundi has accepted ``events``, in the
+    same ledger write that advances the job's offset.
     """
 
     batch_id: str
     delivery_status: DeliveryStatus = DeliveryStatus.PENDING
     job_name: str
     events: list[dict]
-    new_events: list[KnownEvent] = Field(default_factory=list)
-    updated_events: list[KnownEvent] = Field(default_factory=list)
+    site_updates: dict[str, SiteRecord] = Field(default_factory=dict)
     next_offset: int
     complete: bool
 
@@ -81,7 +79,7 @@ class MonitorState(BaseModel):
     identity: dict
     next_slot: int = 0
     jobs: list[Job] = Field(default_factory=list)
-    known_events: list[KnownEvent] = Field(default_factory=list)
+    sites: dict[str, SiteRecord] = Field(default_factory=dict)
     outbox: Optional[Outbox] = None
 
 

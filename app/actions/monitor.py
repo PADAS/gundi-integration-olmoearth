@@ -1,6 +1,7 @@
 """Orchestrate prediction submission, result collection, and recoverable delivery."""
 
 import calendar
+from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
 from uuid import NAMESPACE_URL, uuid5
@@ -12,7 +13,7 @@ from app.services.errors import (
 )
 from app.services.state import IntegrationStateManager
 
-from .change_events import EventStage, InvalidFeatureError, classify, prepare_event
+from .change_events import InvalidFeatureError, SiteStage, classify, prepare_event
 from .client import (
     FeatureSearchRequest,
     KeywordFilter,
@@ -214,10 +215,7 @@ class Monitor:
             await self.sender.post(box.events)
             box.delivery_status = DeliveryStatus.ACCEPTED
             await self.save()
-        updated = {event.external_id: event for event in box.updated_events}
-        self.state.known_events = [
-            updated.get(event.external_id, event) for event in self.state.known_events
-        ] + box.new_events
+        self.state.sites.update(box.site_updates)
         job = next(j for j in self.state.jobs if j.name == box.job_name)
         job.offset = box.next_offset
         job.status = JobStatus.COMPLETE if box.complete else JobStatus.COLLECTING
@@ -294,15 +292,15 @@ class Monitor:
             await self.save()
         return True
 
-    async def _collect_page(self, job: Job, shapes: dict) -> tuple[int, int]:
-        """Read, stage and deliver one page; return (events sent, repeats recorded)."""
+    async def _collect_page(self, job: Job, kinds: Counter) -> int:
+        """Read, stage and deliver one page; return events sent and tally their kinds."""
         if job.offset >= RESULT_WINDOW:
             await self._stop_job(
                 job,
                 JobStatus.NEEDS_EXPORT,
                 "Result reaches the 10,000-feature search window; completeness requires an export or a smaller AOI.",
             )
-            return 0, 0
+            return 0
         query = build_feature_query(self.config, job, job.offset)
         response = await self.api.search_features(job.result_id, query)
         if response.meta.total is not None and response.meta.total > RESULT_WINDOW:
@@ -311,25 +309,22 @@ class Monitor:
                 JobStatus.NEEDS_EXPORT,
                 "Result exceeds the feature search window; use a smaller AOI or export.",
             )
-            return 0, 0
-        stage = EventStage(self.state.known_events)
+            return 0
+        stage = SiteStage(self.state.sites)
         try:
-            events = []
-            for feature in response.records:
-                found = classify(feature, job, self.config)
-                if found and (
-                    event := prepare_event(
-                        feature,
-                        found,
-                        job,
-                        self.config,
-                        stage,
-                        shapes,
-                        integration_id=self.integration_id,
-                        now=self.now,
-                    )
-                ):
-                    events.append(event)
+            events = [
+                prepare_event(
+                    feature,
+                    found,
+                    job,
+                    self.config,
+                    stage,
+                    integration_id=self.integration_id,
+                    now=self.now,
+                )
+                for feature in response.records
+                if (found := classify(feature, job, self.config))
+            ]
         except InvalidFeatureError as exc:
             # Never skip a detection silently: stop the job at this page.
             await self._stop_job(job, JobStatus.FAILED, f"At offset {job.offset}: {exc}")
@@ -339,8 +334,7 @@ class Monitor:
             batch_id=str(uuid5(NAMESPACE_URL, batch)),
             job_name=job.name,
             events=events,
-            new_events=stage.new,
-            updated_events=list(stage.updated.values()),
+            site_updates=stage.updated,
             next_offset=job.offset + len(response.records),
             # A short page proves exhaustion. ES totals can be lower bounds at 10,000.
             complete=len(response.records) < query.limit,
@@ -349,28 +343,27 @@ class Monitor:
             # Persist the payload before sending; a page with nothing to send is
             # committed directly by flush_outbox.
             await self.save()
-        return await self.flush_outbox(), len(stage.updated)
+        sent = await self.flush_outbox()
+        kinds.update(event["event_details"]["detection_kind"] for event in events)
+        return sent
 
     async def collect(self) -> dict:
         await self.load()
         sent = await self.flush_outbox()
-        pages = repeats = 0
+        pages = 0
+        kinds: Counter = Counter()
         # submit() never starts a prediction while another is active, so there is
         # at most one job to collect.
         job = next((j for j in self.state.jobs if j.status in ACTIVE_JOB_STATUSES), None)
         if job and await self._ready_for_paging(job):
-            # Shapely geometries of known events, built at most once per run.
-            shapes = {}
             while pages < PAGES_PER_POLL and job.status == JobStatus.COLLECTING:
-                page_sent, page_repeats = await self._collect_page(job, shapes)
-                sent += page_sent
-                repeats += page_repeats
+                sent += await self._collect_page(job, kinds)
                 pages += 1
         return {
             "events_sent": sent,
-            "repeats_recorded": repeats,
+            "detections_by_kind": dict(kinds),
             "pages_read": pages,
-            "known_events": len(self.state.known_events),
+            "known_sites": len(self.state.sites),
             "jobs": [
                 {
                     "prediction_id": j.prediction_id,
