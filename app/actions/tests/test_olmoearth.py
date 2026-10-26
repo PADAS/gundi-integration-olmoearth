@@ -65,14 +65,10 @@ class MemoryMonitorStore:
 
     def __init__(self):
         self.ledger = None
-        self.legacy = None
         self.events = {}
 
     async def load_ledger(self):
         return copy.deepcopy(self.ledger)
-
-    async def load_legacy(self):
-        return copy.deepcopy(self.legacy)
 
     async def save_ledger(self, ledger):
         self.ledger = copy.deepcopy(ledger)
@@ -148,14 +144,24 @@ def page(features, total=None):
     )
 
 
-def make_monitor(config, api, store, send=None, now=NOW):
+def make_monitor(config, api, store, now=NOW):
     async def accept(events):
         return [
             "gundi-" + event["event_details"]["external_event_id"] for event in events
         ]
 
-    return Monitor(
-        "integration-1", config, api, store, send or AsyncMock(side_effect=accept), now
+    sender = SimpleNamespace(prepare=AsyncMock(), post=AsyncMock(side_effect=accept))
+    return Monitor("integration-1", config, api, store, sender, now)
+
+
+def pending_job(config, prediction_id="p1", name=None, reference_time="2026-10-01T00:00:00Z"):
+    return Job(
+        name=name or prediction_id,
+        reference_time=reference_time,
+        config=config,
+        prediction_id=prediction_id,
+        status="pending",
+        submitted_at=NOW,
     )
 
 
@@ -163,13 +169,7 @@ async def seed(config, api, store, jobs=None):
     monitor = make_monitor(config, api, store)
     await monitor.load()
     monitor.state.jobs = jobs or [
-        Job(
-            name="job",
-            request={"start_time": "2026-10-01T00:00:00Z"},
-            config=config,
-            prediction_id="p1",
-            status="pending",
-        )
+        pending_job(config, "p1", name="job", reference_time="2026-10-01T00:00:00Z")
     ]
     await monitor.save()
     return monitor
@@ -289,7 +289,7 @@ async def test_late_discovery_uses_change_date_and_keeps_both_result_ids(
     monitor = await seed(config, api, store)
     api.search_features.return_value = page([feature()])
     result = await monitor.collect()
-    event = monitor.send.call_args.args[0][0]
+    event = monitor.sender.post.call_args.args[0][0]
     assert event["recorded_at"].startswith("2026-09-10")
     assert event["geometry"] == AREA
     assert event["event_details"]["first_discovered_at"].startswith("2026-10-23")
@@ -302,13 +302,7 @@ async def test_late_discovery_uses_change_date_and_keeps_both_result_ids(
 @pytest.mark.asyncio
 async def test_out_of_order_completion_does_not_skip_older_job(config, api, store):
     jobs = [
-        Job(
-            name=pid,
-            request={"start_time": "2026-10-01T00:00:00Z"},
-            config=config,
-            prediction_id=pid,
-            status="pending",
-        )
+        pending_job(config, pid, name=pid, reference_time="2026-10-01T00:00:00Z")
         for pid in ["older", "newer"]
     ]
     monitor = await seed(config, api, store, jobs)
@@ -344,25 +338,25 @@ async def test_failed_delivery_replays_identical_outbox_then_advances(
 ):
     monitor = await seed(config, api, store)
     api.search_features.return_value = page([feature()])
-    monitor.send.side_effect = RuntimeError("delivery acknowledgement lost")
+    monitor.sender.post.side_effect = RuntimeError("delivery acknowledgement lost")
     with pytest.raises(RuntimeError):
         await monitor.collect()
-    first = copy.deepcopy(monitor.send.call_args.args[0])
+    first = copy.deepcopy(monitor.sender.post.call_args.args[0])
     assert store.value["jobs"][0]["offset"] == 0
     assert store.value["outbox"] is not None
     with pytest.raises(IntegrationConfigurationError, match="unknown"):
         await monitor.collect()
-    monitor.send.assert_awaited_once()
+    monitor.sender.post.assert_awaited_once()
     await monitor.resolve_delivery(
         ResolveDeliveryConfig(
             batch_id=store.value["outbox"]["batch_id"],
             outcome="confirmed_not_delivered",
         )
     )
-    monitor.send.side_effect = None
-    monitor.send.return_value = ["gundi-receipt-1"]
+    monitor.sender.post.side_effect = None
+    monitor.sender.post.return_value = ["gundi-receipt-1"]
     await monitor.collect()
-    assert monitor.send.call_args.args[0] == first
+    assert monitor.sender.post.call_args.args[0] == first
     api.search_features.assert_awaited_once()
     assert store.value["jobs"][0]["status"] == "complete"
     assert store.value["outbox"] is None
@@ -376,13 +370,7 @@ async def test_repeat_polygon_in_next_prediction_is_not_another_event(
     api.search_features.return_value = page([feature()])
     await monitor.collect()
     monitor.state.jobs.append(
-        Job(
-            name="second",
-            request={"start_time": "2026-10-08T00:00:00Z"},
-            config=config,
-            prediction_id="p2",
-            status="pending",
-        )
+        pending_job(config, "p2", name="second", reference_time="2026-10-08T00:00:00Z")
     )
     await monitor.save()
     api.get_prediction.return_value = prediction("p2", result_id="r2")
@@ -393,7 +381,7 @@ async def test_repeat_polygon_in_next_prediction_is_not_another_event(
     assert result["events_sent"] == 0
     assert len(store.value["known_events"]) == 1
     assert store.value["known_events"][0]["observations"] == 2
-    monitor.send.assert_awaited_once()
+    monitor.sender.post.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -402,13 +390,7 @@ async def test_distinct_date_creates_a_new_event(config, api, store):
     api.search_features.return_value = page([feature()])
     await monitor.collect()
     monitor.state.jobs.append(
-        Job(
-            name="second",
-            request={"start_time": "2026-10-08T00:00:00Z"},
-            config=config,
-            prediction_id="p2",
-            status="pending",
-        )
+        pending_job(config, "p2", name="second", reference_time="2026-10-08T00:00:00Z")
     )
     await monitor.save()
     api.get_prediction.return_value = prediction("p2", result_id="r2")
@@ -445,7 +427,7 @@ async def test_invalid_event_does_not_advance_or_drop_a_page(config, api, store)
     assert store.value["jobs"][0]["offset"] == 0
     assert store.value["jobs"][0]["status"] == "failed"
     assert "offset 0" in store.value["jobs"][0]["error"]
-    monitor.send.assert_not_called()
+    monitor.sender.post.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -575,7 +557,7 @@ async def test_confirmed_delivery_commits_receipts_without_reposting(
 ):
     monitor = await seed(config, api, store)
     api.search_features.return_value = page([feature()])
-    monitor.send.side_effect = RuntimeError("lost acknowledgement")
+    monitor.sender.post.side_effect = RuntimeError("lost acknowledgement")
     with pytest.raises(RuntimeError):
         await monitor.collect()
     batch_id = store.value["outbox"]["batch_id"]
@@ -587,7 +569,7 @@ async def test_confirmed_delivery_commits_receipts_without_reposting(
         )
     )
     await monitor.collect()
-    monitor.send.assert_awaited_once()
+    monitor.sender.post.assert_awaited_once()
     assert store.value["known_events"][0]["gundi_object_id"] == "actual-gundi-object"
     assert store.value["jobs"][0]["status"] == "complete"
 
@@ -596,7 +578,7 @@ async def test_confirmed_delivery_commits_receipts_without_reposting(
 async def test_delivery_resolution_rejects_incomplete_receipts(config, api, store):
     monitor = await seed(config, api, store)
     api.search_features.return_value = page([feature()])
-    monitor.send.side_effect = RuntimeError("unknown")
+    monitor.sender.post.side_effect = RuntimeError("unknown")
     with pytest.raises(RuntimeError):
         await monitor.collect()
     with pytest.raises(IntegrationConfigurationError, match="one distinct"):
@@ -633,42 +615,11 @@ async def test_changed_selection_only_applies_to_future_jobs(config, api, store)
 
 
 @pytest.mark.asyncio
-async def test_one_shot_delivery_does_not_retry_unknown_outcome(mocker):
-    from app.services.gundi import send_events_once_to_gundi
-
-    sender = SimpleNamespace(
-        post_events=AsyncMock(side_effect=httpx.ReadTimeout("lost acknowledgement"))
-    )
-    mocker.patch(
-        "app.services.gundi._get_sensors_api_client", AsyncMock(return_value=sender)
-    )
-    with pytest.raises(httpx.ReadTimeout):
-        await send_events_once_to_gundi([{"title": "test"}], "integration-1")
-    sender.post_events.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "response",
-    [[], {"object_id": "1"}, [{"object_id": None}], [{"errors": ["rejected"]}]],
-)
-async def test_incomplete_gundi_acknowledgement_is_not_success(mocker, response):
-    from app.services.gundi import send_events_once_to_gundi
-
-    sender = SimpleNamespace(post_events=AsyncMock(return_value=response))
-    mocker.patch(
-        "app.services.gundi._get_sensors_api_client", AsyncMock(return_value=sender)
-    )
-    with pytest.raises(IntegrationBadResponseError):
-        await send_events_once_to_gundi([{"title": "test"}], "integration-1")
-
-
-@pytest.mark.asyncio
 async def test_event_and_monitor_id_are_separate(config, api, store):
     monitor = await seed(config, api, store)
     api.search_features.return_value = page([feature()])
     await monitor.collect()
-    event = monitor.send.call_args.args[0][0]
+    event = monitor.sender.post.call_args.args[0][0]
     assert event["source"] == "olmoearth-monitor:integration-1"
     assert event["event_details"]["external_event_id"] != event["source"]
 
@@ -722,7 +673,7 @@ async def test_environment_change_cannot_reuse_saved_jobs(config, api, store):
 async def test_invalid_receipts_pause_outbox(config, api, store, receipts):
     monitor = await seed(config, api, store)
     api.search_features.return_value = page([feature("f1"), feature("f2")])
-    monitor.send = AsyncMock(return_value=receipts)
+    monitor.sender.post = AsyncMock(return_value=receipts)
     with pytest.raises(IntegrationBadResponseError):
         await monitor.collect()
     assert store.value["outbox"]["delivery_status"] == "sending"
@@ -756,13 +707,7 @@ async def test_submission_http_rejection_vs_ambiguous_failure(
 
 def two_jobs(config):
     return [
-        Job(
-            name=pid,
-            request={"start_time": "2026-10-01T00:00:00Z"},
-            config=config,
-            prediction_id=pid,
-            status="pending",
-        )
+        pending_job(config, pid, name=pid, reference_time="2026-10-01T00:00:00Z")
         for pid in ["bad", "good"]
     ]
 
@@ -838,45 +783,12 @@ async def test_duplicate_submissions_are_never_released(config, api, store):
 
 
 @pytest.mark.asyncio
-async def test_sender_setup_failure_leaves_outbox_resendable(config, api, store):
-    from app.services.gundi import EventsNotSentError
-
-    monitor = await seed(config, api, store)
-    api.search_features.return_value = page([feature()])
-    monitor.send.side_effect = EventsNotSentError("portal down")
-    with pytest.raises(EventsNotSentError):
-        await monitor.collect()
-    assert store.value["outbox"]["delivery_status"] == "pending"
-    monitor.send.side_effect = None
-    monitor.send.return_value = ["gundi-receipt-1"]
-    assert (await monitor.collect())["events_sent"] == 1
-
-
-@pytest.mark.asyncio
-async def test_gundi_key_failure_is_reported_as_not_sent(mocker):
-    from app.services.gundi import EventsNotSentError, send_events_once_to_gundi
-
-    mocker.patch(
-        "app.services.gundi._get_sensors_api_client",
-        AsyncMock(side_effect=AssertionError("no key")),
-    )
-    with pytest.raises(EventsNotSentError):
-        await send_events_once_to_gundi([{"title": "test"}], "integration-1")
-
-
-@pytest.mark.asyncio
 async def test_polygon_split_in_later_run_is_one_repeat(config, api, store):
     monitor = await seed(config, api, store)
     api.search_features.return_value = page([feature()])
     await monitor.collect()
     monitor.state.jobs.append(
-        Job(
-            name="second",
-            request={"start_time": "2026-10-08T00:00:00Z"},
-            config=config,
-            prediction_id="p2",
-            status="pending",
-        )
+        pending_job(config, "p2", name="second", reference_time="2026-10-08T00:00:00Z")
     )
     await monitor.save()
     api.get_prediction.return_value = prediction("p2", result_id="r2")
@@ -884,23 +796,6 @@ async def test_polygon_split_in_later_run_is_one_repeat(config, api, store):
     result = await monitor.collect()
     assert result["events_sent"] == 0
     assert store.value["known_events"][0]["observations"] == 2
-
-
-def test_known_events_saved_before_first_prediction_id_still_load():
-    from app.actions.monitor_state import KnownEvent
-
-    event = KnownEvent.parse_obj(
-        {
-            "external_id": "e",
-            "geometry": AREA,
-            "change_type": "mining",
-            "change_date": "2026-09-10",
-            "first_seen_at": NOW,
-            "last_seen_at": NOW,
-            "last_prediction_id": "p1",
-        }
-    )
-    assert event.first_prediction_id == "p1"
 
 
 @pytest.mark.asyncio
@@ -924,6 +819,7 @@ def known(external_id, change_date="2026-09-10", change_type="mining", **fields)
         change_date=change_date,
         first_seen_at=NOW,
         last_seen_at=NOW,
+        first_prediction_id="p0",
         last_prediction_id="p0",
         **fields,
     )
@@ -947,7 +843,7 @@ async def test_page_reads_only_candidates_within_date_tolerance(config, api, sto
 async def test_undelivered_page_commits_no_event_history(config, api, store):
     monitor = await seed(config, api, store)
     api.search_features.return_value = page([feature()])
-    monitor.send.side_effect = RuntimeError("lost")
+    monitor.sender.post.side_effect = RuntimeError("lost")
     with pytest.raises(RuntimeError):
         await monitor.collect()
     assert store.events == {}
@@ -964,62 +860,23 @@ async def test_accepted_page_commits_events_with_receipts(config, api, store):
     assert store.ledger["outbox"] is None
 
 
-@pytest.mark.asyncio
-async def test_single_blob_state_migrates_with_its_outbox(config, api, store):
-    seeded = await seed(config, api, store)
-    committed = known("committed")
-    repeat = committed.copy(update={"observations": 2, "last_prediction_id": "p1"})
-    staged_new = known("staged", "2026-09-20")
-    legacy = dict(store.ledger)
-    legacy["jobs"][0].pop("reference_time")
-    legacy["jobs"][0]["request"] = {"start_time": "2026-10-01T00:00:00Z"}
-    legacy["known_events"] = [json.loads(committed.json())]
-    legacy["outbox"] = {
-        "batch_id": "batch",
-        "delivery_status": "pending",
-        "job_name": "job",
-        "events": [{"event_details": {"external_event_id": "staged"}}],
-        "known_events": [json.loads(e.json()) for e in (repeat, staged_new)],
-        "next_offset": 1,
-        "complete": True,
-    }
-    store.ledger, store.legacy = None, legacy
-    monitor = make_monitor(config, api, store)
-    await monitor.load()
-    box = monitor.state.outbox
-    assert [e.external_id for e in box.new_events] == ["staged"]
-    assert [e.observations for e in box.updated_events] == [2]
-    assert monitor.state.jobs[0].reference_time == "2026-10-01T00:00:00Z"
-    assert set(store.events) == {"committed"}
-    monitor.send.side_effect = None
-    monitor.send.return_value = ["gundi-staged"]
-    await monitor.collect()
-    assert store.events["committed"]["observations"] == 2
-    assert store.events["staged"]["gundi_object_id"] == "gundi-staged"
-    assert seeded.state.identity == store.ledger["identity"]
-
-
-@pytest.mark.asyncio
-async def test_lock_yields_false_on_ephemeral_path():
-    from app.services.activity_logger import ephemeral_run
-
-    token = ephemeral_run.set(True)
-    try:
-        async with handlers.state_manager.lock("i", "a", ttl_seconds=5) as acquired:
-            assert acquired is False
-    finally:
-        ephemeral_run.reset(token)
-
-
 @pytest_asyncio.fixture
 async def redis_state_manager():
+    """A state manager on a Redis the developer opted in with OLMOEARTH_TEST_REDIS_URL.
+
+    Never the app's own REDIS_HOST: these tests flush the database they use.
+    """
+    import os
+
+    import redis.asyncio as redis
+
     from app.services.state import IntegrationStateManager
 
-    manager = IntegrationStateManager(db=15)
-    try:
-        await manager.db_client.ping()
-    except Exception:
-        pytest.skip("No Redis server reachable for the store contract test")
+    url = os.environ.get("OLMOEARTH_TEST_REDIS_URL")
+    if not url:
+        pytest.skip("Set OLMOEARTH_TEST_REDIS_URL to a disposable Redis to run this test")
+    manager = IntegrationStateManager()
+    manager.db_client = redis.Redis.from_url(url)
     await manager.db_client.flushdb()
     yield manager
     await manager.db_client.flushdb()
@@ -1081,13 +938,7 @@ async def test_monitor_repeat_detection_on_redis(config, api, redis_state_manage
     api.search_features.return_value = page([feature()])
     assert (await monitor.collect())["events_sent"] == 1
     monitor.state.jobs.append(
-        Job(
-            name="second",
-            reference_time="2026-10-08T00:00:00Z",
-            config=config,
-            prediction_id="p2",
-            status="pending",
-        )
+        pending_job(config, "p2", name="second", reference_time="2026-10-08T00:00:00Z")
     )
     await monitor.save()
     api.get_prediction.return_value = prediction("p2", result_id="r2")
@@ -1096,3 +947,61 @@ async def test_monitor_repeat_detection_on_redis(config, api, redis_state_manage
     (event,) = await store.candidates("mining", dt.date(2026, 9, 1), dt.date(2026, 9, 30))
     assert event.observations == 2 and event.gundi_object_id
     assert (await store.load_ledger())["outbox"] is None
+
+
+@pytest.mark.asyncio
+async def test_sender_setup_failure_leaves_outbox_pending(config, api, store):
+    monitor = await seed(config, api, store)
+    api.search_features.return_value = page([feature()])
+    monitor.sender.prepare.side_effect = IntegrationConnectionError("portal down")
+    with pytest.raises(IntegrationConnectionError):
+        await monitor.collect()
+    assert store.value["outbox"]["delivery_status"] == "pending"
+    monitor.sender.post.assert_not_called()
+    monitor.sender.prepare.side_effect = None
+    assert (await monitor.collect())["events_sent"] == 1
+
+
+@pytest.mark.asyncio
+async def test_event_sender_posts_once_and_reuses_its_client(mocker):
+    from app.actions.delivery import GundiEventSender
+
+    client_ = SimpleNamespace(
+        post_events=AsyncMock(side_effect=httpx.ReadTimeout("lost acknowledgement"))
+    )
+    lookup = mocker.patch(
+        "app.actions.delivery.get_gundi_sender", AsyncMock(return_value=client_)
+    )
+    sender = GundiEventSender("integration-1")
+    await sender.prepare()
+    await sender.prepare()
+    with pytest.raises(httpx.ReadTimeout):
+        await sender.post([{"title": "test"}])
+    lookup.assert_awaited_once()
+    client_.post_events.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response", [{"object_id": "1"}, ["id"], [{"errors": ["rejected"]}]]
+)
+async def test_event_sender_rejects_unclean_acknowledgement(mocker, response):
+    from app.actions.delivery import GundiEventSender
+
+    client_ = SimpleNamespace(post_events=AsyncMock(return_value=response))
+    mocker.patch("app.actions.delivery.get_gundi_sender", AsyncMock(return_value=client_))
+    sender = GundiEventSender("integration-1")
+    await sender.prepare()
+    with pytest.raises(IntegrationBadResponseError):
+        await sender.post([{"title": "test"}])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("receipts", [[], [None], ["id1", "id2"]])
+async def test_wrong_receipt_count_or_value_pauses_outbox(config, api, store, receipts):
+    monitor = await seed(config, api, store)
+    api.search_features.return_value = page([feature()])
+    monitor.sender.post = AsyncMock(return_value=receipts)
+    with pytest.raises(IntegrationBadResponseError):
+        await monitor.collect()
+    assert store.value["outbox"]["delivery_status"] == "sending"

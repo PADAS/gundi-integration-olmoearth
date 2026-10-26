@@ -103,14 +103,13 @@ Redis holds the monitor under `integration_state.<integration>.lcc_monitor_v1.*`
 
 A page's outbox carries only its new and updated events. Once Gundi accepts the batch, those
 events, their index entries and the advanced job offset are written in one Redis transaction.
-State saved by the earlier single-value layout (`...lcc_monitor_v1.no-source`) is migrated on
-first load and left in place as a backup. Configure durable Redis persistence/backups before
-a real deployment: losing the event history means already-delivered detections are resent.
+Configure durable Redis persistence/backups before a real deployment: losing the event
+history means already-delivered detections are resent.
 There is no prediction-creation or feature-time watermark: late-completing jobs remain
 tracked. An action lock and shorter execution timeout prevent the two schedules from
 writing this state concurrently.
 
-Before submission the connector saves its exact request and unique name. Explicit
+Before submission the connector saves the job's unique name, reference time and configuration. Explicit
 400/401/403/404/422/429 rejections, and connections that fail before the request is sent,
 preserve the schedule slot for the next attempt; timeouts, server errors and malformed
 success responses remain ambiguous. It never retries an ambiguous creation POST. The next
@@ -155,6 +154,7 @@ downstream event updates are follow-up work.
 - `app/actions/monitor.py`: submission, collection, pagination and delivery recovery.
 - `app/actions/monitor_state.py`: persisted jobs, events, outbox and monitor identity.
 - `app/actions/monitor_store.py`: the Redis ledger, event hash and date indexes.
+- `app/actions/delivery.py`: one-shot Gundi delivery and receipt validation.
 - `app/actions/change_events.py`: date parsing, repeat matching and event construction.
 
 Event preparation works on a page-local stage: copies of the candidate events the page can
@@ -170,9 +170,10 @@ are created. They cover submission/reconciliation, real nested result IDs, out-o
 completion, filtering, date validation, paging/resumption, interrupted delivery, receipt
 validation, and repeat polygons across predictions.
 
-The Redis store and lock tests run only when a Redis server is reachable at
-`REDIS_HOST`/`REDIS_PORT`; they use database 15 and flush it. Otherwise they skip. For
-example, `docker run -d --rm -p 6390:6379 redis:7-alpine` then `REDIS_PORT=6390 pytest`.
+The Redis store and lock tests run only when `OLMOEARTH_TEST_REDIS_URL` points at a
+disposable Redis database, which they flush; otherwise they skip. For example,
+`docker run -d --rm -p 6390:6379 redis:7-alpine`, then
+`OLMOEARTH_TEST_REDIS_URL=redis://127.0.0.1:6390/15 pytest`.
 
 For the live pilot, use one small AOI and mining, submit two successive reference dates,
 check the actual date-property encoding, then inspect events and repeated polygons in

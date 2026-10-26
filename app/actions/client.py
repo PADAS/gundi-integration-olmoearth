@@ -14,6 +14,7 @@ from app.services.errors import (
     IntegrationBadResponseError,
     IntegrationConfigurationError,
     IntegrationConnectionError,
+    IntegrationError,
     IntegrationRateLimitError,
     source_status_code,
 )
@@ -435,6 +436,21 @@ class OlmoEarthClient:
         """
         response = await self.search_predictions(PredictionSearchRequest(limit=1))
         return response.meta.total
+
+
+# Statuses with which the API rejects a create before creating anything.
+_REJECTED_BEFORE_CREATE = frozenset({400, 401, 403, 404, 422, 429})
+
+
+def definitely_not_created(exc: BaseException) -> bool:
+    """Whether a failed create certainly left nothing behind, so it may be retried.
+
+    Timeouts, 5xx and malformed success replies are ambiguous and return False.
+    """
+    return isinstance(exc, RequestNotSentError) or (
+        isinstance(exc, IntegrationError)
+        and exc.status_code in _REJECTED_BEFORE_CREATE
+    )
 
 
 def _is_transient(exc: BaseException) -> bool:

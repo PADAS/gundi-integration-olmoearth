@@ -5,7 +5,7 @@ from datetime import date, datetime
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field, root_validator
+from pydantic import BaseModel, Field
 
 from .configurations import PullEventsConfig
 
@@ -38,17 +38,9 @@ class Job(BaseModel):
     prediction_id: Optional[str] = None
     result_id: Optional[str] = None
     status: JobStatus = JobStatus.SUBMITTING
-    submitted_at: Optional[datetime] = None
+    submitted_at: datetime
     offset: int = 0
     error: Optional[str] = None
-
-    @root_validator(pre=True)
-    def reference_time_from_request(cls, values):
-        # Jobs saved before reference_time existed kept the whole request body.
-        request = values.pop("request", None)
-        if request and "reference_time" not in values:
-            values["reference_time"] = request["start_time"]
-        return values
 
 
 class KnownEvent(BaseModel):
@@ -62,12 +54,6 @@ class KnownEvent(BaseModel):
     last_prediction_id: str
     observations: int = 1
     gundi_object_id: Optional[str] = None
-
-    @root_validator(pre=True)
-    def default_first_prediction(cls, values):
-        # Records saved before first_prediction_id existed.
-        values.setdefault("first_prediction_id", values.get("last_prediction_id"))
-        return values
 
 
 class Outbox(BaseModel):

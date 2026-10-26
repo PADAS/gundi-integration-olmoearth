@@ -4,6 +4,11 @@ The ledger (jobs, schedule position, outbox) is one small JSON value. Event
 history lives beside it, one hash field per event plus a per-change-type index
 ordered by change date, so matching a page reads only the events whose date is
 within tolerance and committing a page writes only the events it changed.
+
+The ledger goes through ``IntegrationStateManager.get_state``/``set_state``;
+the history and the atomic commit need Redis hashes, sorted sets and
+transactions, which the manager does not wrap. Callers must not reach this
+store on the ephemeral path (``run_monitor`` refuses it before taking the lock).
 """
 
 import json
@@ -22,9 +27,6 @@ class MonitorStore(Protocol):
     async def load_ledger(self) -> Optional[dict]:
         """The saved ledger, or None for a monitor that has never saved one."""
 
-    async def load_legacy(self) -> Optional[dict]:
-        """State saved by the single-blob layout, if any, for one-time migration."""
-
     async def save_ledger(self, ledger: dict) -> None: ...
 
     async def known_ids(self, external_ids: Iterable[str]) -> set[str]:
@@ -41,31 +43,24 @@ class MonitorStore(Protocol):
 
 class RedisMonitorStore:
     def __init__(self, state_manager: IntegrationStateManager, integration_id: str):
+        self._state = state_manager
         self._redis = state_manager.db_client
-        self._key = lambda source: state_manager.key(integration_id, STATE_ACTION, source)
-        self._ledger = self._key("ledger")
-        self._events = self._key("events")
-        self._legacy = state_manager.key(integration_id, STATE_ACTION)
+        self._integration_id = integration_id
+        self._events = state_manager.key(integration_id, STATE_ACTION, "events")
 
     def _index(self, change_type: str) -> str:
-        return self._key(f"by_date.{change_type}")
-
-    async def _get_json(self, key: str) -> Optional[dict]:
-        async for attempt in stamina.retry_context(**REDIS_RETRY):
-            with attempt:
-                raw = await self._redis.get(key)
-        return json.loads(raw) if raw else None
+        return self._state.key(self._integration_id, STATE_ACTION, f"by_date.{change_type}")
 
     async def load_ledger(self) -> Optional[dict]:
-        return await self._get_json(self._ledger)
-
-    async def load_legacy(self) -> Optional[dict]:
-        return await self._get_json(self._legacy)
+        ledger = await self._state.get_state(
+            self._integration_id, STATE_ACTION, source_id="ledger"
+        )
+        return ledger or None
 
     async def save_ledger(self, ledger: dict) -> None:
-        async for attempt in stamina.retry_context(**REDIS_RETRY):
-            with attempt:
-                await self._redis.set(self._ledger, json.dumps(ledger))
+        await self._state.set_state(
+            self._integration_id, STATE_ACTION, ledger, source_id="ledger"
+        )
 
     async def known_ids(self, external_ids: Iterable[str]) -> set[str]:
         ids = list(external_ids)
@@ -106,5 +101,8 @@ class RedisMonitorStore:
                             self._index(event.change_type),
                             {event.external_id: event.change_date.toordinal()},
                         )
-                    pipe.set(self._ledger, json.dumps(ledger))
+                    pipe.set(
+                        self._state.key(self._integration_id, STATE_ACTION, "ledger"),
+                        json.dumps(ledger, default=str),
+                    )
                     await pipe.execute()

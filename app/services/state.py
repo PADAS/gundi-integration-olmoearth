@@ -46,35 +46,31 @@ class IntegrationStateManager:
     ) -> AsyncIterator[bool]:
         """Hold a non-blocking, owner-checked lock for one integration's action.
 
-        Yields True if this caller holds the lock, False if another run does
-        (or on the ephemeral path, where nothing may be written). The lock
-        expires after ttl_seconds, so keep the guarded work shorter than that;
-        releasing a lock that already expired only logs a warning.
+        Yields True if this caller holds the lock, False if another run does.
+        The lock expires after ttl_seconds, so keep the guarded work shorter than
+        that; releasing a lock that already expired only logs a warning.
+
+        A Redis error while acquiring raises rather than being retried: after a
+        lost reply the retry would find this caller's own key and wrongly report
+        the lock as held by another run.
         """
-        if _skip_on_ephemeral_run("lock", integration_id, action_id):
-            yield False
-            return
         lock = self.db_client.lock(
             self.key(integration_id, action_id, "lock"),
             timeout=ttl_seconds,
             blocking=False,
         )
-        async for attempt in stamina.retry_context(**REDIS_RETRY):
-            with attempt:
-                acquired = await lock.acquire()
-        if not acquired:
-            yield False
-            return
+        acquired = await lock.acquire()
         try:
-            yield True
+            yield acquired
         finally:
-            try:
-                await lock.release()
-            except LockError:
-                logger.warning(
-                    f"Lock for action '{action_id}' on integration '{integration_id}' "
-                    "expired before release; the guarded work outlived its TTL."
-                )
+            if acquired:
+                try:
+                    await lock.release()
+                except LockError:
+                    logger.warning(
+                        f"Lock for action '{action_id}' on integration '{integration_id}' "
+                        "expired before release; the guarded work outlived its TTL."
+                    )
 
     async def get_state(self, integration_id: str, action_id: str, source_id: str = "no-source") -> dict:
         async for attempt in stamina.retry_context(**REDIS_RETRY):

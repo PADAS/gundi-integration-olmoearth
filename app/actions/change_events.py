@@ -40,6 +40,21 @@ def event_id(integration_id: str, job: Job, feature: Feature) -> str:
     return str(uuid5(NAMESPACE_URL, f"{integration_id}:{job.result_id}:{feature.id}"))
 
 
+def classify(feature: Feature, job: Job) -> Optional[tuple[str, date]]:
+    """(change type, change date) for a detection the job monitors, else None.
+
+    Raises InvalidFeatureError if a monitored detection has no usable date.
+    """
+    props = feature.properties.model_properties()
+    change_type = props.get("post_change")
+    if change_type not in job.config.selected_types:
+        return None
+    changed = parse_change_date(props.get(job.config.change_date_property))
+    if job.config.changes_since and changed < job.config.changes_since:
+        return None
+    return change_type, changed
+
+
 def candidate_windows(features: list[Feature], job: Job) -> dict[str, tuple[date, date]]:
     """Per change type, the change-date range any repeat of these features can fall in.
 
@@ -47,15 +62,13 @@ def candidate_windows(features: list[Feature], job: Job) -> dict[str, tuple[date
     """
     dates: dict[str, list[date]] = {}
     for feature in features:
-        props = feature.properties.model_properties()
-        change_type = props.get("post_change")
-        if change_type not in job.config.selected_types:
-            continue
         try:
-            changed = parse_change_date(props.get(job.config.change_date_property))
+            found = classify(feature, job)
         except InvalidFeatureError:
             continue
-        dates.setdefault(change_type, []).append(changed)
+        if found:
+            change_type, changed = found
+            dates.setdefault(change_type, []).append(changed)
     tolerance = timedelta(days=job.config.date_tolerance_days)
     return {
         change_type: (min(found) - tolerance, max(found) + tolerance)
@@ -95,13 +108,10 @@ def prepare_event(
         raise InvalidFeatureError(
             f"Detection {feature.id} has no stable feature ID or polygon geometry."
         )
-    props = feature.properties.model_properties()
-    change_type = props.get("post_change")
-    if change_type not in job.config.selected_types:
+    found = classify(feature, job)
+    if found is None:
         return None
-    changed = parse_change_date(props.get(job.config.change_date_property))
-    if job.config.changes_since and changed < job.config.changes_since:
-        return None
+    change_type, changed = found
     geometry = feature.geometry.dict(exclude_none=True)
     try:
         geom = polygon_shape(geometry)
@@ -127,8 +137,10 @@ def prepare_event(
             old_geom = shapes[previous.external_id] = shape(previous.geometry)
         if not geom.intersects(old_geom):
             continue
-        union = geom.union(old_geom).area
-        iou = geom.intersection(old_geom).area / union if union else 0
+        # Both are valid polygons, so the union's area follows from the overlap.
+        overlap = geom.intersection(old_geom).area
+        union = geom.area + old_geom.area - overlap
+        iou = overlap / union if union else 0
         if iou >= job.config.overlap_threshold:
             matches.append(previous)
     if len(matches) == 1:
@@ -155,6 +167,7 @@ def prepare_event(
     )
     shapes[external_id] = geom
     point = geom.representative_point()
+    props = feature.properties.model_properties()
     props.update(
         {
             "prediction_id": job.prediction_id,

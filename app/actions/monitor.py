@@ -1,9 +1,8 @@
 """Orchestrate prediction submission, result collection, and recoverable delivery."""
 
+import asyncio
 import calendar
-import json
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Awaitable, Callable, Optional
 from uuid import NAMESPACE_URL, uuid5
 
 from app.services.errors import (
@@ -11,7 +10,6 @@ from app.services.errors import (
     IntegrationConfigurationError,
     IntegrationError,
 )
-from app.services.gundi import EventsNotSentError, valid_event_receipts
 
 from .change_events import (
     EventStage,
@@ -26,16 +24,16 @@ from .client import (
     OlmoEarthClient,
     PredictionSearchRequest,
     PropertyFilter,
-    RequestNotSentError,
     StringFilter,
+    definitely_not_created,
 )
 from .configurations import Cadence, PullEventsConfig
+from .delivery import GundiEventSender, valid_event_receipts
 from .monitor_state import (
     ACTIVE_JOB_STATUSES,
     DeliveryStatus,
     Job,
     JobStatus,
-    KnownEvent,
     MonitorState,
     Outbox,
     monitor_identity,
@@ -44,8 +42,6 @@ from .monitor_store import MonitorStore
 
 MAX_JOBS = 1000
 RESULT_WINDOW = 10000
-# Statuses that mean Studio rejected the POST before creating anything.
-REJECTED_SUBMISSION_STATUSES = {400, 401, 403, 404, 422, 429}
 # How long a submission with an unknown outcome must stay unfindable by name
 # before it is treated as never created and its schedule slot is reopened.
 UNFOUND_SUBMISSION_GRACE = timedelta(hours=1)
@@ -84,21 +80,19 @@ class Monitor:
         config: PullEventsConfig,
         api: OlmoEarthClient,
         store: MonitorStore,
-        send: Callable[[list[dict]], Awaitable[list[str]]],
+        sender: GundiEventSender,
         now: datetime,
     ):
         self.integration_id = integration_id
         self.config = config
         self.api = api
         self.store = store
-        self.send = send
+        self.sender = sender
         self.now = now.astimezone(timezone.utc)
         self.state: MonitorState
 
     async def load(self):
         raw = await self.store.load_ledger()
-        if raw is None:
-            raw = await self._migrate_legacy()
         identity = monitor_identity(self.config, self.api.base_url)
         self.state = (
             MonitorState.parse_obj(raw) if raw else MonitorState(identity=identity)
@@ -108,38 +102,8 @@ class Monitor:
                 "Environment, model, area, project, date semantics or schedule changed. Create a new monitor integration to preserve existing jobs and event identity."
             )
 
-    def _ledger(self) -> dict:
-        return json.loads(self.state.json())
-
     async def save(self):
-        await self.store.save_ledger(self._ledger())
-
-    async def _migrate_legacy(self) -> Optional[dict]:
-        """Move single-blob state into the ledger + per-event layout, once.
-
-        The old blob is left in place as a backup; it is never read again once
-        the ledger exists.
-        """
-        legacy = await self.store.load_legacy()
-        if not legacy:
-            return None
-        events = [KnownEvent.parse_obj(e) for e in legacy.pop("known_events", [])]
-        box = legacy.get("outbox")
-        if box and "known_events" in box:
-            # The old outbox carried the whole staged history; keep only its changes.
-            committed = {event.external_id: event for event in events}
-            staged = [KnownEvent.parse_obj(e) for e in box.pop("known_events")]
-            box["new_events"] = [
-                json.loads(e.json()) for e in staged if e.external_id not in committed
-            ]
-            box["updated_events"] = [
-                json.loads(e.json())
-                for e in staged
-                if e.external_id in committed and e != committed[e.external_id]
-            ]
-        ledger = json.loads(MonitorState.parse_obj(legacy).json())
-        await self.store.commit(ledger, events)
-        return ledger
+        await self.store.save_ledger(self.state.dict())
 
     async def _release_slot(self, job: Job):
         """Forget a submission Studio never created, so its slot is submitted again."""
@@ -203,12 +167,7 @@ class Monitor:
         try:
             prediction = await self.api.create_prediction(body)
         except IntegrationError as exc:
-            # Explicit rejections and failed connections never created anything and
-            # are safe to retry. Timeouts, 5xx and malformed replies stay ambiguous.
-            if (
-                isinstance(exc, RequestNotSentError)
-                or exc.status_code in REJECTED_SUBMISSION_STATUSES
-            ):
+            if definitely_not_created(exc):
                 await self._release_slot(job)
             raise
         job.prediction_id = prediction.id
@@ -236,10 +195,7 @@ class Monitor:
             job.status = JobStatus.PENDING
             await self.save()
             return {"recovered_prediction_id": job.prediction_id}
-        if found == 0 and (
-            job.submitted_at is None
-            or self.now - job.submitted_at >= UNFOUND_SUBMISSION_GRACE
-        ):
+        if found == 0 and self.now - job.submitted_at >= UNFOUND_SUBMISSION_GRACE:
             await self._release_slot(job)
             return {"status": "unsent_submission_released", "name": job.name}
         raise IntegrationConfigurationError(
@@ -257,17 +213,15 @@ class Monitor:
                 f"Delivery outcome is unknown for batch {box.batch_id}. Use Resolve LCC Delivery after checking Gundi; it will not be resent automatically."
             )
         if box.events and box.delivery_status == DeliveryStatus.PENDING:
+            # Resolve the Gundi client first: a failure here provably sent nothing,
+            # so the batch stays pending and goes out on the next run.
+            await self.sender.prepare()
             box.delivery_status = DeliveryStatus.SENDING
             await self.save()
-            try:
-                box.receipts = await self.send(box.events)
-            except EventsNotSentError:
-                box.delivery_status = DeliveryStatus.PENDING
-                await self.save()
-                raise
+            box.receipts = await self.sender.post(box.events)
             if not valid_event_receipts(box.receipts, len(box.events)):
                 raise IntegrationBadResponseError(
-                    "Gundi did not acknowledge every event in the outbox."
+                    "Gundi returned missing, invalid or duplicate object IDs; reconcile the outbox before retrying."
                 )
             box.delivery_status = DeliveryStatus.ACCEPTED
             await self.save()
@@ -278,7 +232,7 @@ class Monitor:
         job.offset = box.next_offset
         job.status = JobStatus.COMPLETE if box.complete else JobStatus.COLLECTING
         self.state.outbox = None
-        await self.store.commit(self._ledger(), box.new_events + box.updated_events)
+        await self.store.commit(self.state.dict(), box.new_events + box.updated_events)
         return len(box.events)
 
     async def resolve_delivery(self, resolution) -> dict:
@@ -311,18 +265,120 @@ class Monitor:
 
     async def _stage(self, job: Job, features: list) -> EventStage:
         """Fetch only the committed history this page's features can touch."""
-        candidates = []
-        for change_type, (start, end) in candidate_windows(features, job).items():
-            candidates += await self.store.candidates(change_type, start, end)
-        known_ids = await self.store.known_ids(
-            event_id(self.integration_id, job, f) for f in features if f.id is not None
+        windows = candidate_windows(features, job)
+        *found, known_ids = await asyncio.gather(
+            *(
+                self.store.candidates(change_type, start, end)
+                for change_type, (start, end) in windows.items()
+            ),
+            self.store.known_ids(
+                event_id(self.integration_id, job, f) for f in features if f.id is not None
+            ),
         )
-        return EventStage(candidates, known_ids)
+        return EventStage([event for events in found for event in events], known_ids)
 
     async def _stop_job(self, job: Job, status: JobStatus, error: str):
         job.status = status
         job.error = error
         await self.save()
+
+    async def _fail_job(
+        self, job: Job, error: IntegrationError, errors: list[IntegrationError]
+    ):
+        await self._stop_job(job, JobStatus.FAILED, str(error))
+        errors.append(error)
+
+    async def _ready_for_paging(self, job: Job, errors: list[IntegrationError]) -> bool:
+        """Advance an active job from its prediction; True once it has a result to page."""
+        prediction = await self.api.get_prediction(job.prediction_id)
+        if prediction.status in {"failed", "cancelled"}:
+            await self._stop_job(
+                job, JobStatus.FAILED, prediction.error_message or prediction.status
+            )
+            return False
+        if prediction.status != "completed":
+            return False
+        if prediction.result is None or "mvt" not in prediction.result.file_formats:
+            await self._fail_job(
+                job,
+                IntegrationConfigurationError(
+                    "Completed prediction has no vector result. Use an LCC model configured with vectorization."
+                ),
+                errors,
+            )
+            return False
+        if job.result_id is not None and job.result_id != prediction.result.id:
+            await self._fail_job(
+                job,
+                IntegrationBadResponseError(
+                    "Prediction result changed while paging; earlier pages came from a different result."
+                ),
+                errors,
+            )
+            return False
+        if job.result_id is None or job.status != JobStatus.COLLECTING:
+            job.result_id = prediction.result.id
+            job.status = JobStatus.COLLECTING
+            await self.save()
+        return True
+
+    async def _collect_page(
+        self, job: Job, shapes: dict, errors: list[IntegrationError]
+    ) -> int:
+        """Read, stage and deliver one page of a collecting job; return events sent."""
+        if job.offset >= RESULT_WINDOW:
+            await self._stop_job(
+                job,
+                JobStatus.NEEDS_EXPORT,
+                "Result reaches the 10,000-feature search window; completeness requires an export or a smaller AOI.",
+            )
+            return 0
+        query = build_feature_query(job.config, job.offset)
+        response = await self.api.search_features(job.result_id, query)
+        if response.meta.total is not None and response.meta.total > RESULT_WINDOW:
+            await self._stop_job(
+                job,
+                JobStatus.NEEDS_EXPORT,
+                "Result exceeds the feature search window; use a smaller AOI or export.",
+            )
+            return 0
+        stage = await self._stage(job, response.records)
+        try:
+            events = [
+                event
+                for feature in response.records
+                if (
+                    event := prepare_event(
+                        feature,
+                        job,
+                        stage,
+                        shapes,
+                        integration_id=self.integration_id,
+                        now=self.now,
+                    )
+                )
+            ]
+        except InvalidFeatureError as exc:
+            # Never skip a detection silently: stop this job at this page.
+            await self._stop_job(job, JobStatus.FAILED, f"At offset {job.offset}: {exc}")
+            errors.append(exc)
+            return 0
+        batch = f"{self.integration_id}:{job.name}:{job.offset}"
+        self.state.outbox = Outbox(
+            batch_id=str(uuid5(NAMESPACE_URL, batch)),
+            job_name=job.name,
+            events=events,
+            new_events=stage.new,
+            updated_events=list(stage.updated.values()),
+            next_offset=job.offset + len(response.records),
+            # A short page proves exhaustion. ES totals can be lower bounds at 10,000.
+            complete=len(response.records) < query.limit,
+        )
+        if events:
+            # Persist the payload before sending; a page with nothing to send is
+            # committed directly by flush_outbox.
+            await self.save()
+        return await self.flush_outbox()
 
     async def collect(self) -> dict:
         await self.load()
@@ -331,7 +387,7 @@ class Monitor:
         pages = 0
         # A bad result fails only its own job; the first such error is raised at the
         # end so the run is still reported as an error once the other jobs are done.
-        job_errors: list[IntegrationError] = []
+        errors: list[IntegrationError] = []
         # Shapely geometries of known events, built at most once per run.
         shapes = {}
         for job in self.state.jobs:
@@ -339,96 +395,12 @@ class Monitor:
                 break
             if job.status not in ACTIVE_JOB_STATUSES:
                 continue
-            prediction = await self.api.get_prediction(job.prediction_id)
-            if prediction.status in {"failed", "cancelled"}:
-                await self._stop_job(
-                    job, JobStatus.FAILED, prediction.error_message or prediction.status
-                )
+            if not await self._ready_for_paging(job, errors):
                 continue
-            if prediction.status != "completed":
-                continue
-            if prediction.result is None or "mvt" not in prediction.result.file_formats:
-                error = IntegrationConfigurationError(
-                    "Completed prediction has no vector result. Use an LCC model configured with vectorization."
-                )
-                await self._stop_job(job, JobStatus.FAILED, str(error))
-                job_errors.append(error)
-                continue
-            if job.result_id is not None and job.result_id != prediction.result.id:
-                error = IntegrationBadResponseError(
-                    "Prediction result changed while paging; earlier pages came from a different result."
-                )
-                await self._stop_job(job, JobStatus.FAILED, str(error))
-                job_errors.append(error)
-                continue
-            job.result_id = prediction.result.id
-            job.status = JobStatus.COLLECTING
-            await self.save()
             while pages < self.config.pages_per_poll and job.status == JobStatus.COLLECTING:
-                if job.offset >= RESULT_WINDOW:
-                    await self._stop_job(
-                        job,
-                        JobStatus.NEEDS_EXPORT,
-                        "Result reaches the 10,000-feature search window; completeness requires an export or a smaller AOI.",
-                    )
-                    break
-                query = build_feature_query(job.config, job.offset)
-                response = await self.api.search_features(job.result_id, query)
-                if (
-                    response.meta.total is not None
-                    and response.meta.total > RESULT_WINDOW
-                ):
-                    await self._stop_job(
-                        job,
-                        JobStatus.NEEDS_EXPORT,
-                        "Result exceeds the feature search window; use a smaller AOI or export.",
-                    )
-                    break
-                # A short page proves exhaustion. ES totals can be lower bounds at 10,000.
-                complete = len(response.records) < query.limit
-                stage = await self._stage(job, response.records)
-                try:
-                    events = [
-                        event
-                        for feature in response.records
-                        if (
-                            event := prepare_event(
-                                feature,
-                                job,
-                                stage,
-                                shapes,
-                                integration_id=self.integration_id,
-                                now=self.now,
-                            )
-                        )
-                    ]
-                except InvalidFeatureError as exc:
-                    # Never skip a detection silently: stop this job at this page.
-                    await self._stop_job(
-                        job, JobStatus.FAILED, f"At offset {job.offset}: {exc}"
-                    )
-                    job_errors.append(exc)
-                    break
-                self.state.outbox = Outbox(
-                    batch_id=str(
-                        uuid5(
-                            NAMESPACE_URL,
-                            f"{self.integration_id}:{job.name}:{job.offset}",
-                        )
-                    ),
-                    job_name=job.name,
-                    events=events,
-                    new_events=stage.new,
-                    updated_events=list(stage.updated.values()),
-                    next_offset=job.offset + len(response.records),
-                    complete=complete,
-                )
-                await self.save()
-                sent += await self.flush_outbox()
+                sent += await self._collect_page(job, shapes, errors)
                 pages += 1
-        if job_errors:
-            raise job_errors[0]
-        return {
+        summary = {
             "events_sent": sent,
             "pages_read": pages,
             "jobs": [
@@ -441,3 +413,11 @@ class Monitor:
                 for j in self.state.jobs
             ],
         }
+        if errors:
+            first = errors[0]
+            raise type(first)(
+                f"{first} (this run still sent {sent} events from {pages} pages; "
+                f"{len(errors)} job(s) failed)",
+                status_code=first.status_code,
+            ) from first
+        return summary

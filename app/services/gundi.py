@@ -22,7 +22,6 @@ from app import settings  # noqa: F401
 from gundi_client_v2.client import GundiClient, GundiDataSenderClient
 
 from .activity_logger import ephemeral_run
-from .errors import IntegrationBadResponseError, IntegrationConnectionError
 from .retry_policies import is_transient_gundi_error
 
 
@@ -214,41 +213,12 @@ async def send_messages_to_gundi(messages: List[dict], **kwargs) -> dict:
     return await sensors_api_client.post_messages(data=messages)
 
 
-def valid_event_receipts(receipts, expected_count: int) -> bool:
-    """Require one distinct, usable acknowledgement per event in batch order."""
-    return (
-        isinstance(receipts, list)
-        and len(receipts) == expected_count
-        and all(isinstance(value, str) and bool(value.strip()) for value in receipts)
-        and len(set(receipts)) == len(receipts)
-    )
+@stamina.retry(**GUNDI_API_RETRY)
+async def get_gundi_sender(integration_id: str) -> GundiDataSenderClient:
+    """A sensors-API client for the integration, for callers that post on their own terms.
 
-
-class EventsNotSentError(IntegrationConnectionError):
-    """Failed before any event was posted, so the batch can safely be sent again."""
-
-
-async def send_events_once_to_gundi(events: List[dict], integration_id: str) -> list[str]:
-    """Submit an outbox batch once; its owner reconciles ambiguous delivery instead of retrying.
-
-    Only the POST is one-shot. Fetching the integration's API key is idempotent, so it
-    keeps the usual retry policy, and a failure there raises EventsNotSentError.
+    Only the API-key lookup is retried; whatever the caller sends with the client
+    is not, so a caller that must not resend a batch can fetch the client first
+    and post exactly once.
     """
-    _block_if_ephemeral("send_events_once_to_gundi")
-    try:
-        sender = await stamina.retry(**GUNDI_API_RETRY)(_get_sensors_api_client)(
-            integration_id=str(integration_id)
-        )
-    except Exception as exc:
-        raise EventsNotSentError(
-            f"Could not prepare the Gundi sender; no events were sent: {exc}"
-        ) from exc
-    response = await sender.post_events(data=events)
-    if not isinstance(response, list) or any(
-        not isinstance(item, dict) or item.get("errors") for item in response
-    ):
-        raise IntegrationBadResponseError("Gundi did not acknowledge every event; reconcile the outbox before retrying.")
-    receipts = [item.get("object_id") for item in response]
-    if not valid_event_receipts(receipts, len(events)):
-        raise IntegrationBadResponseError("Gundi returned missing, invalid or duplicate object IDs; reconcile the outbox before retrying.")
-    return receipts
+    return await _get_sensors_api_client(integration_id=str(integration_id))

@@ -2,14 +2,12 @@
 
 import asyncio
 from datetime import datetime, timezone
-from functools import partial
 from typing import Awaitable, Callable
 
 from app.actions.core import ReferenceDataResponse, ReferenceOption, action_title
 from app.services.action_scheduler import crontab_schedule
 from app.services.activity_logger import activity_logger, ephemeral_run
 from app.services.errors import IntegrationConfigurationError
-from app.services.gundi import send_events_once_to_gundi
 from app.services.state import IntegrationStateManager
 from app.services.utils import find_config_for_action
 
@@ -21,6 +19,7 @@ from .configurations import (
     ResolveDeliveryConfig,
     SubmitPredictionsConfig,
 )
+from .delivery import GundiEventSender
 from .monitor import Monitor
 from .monitor_state import STATE_ACTION
 from .monitor_store import RedisMonitorStore
@@ -109,7 +108,7 @@ async def run_monitor(
                 config,
                 api,
                 RedisMonitorStore(state_manager, integration_id),
-                partial(send_events_once_to_gundi, integration_id=integration_id),
+                GundiEventSender(integration_id),
                 datetime.now(timezone.utc),
             )
             # Finish/cancel before the shared lock expires, even on a stalled provider.
