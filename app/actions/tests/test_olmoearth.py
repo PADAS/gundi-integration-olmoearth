@@ -19,12 +19,13 @@ from app.actions.configurations import (
     ResolveDeliveryConfig,
     SubmitPredictionsConfig,
 )
+from app.actions import monitor as monitor_module
 from app.actions.monitor import (
     Monitor,
     build_feature_query,
     schedule_slot,
 )
-from app.actions.monitor_state import Job, KnownEvent
+from app.actions.monitor_state import Job
 from app.services.errors import (
     IntegrationAuthError,
     IntegrationBadResponseError,
@@ -55,49 +56,31 @@ def config():
         post_change_types=["mining"],
         change_date_property="onset",
         change_date_aggregation="percentile_10",
-        feature_page_size=2,
-        pages_per_poll=1,
     )
 
 
-class MemoryMonitorStore:
-    """In-memory MonitorStore with the same contract as RedisMonitorStore."""
+@pytest.fixture(autouse=True)
+def small_pages(monkeypatch):
+    monkeypatch.setattr(monitor_module, "FEATURE_PAGE_SIZE", 2)
+    monkeypatch.setattr(monitor_module, "PAGES_PER_POLL", 1)
+
+
+class MemoryState:
+    """Stands in for IntegrationStateManager.get_state/set_state."""
 
     def __init__(self):
-        self.ledger = None
-        self.events = {}
+        self.value = {}
 
-    async def load_ledger(self):
-        return copy.deepcopy(self.ledger)
+    async def get_state(self, *args):
+        return copy.deepcopy(self.value)
 
-    async def save_ledger(self, ledger):
-        self.ledger = copy.deepcopy(ledger)
-
-    async def known_ids(self, external_ids):
-        return {external_id for external_id in external_ids if external_id in self.events}
-
-    async def candidates(self, change_type, start, end):
-        return [
-            KnownEvent.parse_obj(event)
-            for event in self.events.values()
-            if event["change_type"] == change_type
-            and start <= dt.date.fromisoformat(event["change_date"]) <= end
-        ]
-
-    async def commit(self, ledger, events):
-        for event in events:
-            self.events[event.external_id] = json.loads(event.json())
-        self.ledger = copy.deepcopy(ledger)
-
-    @property
-    def value(self):
-        """The ledger plus committed events, for assertions."""
-        return {**(self.ledger or {}), "known_events": list(self.events.values())}
+    async def set_state(self, *args):
+        self.value = copy.deepcopy(args[-1])
 
 
 @pytest.fixture
 def store():
-    return MemoryMonitorStore()
+    return MemoryState()
 
 
 @pytest.fixture
@@ -107,6 +90,7 @@ def api():
     api.verify_token.return_value = 0
     api.create_prediction.return_value = prediction("p1", status="pending")
     api.get_prediction.return_value = prediction("p1")
+    api.search_predictions.return_value = client.PredictionSearchResponse(records=[])
     api.search_features.return_value = page([])
     return api
 
@@ -145,23 +129,16 @@ def page(features, total=None):
 
 
 def make_monitor(config, api, store, now=NOW):
-    async def accept(events):
-        return [
-            "gundi-" + event["event_details"]["external_event_id"] for event in events
-        ]
-
-    sender = SimpleNamespace(prepare=AsyncMock(), post=AsyncMock(side_effect=accept))
+    sender = SimpleNamespace(prepare=AsyncMock(), post=AsyncMock())
     return Monitor("integration-1", config, api, store, sender, now)
 
 
 def pending_job(config, prediction_id="p1", name=None, reference_time="2026-10-01T00:00:00Z"):
     return Job(
         name=name or prediction_id,
-        reference_time=reference_time,
-        config=config,
         prediction_id=prediction_id,
-        status="pending",
-        submitted_at=NOW,
+        reference_time=reference_time,
+        selected_types=config.selected_types,
     )
 
 
@@ -199,7 +176,7 @@ def test_calendar_schedule_keeps_anchor_after_short_month(config):
 
 
 def test_feature_filter_uses_post_change_and_not_a_moving_date_cursor(config):
-    body = build_feature_query(config, 6).as_body()
+    body = build_feature_query(config, pending_job(config), 6).as_body()
     assert body["intersects_geometry"] == AREA
     assert body["offset"] == 6
     assert body["property_filters"] == [
@@ -250,36 +227,41 @@ async def test_organization_mismatch_cannot_submit(config, api, store):
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_submission_recovers_by_name_without_duplicate_post(
+async def test_lost_submission_is_recovered_by_name_without_a_second_post(
     config, api, store
 ):
     api.create_prediction.side_effect = IntegrationConnectionError("timeout")
     with pytest.raises(IntegrationConnectionError):
         await make_monitor(config, api, store).submit()
-    assert store.value["jobs"][0]["status"] == "submitting"
+    assert store.value == {}
     api.search_predictions.return_value = client.PredictionSearchResponse(
         records=[prediction("recovered")]
     )
     result = await make_monitor(config, api, store).submit()
-    assert result == {"recovered_prediction_id": "recovered"}
-    assert (
-        api.search_predictions.call_args.args[0].name.eq
-        == store.value["jobs"][0]["name"]
-    )
+    assert result["recovered_prediction_id"] == "recovered"
+    assert api.search_predictions.call_args.args[0].name.eq == store.value["jobs"][0]["name"]
+    assert store.value["next_slot"] == 1
     api.create_prediction.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_unknown_submission_without_a_match_requires_reconciliation(
-    config, api, store
-):
+async def test_submission_with_no_match_is_posted_again(config, api, store):
     api.create_prediction.side_effect = IntegrationConnectionError("timeout")
     with pytest.raises(IntegrationConnectionError):
         await make_monitor(config, api, store).submit()
-    api.search_predictions.return_value = client.PredictionSearchResponse(records=[])
-    with pytest.raises(IntegrationConfigurationError, match="unknown outcome"):
+    api.create_prediction.side_effect = None
+    assert (await make_monitor(config, api, store).submit())["submitted_prediction_id"] == "p1"
+    assert api.create_prediction.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_duplicate_predictions_block_submission(config, api, store):
+    api.search_predictions.return_value = client.PredictionSearchResponse(
+        records=[prediction("a"), prediction("b")], meta=client.SearchMeta(total=2)
+    )
+    with pytest.raises(IntegrationConfigurationError, match="Delete all but one"):
         await make_monitor(config, api, store).submit()
-    api.create_prediction.assert_awaited_once()
+    api.create_prediction.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -336,7 +318,6 @@ async def test_failed_delivery_replays_identical_outbox_then_advances(
         )
     )
     monitor.sender.post.side_effect = None
-    monitor.sender.post.return_value = ["gundi-receipt-1"]
     await monitor.collect()
     assert monitor.sender.post.call_args.args[0] == first
     api.search_features.assert_awaited_once()
@@ -361,6 +342,7 @@ async def test_repeat_polygon_in_next_prediction_is_not_another_event(
     )
     result = await monitor.collect()
     assert result["events_sent"] == 0
+    assert result["repeats_recorded"] == 1
     assert len(store.value["known_events"]) == 1
     assert store.value["known_events"][0]["observations"] == 2
     monitor.sender.post.assert_awaited_once()
@@ -464,7 +446,9 @@ async def test_actual_http_contracts_use_nested_result_and_per_result_search(con
         "https://example.test", "token", transport=httpx.MockTransport(route)
     ) as http:
         pred = await http.get_prediction("p1")
-        await http.search_features(pred.result.id, build_feature_query(config, 0))
+        await http.search_features(
+            pred.result.id, build_feature_query(config, pending_job(config), 0)
+        )
     assert seen[0].method == "GET"
     assert (
         seen[1].url.path == "/api/v1/prediction-results/studio-result/features/search"
@@ -534,43 +518,21 @@ async def test_lock_released_after_failure(config, mocker):
 
 
 @pytest.mark.asyncio
-async def test_confirmed_delivery_commits_receipts_without_reposting(
-    config, api, store
-):
+async def test_confirmed_delivery_commits_without_reposting(config, api, store):
     monitor = await seed(config, api, store)
     api.search_features.return_value = page([feature()])
     monitor.sender.post.side_effect = RuntimeError("lost acknowledgement")
     with pytest.raises(RuntimeError):
         await monitor.collect()
-    batch_id = store.value["outbox"]["batch_id"]
     await monitor.resolve_delivery(
         ResolveDeliveryConfig(
-            batch_id=batch_id,
-            outcome="confirmed_delivered",
-            gundi_object_ids=["actual-gundi-object"],
+            batch_id=store.value["outbox"]["batch_id"], outcome="confirmed_delivered"
         )
     )
     await monitor.collect()
     monitor.sender.post.assert_awaited_once()
-    assert store.value["known_events"][0]["gundi_object_id"] == "actual-gundi-object"
+    assert len(store.value["known_events"]) == 1
     assert store.value["jobs"][0]["status"] == "complete"
-
-
-@pytest.mark.asyncio
-async def test_delivery_resolution_rejects_incomplete_receipts(config, api, store):
-    monitor = await seed(config, api, store)
-    api.search_features.return_value = page([feature()])
-    monitor.sender.post.side_effect = RuntimeError("unknown")
-    with pytest.raises(RuntimeError):
-        await monitor.collect()
-    with pytest.raises(IntegrationConfigurationError, match="one distinct"):
-        await monitor.resolve_delivery(
-            ResolveDeliveryConfig(
-                batch_id=store.value["outbox"]["batch_id"],
-                outcome="confirmed_delivered",
-            )
-        )
-    assert store.value["outbox"]["delivery_status"] == "sending"
 
 
 @pytest.mark.asyncio
@@ -632,13 +594,11 @@ async def test_rejected_submission_preserves_slot_for_retry(config, api, store, 
     )
     with pytest.raises(IntegrationAuthError):
         await make_monitor(config, api, store).submit()
-    assert store.value["next_slot"] == 0
-    assert store.value["jobs"] == []
+    assert store.value == {}
     api.create_prediction.side_effect = None
     await make_monitor(config, api, store).submit()
     assert store.value["next_slot"] == 1
     assert store.value["jobs"][0]["prediction_id"] == "p1"
-    api.search_predictions.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -651,11 +611,10 @@ async def test_environment_change_cannot_reuse_saved_jobs(config, api, store):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("receipts", [[" ", "id2"], ["id1", "id1"]])
-async def test_invalid_receipts_pause_outbox(config, api, store, receipts):
+async def test_unacknowledged_batch_pauses_outbox(config, api, store):
     monitor = await seed(config, api, store)
     api.search_features.return_value = page([feature("f1"), feature("f2")])
-    monitor.sender.post = AsyncMock(return_value=receipts)
+    monitor.sender.post.side_effect = IntegrationBadResponseError("not acknowledged")
     with pytest.raises(IntegrationBadResponseError):
         await monitor.collect()
     assert store.value["outbox"]["delivery_status"] == "sending"
@@ -663,16 +622,14 @@ async def test_invalid_receipts_pause_outbox(config, api, store, receipts):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "status,retryable_slot", [(401, True), (422, True), (503, False)]
-)
-async def test_submission_http_rejection_vs_ambiguous_failure(
-    config, store, status, retryable_slot
-):
-    calls = []
+@pytest.mark.parametrize("status", [401, 422, 503])
+async def test_failed_submission_saves_nothing_and_posts_once(config, store, status):
+    posts = []
 
     def route(request):
-        calls.append(request)
+        if request.url.path.endswith("/search"):
+            return httpx.Response(200, json={"records": [], "meta": {"total": 0}})
+        posts.append(request)
         return httpx.Response(status, json={"detail": "failure"})
 
     async with client.OlmoEarthClient(
@@ -682,9 +639,8 @@ async def test_submission_http_rejection_vs_ambiguous_failure(
 
         with pytest.raises(IntegrationError):
             await make_monitor(config, api, store).submit()
-    assert len(calls) == 1
-    assert store.value["next_slot"] == (0 if retryable_slot else 1)
-    assert bool(store.value["jobs"]) is not retryable_slot
+    assert len(posts) == 1
+    assert store.value == {}
 
 
 @pytest.mark.asyncio
@@ -696,43 +652,6 @@ async def test_stopped_job_does_not_block_next_submission(config, api, store, st
     await monitor.save()
     result = await make_monitor(config, api, store).submit()
     assert result["submitted_prediction_id"] == "p1"
-
-
-@pytest.mark.asyncio
-async def test_connection_failure_before_sending_releases_slot(config, api, store):
-    api.create_prediction.side_effect = client.RequestNotSentError("refused")
-    with pytest.raises(IntegrationConnectionError):
-        await make_monitor(config, api, store).submit()
-    assert store.value["jobs"] == [] and store.value["next_slot"] == 0
-
-
-@pytest.mark.asyncio
-async def test_unfound_submission_is_released_after_grace(config, api, store):
-    api.create_prediction.side_effect = IntegrationConnectionError("timeout")
-    with pytest.raises(IntegrationConnectionError):
-        await make_monitor(config, api, store).submit()
-    api.search_predictions.return_value = client.PredictionSearchResponse(records=[])
-    later = NOW + dt.timedelta(hours=2)
-    result = await make_monitor(config, api, store, now=later).submit()
-    assert result["status"] == "unsent_submission_released"
-    assert store.value["jobs"] == [] and store.value["next_slot"] == 0
-    api.create_prediction.side_effect = None
-    await make_monitor(config, api, store, now=later).submit()
-    assert store.value["jobs"][0]["status"] == "pending"
-
-
-@pytest.mark.asyncio
-async def test_duplicate_submissions_are_never_released(config, api, store):
-    api.create_prediction.side_effect = IntegrationConnectionError("timeout")
-    with pytest.raises(IntegrationConnectionError):
-        await make_monitor(config, api, store).submit()
-    api.search_predictions.return_value = client.PredictionSearchResponse(
-        records=[prediction("a"), prediction("b")], meta=client.SearchMeta(total=2)
-    )
-    later = NOW + dt.timedelta(hours=2)
-    with pytest.raises(IntegrationConfigurationError, match="unknown outcome"):
-        await make_monitor(config, api, store, now=later).submit()
-    assert store.value["jobs"][0]["status"] == "submitting"
 
 
 @pytest.mark.asyncio
@@ -764,34 +683,6 @@ async def test_project_organization_parses_typed_response():
         assert await http.project_organization(PROJECT) == ORG
 
 
-def known(external_id, change_date="2026-09-10", change_type="mining", **fields):
-    return KnownEvent(
-        external_id=external_id,
-        geometry=AREA,
-        change_type=change_type,
-        change_date=change_date,
-        first_seen_at=NOW,
-        last_seen_at=NOW,
-        first_prediction_id="p0",
-        last_prediction_id="p0",
-        **fields,
-    )
-
-
-@pytest.mark.asyncio
-async def test_page_reads_only_candidates_within_date_tolerance(config, api, store):
-    monitor = await seed(config, api, store)
-    await store.commit(
-        store.ledger, [known("near", "2026-09-01"), known("far", "2025-01-01")]
-    )
-    store.candidates = AsyncMock(wraps=store.candidates)
-    api.search_features.return_value = page([feature(changed="2026-09-10")])
-    await monitor.collect()
-    (change_type, start, end), _ = store.candidates.call_args
-    assert change_type == "mining"
-    assert start == dt.date(2026, 8, 10) and end == dt.date(2026, 10, 11)
-
-
 @pytest.mark.asyncio
 async def test_undelivered_page_commits_no_event_history(config, api, store):
     monitor = await seed(config, api, store)
@@ -799,18 +690,18 @@ async def test_undelivered_page_commits_no_event_history(config, api, store):
     monitor.sender.post.side_effect = RuntimeError("lost")
     with pytest.raises(RuntimeError):
         await monitor.collect()
-    assert store.events == {}
-    assert len(store.ledger["outbox"]["new_events"]) == 1
+    assert store.value["known_events"] == []
+    assert len(store.value["outbox"]["new_events"]) == 1
 
 
 @pytest.mark.asyncio
-async def test_accepted_page_commits_events_with_receipts(config, api, store):
+async def test_accepted_page_commits_its_events(config, api, store):
     monitor = await seed(config, api, store)
     api.search_features.return_value = page([feature()])
-    await monitor.collect()
-    (event,) = store.events.values()
-    assert event["gundi_object_id"] == "gundi-" + event["external_id"]
-    assert store.ledger["outbox"] is None
+    result = await monitor.collect()
+    assert len(store.value["known_events"]) == 1
+    assert result["known_events"] == 1
+    assert store.value["outbox"] is None
 
 
 @pytest_asyncio.fixture
@@ -836,43 +727,6 @@ async def redis_state_manager():
     await manager.db_client.aclose()
 
 
-async def check_store_contract(any_store):
-    assert await any_store.load_ledger() is None
-    await any_store.commit(
-        {"identity": "x"},
-        [
-            known("a", "2026-09-01"),
-            known("b", "2026-09-30"),
-            known("c", "2026-09-10", change_type="new_road"),
-        ],
-    )
-    assert await any_store.load_ledger() == {"identity": "x"}
-    found = await any_store.candidates(
-        "mining", dt.date(2026, 8, 25), dt.date(2026, 9, 15)
-    )
-    assert [e.external_id for e in found] == ["a"]
-    assert await any_store.known_ids(["a", "c", "missing"]) == {"a", "c"}
-    await any_store.commit({"identity": "y"}, [known("a", "2026-09-01", observations=3)])
-    (updated,) = await any_store.candidates(
-        "mining", dt.date(2026, 9, 1), dt.date(2026, 9, 1)
-    )
-    assert updated.observations == 3
-    await any_store.save_ledger({"identity": "z"})
-    assert await any_store.load_ledger() == {"identity": "z"}
-
-
-@pytest.mark.asyncio
-async def test_memory_store_contract():
-    await check_store_contract(MemoryMonitorStore())
-
-
-@pytest.mark.asyncio
-async def test_redis_store_contract(redis_state_manager):
-    from app.actions.monitor_store import RedisMonitorStore
-
-    await check_store_contract(RedisMonitorStore(redis_state_manager, "integration-1"))
-
-
 @pytest.mark.asyncio
 async def test_redis_lock_excludes_a_second_run(redis_state_manager):
     async with redis_state_manager.lock("i", "a", ttl_seconds=30) as first:
@@ -884,10 +738,9 @@ async def test_redis_lock_excludes_a_second_run(redis_state_manager):
 
 @pytest.mark.asyncio
 async def test_monitor_repeat_detection_on_redis(config, api, redis_state_manager):
-    from app.actions.monitor_store import RedisMonitorStore
+    from app.actions.monitor_state import STATE_ACTION
 
-    store = RedisMonitorStore(redis_state_manager, "integration-1")
-    monitor = await seed(config, api, store)
+    monitor = await seed(config, api, redis_state_manager)
     api.search_features.return_value = page([feature()])
     assert (await monitor.collect())["events_sent"] == 1
     monitor.state.jobs.append(
@@ -897,9 +750,10 @@ async def test_monitor_repeat_detection_on_redis(config, api, redis_state_manage
     api.get_prediction.return_value = prediction("p2", result_id="r2")
     api.search_features.return_value = page([feature("again", changed="2026-09-12")])
     assert (await monitor.collect())["events_sent"] == 0
-    (event,) = await store.candidates("mining", dt.date(2026, 9, 1), dt.date(2026, 9, 30))
-    assert event.observations == 2 and event.gundi_object_id
-    assert (await store.load_ledger())["outbox"] is None
+    ledger = await redis_state_manager.get_state("integration-1", STATE_ACTION)
+    (event,) = ledger["known_events"]
+    assert event["observations"] == 2
+    assert ledger["outbox"] is None
 
 
 @pytest.mark.asyncio
@@ -936,7 +790,7 @@ async def test_event_sender_posts_once_and_reuses_its_client(mocker):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "response", [{"object_id": "1"}, ["id"], [{"errors": ["rejected"]}]]
+    "response", [{"object_id": "1"}, [], ["id"], [{"errors": ["rejected"]}]]
 )
 async def test_event_sender_rejects_unclean_acknowledgement(mocker, response):
     from app.actions.delivery import GundiEventSender
@@ -947,17 +801,6 @@ async def test_event_sender_rejects_unclean_acknowledgement(mocker, response):
     await sender.prepare()
     with pytest.raises(IntegrationBadResponseError):
         await sender.post([{"title": "test"}])
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("receipts", [[], [None], ["id1", "id2"]])
-async def test_wrong_receipt_count_or_value_pauses_outbox(config, api, store, receipts):
-    monitor = await seed(config, api, store)
-    api.search_features.return_value = page([feature()])
-    monitor.sender.post = AsyncMock(return_value=receipts)
-    with pytest.raises(IntegrationBadResponseError):
-        await monitor.collect()
-    assert store.value["outbox"]["delivery_status"] == "sending"
 
 
 @pytest.mark.asyncio
@@ -976,6 +819,6 @@ async def test_deleted_prediction_fails_its_job_instead_of_wedging(config, api, 
 @pytest.mark.asyncio
 async def test_identity_change_names_the_changed_settings(config, api, store):
     await seed(config, api, store)
-    config.imagery_lag_days = 7
-    with pytest.raises(IntegrationConfigurationError, match=r"\(imagery_lag_days\)"):
+    config.change_date_precision = "day"
+    with pytest.raises(IntegrationConfigurationError, match=r"\(change_date_precision\)"):
         await make_monitor(config, api, store).collect()

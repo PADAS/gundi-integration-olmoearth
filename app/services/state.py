@@ -35,11 +35,6 @@ class IntegrationStateManager:
         db = kwargs.get("db", settings.REDIS_STATE_DB)
         self.db_client = redis.Redis(host=host, port=port, db=db)
 
-    @staticmethod
-    def key(integration_id: str, action_id: str, source_id: str = "no-source") -> str:
-        """The Redis key for one piece of an integration's state."""
-        return f"integration_state.{integration_id}.{action_id}.{source_id}"
-
     @asynccontextmanager
     async def lock(
         self, integration_id: str, action_id: str, *, ttl_seconds: int
@@ -55,7 +50,7 @@ class IntegrationStateManager:
         the lock as held by another run.
         """
         lock = self.db_client.lock(
-            self.key(integration_id, action_id, "lock"),
+            f"integration_state.{integration_id}.{action_id}.lock",
             timeout=ttl_seconds,
             blocking=False,
         )
@@ -75,7 +70,7 @@ class IntegrationStateManager:
     async def get_state(self, integration_id: str, action_id: str, source_id: str = "no-source") -> dict:
         async for attempt in stamina.retry_context(**REDIS_RETRY):
             with attempt:
-                json_value = await self.db_client.get(self.key(integration_id, action_id, source_id))
+                json_value = await self.db_client.get(f"integration_state.{integration_id}.{action_id}.{source_id}")
         value = json.loads(json_value) if json_value else {}
         return value
 
@@ -85,7 +80,7 @@ class IntegrationStateManager:
         async for attempt in stamina.retry_context(**REDIS_RETRY):
             with attempt:
                 await self.db_client.set(
-                    self.key(integration_id, action_id, source_id),
+                    f"integration_state.{integration_id}.{action_id}.{source_id}",
                     json.dumps(state, default=str)
                 )
 
@@ -106,7 +101,7 @@ class IntegrationStateManager:
         async for attempt in stamina.retry_context(**REDIS_RETRY):
             with attempt:
                 was_set = await self.db_client.set(
-                    self.key(integration_id, action_id, source_id),
+                    f"integration_state.{integration_id}.{action_id}.{source_id}",
                     "1",
                     ex=ttl_seconds,
                     nx=True,
@@ -119,7 +114,7 @@ class IntegrationStateManager:
         async for attempt in stamina.retry_context(**REDIS_RETRY):
             with attempt:
                 await self.db_client.delete(
-                    self.key(integration_id, action_id, source_id)
+                    f"integration_state.{integration_id}.{action_id}.{source_id}"
                 )
 
     def __str__(self):

@@ -1,17 +1,29 @@
 """Validate polygon changes, match repeat detections, and build Gundi event payloads."""
 
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timezone
 from typing import Optional
 from uuid import NAMESPACE_URL, uuid5
 
 from shapely.geometry import shape
 from shapely.geometry.base import BaseGeometry
 
-from app.services.errors import IntegrationBadResponseError
+from app.services.errors import (
+    IntegrationBadResponseError,
+    IntegrationConfigurationError,
+)
 
 from .client import Feature
-from .configurations import polygon_shape
+from .configurations import PullEventsConfig, polygon_shape
 from .monitor_state import Job, KnownEvent
+
+# Repeat matching: a detection repeats a known event of the same change type whose
+# change date is within DATE_TOLERANCE_DAYS and whose polygon overlaps it with at
+# least this intersection-over-union.
+OVERLAP_THRESHOLD = 0.7
+DATE_TOLERANCE_DAYS = 31
+# The history lives in the monitor's single ledger value; stop visibly at this size.
+MAX_EVENTS = 10000
+
 
 class InvalidFeatureError(IntegrationBadResponseError):
     """A detection in a result is unusable; retrying the same page cannot fix it."""
@@ -40,53 +52,50 @@ def event_id(integration_id: str, job: Job, feature: Feature) -> str:
     return str(uuid5(NAMESPACE_URL, f"{integration_id}:{job.result_id}:{feature.id}"))
 
 
-def classify(feature: Feature, job: Job) -> Optional[tuple[str, date]]:
+def classify(
+    feature: Feature, job: Job, config: PullEventsConfig
+) -> Optional[tuple[str, date]]:
     """(change type, change date) for a detection the job monitors, else None.
 
     Raises InvalidFeatureError if a monitored detection has no usable date.
     """
     props = feature.properties.model_properties()
     change_type = props.get("post_change")
-    if change_type not in job.config.selected_types:
+    if change_type not in job.selected_types:
         return None
-    changed = parse_change_date(props.get(job.config.change_date_property))
-    if job.config.changes_since and changed < job.config.changes_since:
+    changed = parse_change_date(props.get(config.change_date_property))
+    if job.changes_since and changed < job.changes_since:
         return None
     return change_type, changed
 
 
-def candidate_windows(
-    classified: list[tuple[str, date]], job: Job
-) -> dict[str, tuple[date, date]]:
-    """Per change type, the change-date range any repeat of these detections can fall in."""
-    dates: dict[str, list[date]] = {}
-    for change_type, changed in classified:
-        dates.setdefault(change_type, []).append(changed)
-    tolerance = timedelta(days=job.config.date_tolerance_days)
-    return {
-        change_type: (min(found) - tolerance, max(found) + tolerance)
-        for change_type, found in dates.items()
-    }
-
-
 class EventStage:
-    """One page's view of event history: committed candidates plus staged changes.
+    """One page's view of event history: the committed events plus staged changes.
 
-    Nothing here is persisted until the page's outbox is accepted and committed.
+    Committed events are never mutated here; a repeat is recorded on a copy in
+    ``updated``. Nothing is persisted until the page's outbox is committed.
     """
 
-    def __init__(self, candidates: list[KnownEvent], known_ids: set[str]):
-        # Copies, so a page that is never committed leaves no trace.
-        self.candidates = [event.copy() for event in candidates]
-        self.known_ids = set(known_ids)
+    def __init__(self, known: list[KnownEvent]):
+        self.known = known
+        self.known_ids = {event.external_id for event in known}
         self.new: list[KnownEvent] = []
         self.updated: dict[str, KnownEvent] = {}
+
+    def record_repeat(self, event: KnownEvent, job: Job, now: datetime) -> None:
+        staged = self.updated.setdefault(event.external_id, event.copy())
+        staged.last_seen_at = now
+        # A polygon split into several features this run is still one observation.
+        if staged.last_prediction_id != job.prediction_id:
+            staged.last_prediction_id = job.prediction_id
+            staged.observations += 1
 
 
 def prepare_event(
     feature: Feature,
     found: tuple[str, date],
     job: Job,
+    config: PullEventsConfig,
     stage: EventStage,
     shapes: dict[str, BaseGeometry],
     *,
@@ -95,7 +104,7 @@ def prepare_event(
 ) -> Optional[dict]:
     """Build a new event or record a repeat in the page's staged history.
 
-    ``found`` is ``classify(feature, job)`` for a detection the job monitors.
+    ``found`` is ``classify(feature, job, config)`` for a detection the job monitors.
     Mutates only ``stage`` and ``shapes``, a cache of known-event geometries keyed
     by external ID. This function performs no persistence or network operations.
     """
@@ -115,14 +124,14 @@ def prepare_event(
     if external_id in stage.known_ids:
         return None
     matches = []
-    for previous in stage.candidates:
+    for previous in stage.known:
         # Detections from the same run are distinct polygons, never repeats.
         if (
             previous.change_type != change_type
             or previous.first_prediction_id == job.prediction_id
         ):
             continue
-        if abs((previous.change_date - changed).days) > job.config.date_tolerance_days:
+        if abs((previous.change_date - changed).days) > DATE_TOLERANCE_DAYS:
             continue
         old_geom = shapes.get(previous.external_id)
         if old_geom is None:
@@ -133,17 +142,15 @@ def prepare_event(
         overlap = geom.intersection(old_geom).area
         union = geom.area + old_geom.area - overlap
         iou = overlap / union if union else 0
-        if iou >= job.config.overlap_threshold:
+        if iou >= OVERLAP_THRESHOLD:
             matches.append(previous)
     if len(matches) == 1:
-        previous = matches[0]
-        previous.last_seen_at = now
-        # A polygon split into several features this run is still one observation.
-        if previous.last_prediction_id != job.prediction_id:
-            previous.last_prediction_id = job.prediction_id
-            previous.observations += 1
-        stage.updated[previous.external_id] = previous
+        stage.record_repeat(matches[0], job, now)
         return None
+    if len(stage.known) + len(stage.new) >= MAX_EVENTS:
+        raise IntegrationConfigurationError(
+            "Prototype event history is full; migrate to a durable event store before collecting more."
+        )
     stage.known_ids.add(external_id)
     stage.new.append(
         KnownEvent(
@@ -167,18 +174,18 @@ def prepare_event(
             "oerun_prediction_result_id": feature.properties.oe_prediction_result_id,
             "external_event_id": external_id,
             "feature_id": feature.id,
-            "model_id": str(job.config.model_id),
+            "model_id": str(config.model_id),
             "first_discovered_at": now.isoformat(),
             "estimated_change_date": changed.isoformat(),
-            "change_date_precision": job.config.change_date_precision,
-            "change_date_aggregation": job.config.change_date_aggregation,
+            "change_date_precision": config.change_date_precision,
+            "change_date_aggregation": config.change_date_aggregation,
             "prediction_reference_time": job.reference_time,
             "ambiguous_match_count": len(matches),
         }
     )
     return {
         "title": f"OlmoEarth: {change_type.replace('_', ' ')}",
-        "event_type": job.config.event_type,
+        "event_type": config.event_type,
         "source": f"olmoearth-monitor:{integration_id}",
         "recorded_at": datetime.combine(changed, time(), timezone.utc).isoformat(),
         "location": {"lat": point.y, "lon": point.x},

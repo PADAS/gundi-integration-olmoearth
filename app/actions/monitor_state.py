@@ -1,4 +1,4 @@
-"""Persisted monitor records and the identity that keeps configurations isolated."""
+"""The monitor's persisted ledger and the identity that keeps configurations isolated."""
 
 import json
 from datetime import date, datetime
@@ -13,7 +13,6 @@ STATE_ACTION = "lcc_monitor_v1"
 
 
 class JobStatus(str, Enum):
-    SUBMITTING = "submitting"  # POST sent or about to be; outcome unknown
     PENDING = "pending"
     COLLECTING = "collecting"
     COMPLETE = "complete"
@@ -32,13 +31,19 @@ class DeliveryStatus(str, Enum):
 
 
 class Job(BaseModel):
+    """One submitted prediction and how far its result has been read.
+
+    Only the settings that may change between jobs are kept; the rest are pinned
+    by the monitor identity and read from the live configuration.
+    """
+
     name: str
+    prediction_id: str
     reference_time: str
-    config: PullEventsConfig
-    prediction_id: Optional[str] = None
+    selected_types: list[str]
+    changes_since: Optional[date] = None
     result_id: Optional[str] = None
-    status: JobStatus = JobStatus.SUBMITTING
-    submitted_at: datetime
+    status: JobStatus = JobStatus.PENDING
     offset: int = 0
     error: Optional[str] = None
 
@@ -53,19 +58,17 @@ class KnownEvent(BaseModel):
     first_prediction_id: str
     last_prediction_id: str
     observations: int = 1
-    gundi_object_id: Optional[str] = None
 
 
 class Outbox(BaseModel):
     """One page's delivery and the event-history changes it commits.
 
     The history changes are applied only once Gundi has accepted ``events``,
-    together with the job's new offset, in a single store transaction.
+    in the same ledger write that advances the job's offset.
     """
 
     batch_id: str
     delivery_status: DeliveryStatus = DeliveryStatus.PENDING
-    receipts: list[str] = Field(default_factory=list)
     job_name: str
     events: list[dict]
     new_events: list[KnownEvent] = Field(default_factory=list)
@@ -75,12 +78,10 @@ class Outbox(BaseModel):
 
 
 class MonitorState(BaseModel):
-    """The ledger: everything except the event history, which the store keeps
-    per event so a page reads and writes only the events it touches."""
-
     identity: dict
     next_slot: int = 0
     jobs: list[Job] = Field(default_factory=list)
+    known_events: list[KnownEvent] = Field(default_factory=list)
     outbox: Optional[Outbox] = None
 
 
@@ -91,7 +92,6 @@ IDENTITY_FIELDS = {
     "area_of_interest",
     "schedule_start",
     "cadence",
-    "imagery_lag_days",
     "change_date_property",
     "change_date_aggregation",
     "change_date_precision",

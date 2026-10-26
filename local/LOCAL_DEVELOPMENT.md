@@ -50,7 +50,7 @@ There are four levels of validation:
 | Goal | Required components |
 | --- | --- |
 | Exercise the monitor without accounts | `pytest app/actions/tests/test_olmoearth.py -q`; APIs, state, and delivery are mocked |
-| Exercise the Redis store and lock | Start a disposable Redis, then `OLMOEARTH_TEST_REDIS_URL=redis://127.0.0.1:6390/15 pytest app/actions/tests -q` (the tests flush that database) |
+| Exercise the monitor and lock on real Redis | Start a disposable Redis, then `OLMOEARTH_TEST_REDIS_URL=redis://127.0.0.1:6390/15 pytest app/actions/tests -q` (the tests flush that database) |
 | Browse the runner API | Python dependencies and `REGISTER_ON_START=false python -m uvicorn app.main:app --host 127.0.0.1 --port 8080`; open `/docs` |
 | View the real form and deliver events | Gundi portal/API and OAuth, registered runner, Redis, scheduler/message delivery, OlmoEarth credentials/model, Gundi ingestion/routing and EarthRanger destination |
 

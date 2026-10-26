@@ -47,7 +47,6 @@ Neither IDs nor the OlmoEarth environment are hardcoded in the connector.
 | Action | Schedule | Behavior |
 | --- | --- | --- |
 | `auth` | on demand | Verify token using authenticated prediction search. |
-| `list_predictions` | reference lookup | List a project's predictions for inspection. |
 | `submit_predictions` | every four hours, opt-in | Submit one due schedule slot if no job is in flight. |
 | `pull_events` | every four hours, at :15 | Poll saved jobs, filter features, and deliver events. |
 | `resolve_delivery` | manual only | Resolve a delivery whose acknowledgement was lost. |
@@ -58,8 +57,8 @@ Submission calls `POST /api/v1/predictions`, saves its ID, and collection polls
 The area and selected post-change labels filter features. Opening EarthRanger does not
 trigger inference: it displays events delivered through Gundi.
 
-The model reference time is the schedule slot minus `imagery_lag_days` (14 by default;
-verify for the chosen model). Start and end are both that reference time. The model's
+The model reference time is the schedule slot minus 14 days (`IMAGERY_LAG_DAYS` in
+`monitor.py`; verify for the chosen model). Start and end are both that reference time. The model's
 own configuration determines its imagery lookbehind. Frequency does not set that
 lookbehind or imply event-date precision. Annual sampling is not a promise of exhaustive
 annual coverage. Missed slots catch up oldest first, with at most one job in flight.
@@ -71,21 +70,21 @@ annual coverage. Missed slots catch up oldest first, with at most one job in fli
 - `first_discovered_at` is when the connector found the polygon. A late-discovered change
   is retained even if its estimated date predates the last poll.
 - `changes_since`, if set, is a fixed initial event-date cutoff. It never advances as a cursor.
-- Selected classes and delivery settings are snapshotted per submitted job. Changing the
-  class selection affects future jobs, not a half-read result or already delivered history.
+- Selected classes and `changes_since` are snapshotted per submitted job. Changing them
+  affects future jobs, not a half-read result or already delivered history.
 - Environment/project/model/area/schedule/date semantics changes require a new monitor integration,
   preserving old jobs instead of silently mixing identities.
 
 Every new event gets a deterministic `event_details.external_event_id`. Gundi's REST
-`source` identifies the monitor, **not** a per-event idempotency key. Store
-Gundi's returned `object_id` separately after acknowledged delivery. See the
+`source` identifies the monitor, **not** a per-event idempotency key. See the
 [Gundi API guide](https://support.earthranger.com/en_US/become-a-data-provider/gundi-api).
 
 For consecutive predictions, the prototype suppresses a repeat when exactly one previously
-known polygon has the same class, estimated date within `date_tolerance_days`, and polygon
-intersection-over-union at least `overlap_threshold`, and that was first seen in an earlier
+known polygon has the same class, estimated date within 31 days, and polygon
+intersection-over-union at least 0.7 (`DATE_TOLERANCE_DAYS` and `OVERLAP_THRESHOLD` in
+`change_events.py`), and that was first seen in an earlier
 prediction (a polygon split into several features counts as one observation). It records the
-new observation locally; it does not PATCH the delivered EarthRanger event. Multiple matches create an event
+new observation locally and reports `repeats_recorded` in the collection result; it does not PATCH the delivered EarthRanger event. Multiple matches create an event
 with `ambiguous_match_count` for review. This is a regional, planar-overlap heuristic,
 not a general change-tracking algorithm: inspect splits, merges, geometry drift and dates
 in the pilot. Antimeridian-spanning AOIs are rejected. Geometry is selected by intersection,
@@ -93,46 +92,39 @@ not clipped to the AOI. Nearby separate polygons from the same prediction remain
 
 ## Recovery and completeness
 
-Redis holds the monitor under `integration_state.<integration>.lcc_monitor_v1.*`:
+Each monitor's state is one Redis value, `integration_state.<integration>.lcc_monitor_v1.no-source`,
+written through `IntegrationStateManager.set_state`: the jobs and their per-result offsets,
+the schedule position, the known events (polygon, change type and date, observations), and
+the delivery outbox. Because it is one value, every save is atomic. History is bounded at
+10,000 known events and stops visibly there; it is never evicted, so old detections are never
+silently resent. Configure durable Redis persistence/backups before a real deployment: losing
+it means already-delivered detections are resent.
 
-- `ledger`: jobs, per-result offsets, schedule position and the delivery outbox.
-- `events`: a hash of known events (polygon, change type and date, observations, Gundi ID).
-- `by_date.<change_type>`: a sorted set of event IDs scored by change date. Repeat matching
-  reads only events of the same type within `date_tolerance_days`, so cost tracks local
-  density rather than total history, and history has no size cap.
-- `lock`: the run lock (`IntegrationStateManager.lock`).
-
-A page's outbox carries only its new and updated events. Once Gundi accepts the batch, those
-events, their index entries and the advanced job offset are written in one Redis transaction.
-Configure durable Redis persistence/backups before a real deployment: losing the event
-history means already-delivered detections are resent.
 There is no prediction-creation or feature-time watermark: late-completing jobs remain
-tracked. A run lock, held a few minutes longer than the runner's action timeout
-(`MAX_ACTION_EXECUTION_TIME`), prevents the two schedules from writing this state
-concurrently. Only one prediction is in flight at a time, so a collection run pages that
-one job. A changed environment or monitor setting is refused with the names of the
+tracked. A run lock (`IntegrationStateManager.lock`), held a few minutes longer than the
+runner's action timeout (`MAX_ACTION_EXECUTION_TIME`), prevents the two schedules from writing
+this state concurrently. Only one prediction is in flight at a time, so a collection run pages
+that one job. A changed environment or monitor setting is refused with the names of the
 settings that differ.
 
-Before submission the connector saves the job's unique name, reference time and configuration. Explicit
-400/401/403/404/422/429 rejections, and connections that fail before the request is sent,
-preserve the schedule slot for the next attempt; timeouts, server errors and malformed
-success responses remain ambiguous. It never retries an ambiguous creation POST. The next
-submission action searches that name within the project/model and recovers a single
-matching ID. If no prediction with that name has appeared an hour after submission, the
-slot is released and submitted again on the next run. Multiple matches require an
-operator to delete the duplicates; they never cause an automatic second POST.
+Each schedule slot has a unique prediction name. Before posting, submission searches for that
+name in the project/model and adopts a single match, so a POST whose response was lost is
+recovered on the next run rather than sent twice. The create POST is never retried, and the
+job is recorded only once a prediction ID is in hand; any failure leaves the slot due for the
+next run. Multiple predictions with the name stop submission until an operator deletes the
+extras.
 
-A page's payload is stored before delivery. The Gundi POST is attempted once; fetching the
-integration's Gundi key beforehand is retried, and if it still fails the batch stays
-`pending` and is sent on the next collection. A successful
-acknowledgement saves every returned object ID before committing the page offset. If the
-outcome is unknown, the outbox stays `sending` and subsequent collection pauses rather
-than potentially creating duplicates. **Resolve LCC Delivery** requires the exact batch ID:
+A page's payload is stored in the outbox before delivery, with the page's new and updated
+events. The Gundi POST is attempted once; fetching the integration's Gundi key beforehand is
+retried, and if it still fails the batch stays `pending` and is sent on the next collection.
+Once Gundi acknowledges every event, the events and the page offset are committed in the same
+save. If the outcome is unknown, the outbox stays `sending` and subsequent collection pauses
+rather than potentially creating duplicates. **Resolve LCC Delivery** takes the batch ID and
+an outcome:
 
-- `confirmed_delivered`: supply each Gundi object ID in outbox order; the next collection
-  commits the page without resending.
-- `confirmed_not_delivered`: only after checking the entire batch, permit the next collection
-  to send the saved payload again.
+- `confirmed_delivered`: the next collection commits the page without resending.
+- `confirmed_not_delivered`: only after checking the entire batch, the next collection sends
+  the saved payload again.
 - Partial delivery requires manual reconciliation of the whole batch first. Do not mark it
   wholly undelivered. There is no claim of automatic exactly-once delivery.
 
@@ -140,14 +132,14 @@ The page budget pauses with a saved offset. Reaching Elasticsearch's 10,000-feat
 marks the job `needs_export`; it is never reported complete, but later scheduled runs
 continue. Use a smaller AOI for the prototype. Empty vector results complete normally.
 A raster-only result, a changed result ID, or a detection with an invalid polygon or
-malformed date marks only that job `failed` at the offending page (no detection is
-skipped silently); the run reports the error after the other jobs are collected. Upstream
+malformed date, or a prediction deleted in OlmoEarth, marks the job `failed` at the
+offending page (no detection is skipped silently) and the run reports the error; the next
+scheduled submission proceeds. Upstream
 vectorization can itself remove/cap polygons: use an uncapped model and inspect its
 sieve/simplification settings for the pilot.
 
-The job ledger is bounded at 1,000 jobs and stops visibly at that limit. Event history is
-never evicted, so old detections are never silently resent. Large-result export and
-downstream event updates are follow-up work.
+The job ledger is bounded at 1,000 jobs and stops visibly at that limit. Large-result
+export and downstream event updates are follow-up work.
 
 ## Code layout
 
@@ -156,17 +148,16 @@ downstream event updates are follow-up work.
 - `app/actions/client.py`: OlmoEarth HTTP requests and API payload schemas.
 - `app/actions/handlers.py`: connects Gundi actions to the monitor.
 - `app/actions/monitor.py`: submission, collection, pagination and delivery recovery.
-- `app/actions/monitor_state.py`: persisted jobs, events, outbox and monitor identity.
-- `app/actions/monitor_store.py`: the Redis ledger, event hash and date indexes.
-- `app/actions/delivery.py`: one-shot Gundi delivery and receipt validation.
+- `app/actions/monitor_state.py`: the persisted ledger (jobs, events, outbox) and monitor identity.
+- `app/actions/delivery.py`: one-shot Gundi delivery and acknowledgement check.
 - `app/actions/change_events.py`: date parsing, repeat matching and event construction.
 
 Shared runner code in `app/services` comes from the upstream action-runner template, so
-changes there stay small and general: `IntegrationStateManager.key()`/`.lock()` and
-`gundi.get_gundi_sender()`. Existing state key names and send helpers are unchanged.
+changes there are two additions: `IntegrationStateManager.lock()` and
+`gundi.get_gundi_sender()`. Existing state keys and send helpers are unchanged.
 
-Event preparation works on a page-local stage: copies of the candidate events the page can
-match, plus the events it creates or updates. The monitor stores that stage's changes in
+Event preparation works on a page-local stage: the committed events it can match, plus the
+events it creates and copies of those it updates. The monitor stores that stage's changes in
 the outbox and commits them only after delivery. This keeps polygon logic independent of
 network and storage while preserving the delivery/checkpoint boundary.
 
@@ -174,11 +165,11 @@ network and storage while preserving the delivery/checkpoint boundary.
 
 Run `pytest` for the full suite, or `pytest app/actions/tests/test_olmoearth.py -q` for
 connector contracts. Tests use mocked HTTP and state; no paid predictions or Gundi events
-are created. They cover submission/reconciliation, real nested result IDs, out-of-order
-completion, filtering, date validation, paging/resumption, interrupted delivery, receipt
-validation, and repeat polygons across predictions.
+are created. They cover submission recovery by name, real nested result IDs, filtering,
+date validation, paging/resumption, interrupted delivery, acknowledgement checks, and
+repeat polygons across predictions.
 
-The Redis store and lock tests run only when `OLMOEARTH_TEST_REDIS_URL` points at a
+The real-Redis lock and monitor tests run only when `OLMOEARTH_TEST_REDIS_URL` points at a
 disposable Redis database, which they flush; otherwise they skip. For example,
 `docker run -d --rm -p 6390:6379 redis:7-alpine`, then
 `OLMOEARTH_TEST_REDIS_URL=redis://127.0.0.1:6390/15 pytest`.

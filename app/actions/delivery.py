@@ -8,16 +8,6 @@ from app.services.errors import IntegrationBadResponseError
 from app.services.gundi import get_gundi_sender
 
 
-def valid_event_receipts(receipts, expected_count: int) -> bool:
-    """Require one distinct, usable acknowledgement per event in batch order."""
-    return (
-        isinstance(receipts, list)
-        and len(receipts) == expected_count
-        and all(isinstance(value, str) and bool(value.strip()) for value in receipts)
-        and len(set(receipts)) == len(receipts)
-    )
-
-
 class GundiEventSender:
     """Posts each batch exactly once; its owner reconciles ambiguous delivery.
 
@@ -34,17 +24,14 @@ class GundiEventSender:
         if self._client is None:
             self._client = await get_gundi_sender(self.integration_id)
 
-    async def post(self, events: list[dict]) -> list:
-        """POST the batch once and return each event's object_id, in order.
-
-        Raises if the reply is not one clean acknowledgement per item; the
-        caller checks the IDs themselves with ``valid_event_receipts``.
-        """
+    async def post(self, events: list[dict]) -> None:
+        """POST the batch once; raise unless Gundi acknowledged every event."""
         response = await self._client.post_events(data=events)
-        if not isinstance(response, list) or any(
-            not isinstance(item, dict) or item.get("errors") for item in response
+        if (
+            not isinstance(response, list)
+            or len(response) != len(events)
+            or any(not isinstance(item, dict) or item.get("errors") for item in response)
         ):
             raise IntegrationBadResponseError(
                 "Gundi did not acknowledge every event; reconcile the outbox before retrying."
             )
-        return [item.get("object_id") for item in response]

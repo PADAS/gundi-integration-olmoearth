@@ -30,7 +30,6 @@
   },
   "cadence": "monthly",
   "schedule_start": "2026-10-23",
-  "imagery_lag_days": 14,
   "select_all_types": false,
   "post_change_types": [
     "mining"
@@ -39,9 +38,5 @@
   "change_date_precision": "month",
   "change_date_aggregation": "REPLACE_WITH_MODEL_AGGREGATION",
   "event_type": "olmoearth_detection",
-  "feature_page_size": 100,
-  "pages_per_poll": 5,
-  "overlap_threshold": 0.7,
-  "date_tolerance_days": 31,
   "run_on_schedule": false
 }

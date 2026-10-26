@@ -26,7 +26,7 @@ flowchart TD
     Scheduler[Gundi scheduler] --> Messages[Messaging / PubSub]
     Messages --> Runner[Our OlmoEarth action runner]
     Config --> Runner
-    Runner <--> Redis[Redis: ledger + outbox, event hash, date indexes]
+    Runner <--> Redis[Redis: one ledger value per monitor]
     Runner -->|Create and poll predictions| OE[OlmoEarth API and inference]
     OE -->|Vector polygons and properties| Runner
     Runner -->|Send filtered events| Ingest[Gundi ingestion API]
@@ -41,13 +41,13 @@ These are logical responsibilities, not a verified deployment inventory. Gundi i
 
 1. Save one Gundi integration for one area/model. Configure the OlmoEarth base URL and token, project, optional organization ownership check, model, area geometry, selected `post_change` labels and cadence.
 2. Gundi triggers Submit LCC Predictions every four hours when enabled. The runner checks whether the selected weekly/monthly/quarterly/annual slot is due. Scheduled submission defaults off.
-3. Save the job (unique name, reference time, configuration snapshot) in Redis, call `POST /api/v1/predictions` once, then save the prediction ID. A clear rejection or a connection that never sent the request releases the slot; an ambiguous failure is recovered by searching for the job's name on the next run. Use a model already configured for vectorization; there is no request-level vectorization flag.
+3. Search for the slot's unique prediction name; adopt a single match, otherwise call `POST /api/v1/predictions` once. Record the job (name, prediction ID, reference time, selected classes) only once a prediction ID is in hand, so a lost response is recovered by name on the next run and any failure leaves the slot due. Use a model already configured for vectorization; there is no request-level vectorization flag.
 4. Collect LCC Events polls `GET /api/v1/predictions/{id}`. Once complete, read the nested `result.id`.
 5. Search `POST /api/v1/prediction-results/{result_id}/features/search` with AOI and class filters. Read date properties from the returned polygons and apply any fixed `changes_since` cutoff locally.
-6. For each page, fetch only the stored events that could repeat these detections, match repeats, and stage the page's new events and repeat updates in the Redis outbox. Post the batch to Gundi once, then commit the new events, repeat updates, receipt IDs and page checkpoint in one Redis transaction.
+6. For each page, match repeats against the known events and stage the page's new events and repeat updates in the outbox. Post the batch to Gundi once; once every event is acknowledged, commit the event changes and page checkpoint in the same ledger save.
 7. Gundi routes events to EarthRanger. An ingestion receipt does not prove final destination delivery; verify that separately.
 
-The model reference time is the due slot minus an imagery lag (currently 14 days by default). Its own model configuration controls imagery lookbehind. Cadence is not the model's observation window or date precision.
+The model reference time is the due slot minus an imagery lag (14 days, `IMAGERY_LAG_DAYS`). Its own model configuration controls imagery lookbehind. Cadence is not the model's observation window or date precision.
 
 ## Change dates and repeated detections
 
@@ -57,26 +57,24 @@ The polygon comes from `post_change`; the change date is an auxiliary property o
 - `first_discovered_at`: when the connector found the detection.
 - `changes_since`: optional fixed cutoff; never advances as a polling watermark.
 
-A late-finishing prediction can therefore report an older change. Repeat matching uses class, date proximity and polygon overlap against events first seen in an earlier prediction; detections within one prediction are never merged, and a polygon split into several features in a later run counts as one repeat observation. This is a prototype heuristic, not proof that split/merged/drifting polygons are the same event. The code records repeat observations locally; updating or reversing an already delivered EarthRanger event is not implemented.
+A late-finishing prediction can therefore report an older change. Repeat matching uses class, date proximity and polygon overlap against events first seen in an earlier prediction; detections within one prediction are never merged, and a polygon split into several features in a later run counts as one repeat observation. This is a prototype heuristic, not proof that split/merged/drifting polygons are the same event. The code records repeat observations locally and reports `repeats_recorded` for each collection run; updating or reversing an already delivered EarthRanger event is not implemented.
 
 ## State and delivery
 
-Each monitor's state lives in the runner's Redis, under `integration_state.<integration>.lcc_monitor_v1.*`. Only this connector uses these keys; the Redis server and the other integrations' state are unaffected.
+Each monitor's state is one value in the runner's Redis, `integration_state.<integration>.lcc_monitor_v1.no-source`, written through the template's `IntegrationStateManager.set_state`, plus a short-lived `...lcc_monitor_v1.lock` key while a run holds the lock. Only this connector uses these keys; the Redis server and the other integrations' state are unaffected.
 
 ```mermaid
 flowchart LR
-    subgraph Redis["Redis keys for one monitor"]
-        Ledger["ledger: jobs, offsets, schedule slot, outbox"]
-        Events["events: hash of known events by external ID"]
-        Index["by_date.change_type: event IDs scored by change date"]
-        Lock["lock: one run at a time, outlives the runner timeout"]
+    subgraph Ledger["Ledger value for one monitor"]
+        Jobs["jobs: prediction, offset, status, selected classes"]
+        Known["known_events: polygon, class, date, observations"]
+        Outbox["outbox: one page's events and event changes"]
     end
-    Page[Feature page] -->|change type + date window| Index
-    Index -->|candidate IDs| Events
-    Events -->|candidates| Match[Repeat matching]
-    Match -->|new + updated events| Ledger
-    Ledger -->|after Gundi accepts: one transaction| Events
-    Ledger -->|same transaction| Index
+    Page[Feature page] --> Match[Repeat matching]
+    Known --> Match
+    Match -->|new + updated events| Outbox
+    Outbox -->|after Gundi acknowledges: same save| Known
+    Outbox -->|same save| Jobs
 ```
 
 The outbox holds one page at a time and moves through these states:
@@ -86,14 +84,14 @@ stateDiagram-v2
     [*] --> pending: page staged
     pending --> pending: Gundi client lookup fails (nothing sent)
     pending --> sending: POST to Gundi (once)
-    sending --> accepted: one distinct receipt per event
+    sending --> accepted: Gundi acknowledges every event
     sending --> sending: outcome unknown, collection pauses
     sending --> accepted: Resolve LCC Delivery, confirmed_delivered
     sending --> pending: Resolve LCC Delivery, confirmed_not_delivered
-    accepted --> [*]: events, index, receipts and offset committed together
+    accepted --> [*]: events and offset committed in one save
 ```
 
-A page with nothing to send skips straight to the commit. Partial acceptance or a lost acknowledgement requires manual reconciliation. Search is limited to the 10,000-feature window; reaching it marks the job `needs_export` without blocking later runs. A raster-only result, a changed result ID, or a malformed detection fails only that job, at the page where it happened. Redis needs durable storage/backups for live use: losing the event history means already-delivered detections are sent again.
+A page with nothing to send skips straight to the commit. Partial acceptance or a lost acknowledgement requires manual reconciliation. Search is limited to the 10,000-feature window; reaching it marks the job `needs_export` without blocking later runs. A raster-only result, a changed result ID, a malformed detection or a prediction deleted in OlmoEarth fails that job at the page where it happened, and the next scheduled submission proceeds. History stops visibly at 10,000 known events. Redis needs durable storage/backups for live use: losing the ledger means already-delivered detections are sent again.
 
 ## Reusable areas — agreed next step, not implemented
 
@@ -122,16 +120,15 @@ Do not put real secrets in notes or committed examples. An EarthRanger admin log
 | `handlers.py` | Gundi action wiring |
 | `client.py` | OlmoEarth HTTP calls and API schemas |
 | `monitor.py` | Submission, polling, pagination and recovery |
-| `monitor_state.py` | Ledger models (jobs, outbox, known events) and monitor identity |
-| `monitor_store.py` | Redis ledger, event hash and per-type date indexes; atomic page commit |
-| `delivery.py` | One-shot Gundi posting and receipt validation |
+| `monitor_state.py` | Ledger models (jobs, known events, outbox) and monitor identity |
+| `delivery.py` | One-shot Gundi posting and acknowledgement check |
 | `change_events.py` | Dates, polygon matching and event payloads |
 | Shared `routers/actions.py` | Runner HTTP action endpoints |
 | Shared services | Gundi authentication/configuration, Redis and ingestion |
 
-Changes to the shared runner code (`app/services`, from the upstream action-runner template) are kept small and general: `IntegrationStateManager.key()` and `.lock()`, and `gundi.get_gundi_sender()` (a retried client lookup). Existing key names and send helpers are unchanged.
+Changes to the shared runner code (`app/services`, from the upstream action-runner template) are two additions: `IntegrationStateManager.lock()` and `gundi.get_gundi_sender()` (a retried client lookup). Existing state keys and send helpers are unchanged.
 
-The implementation is on `olmoearth-integration` in PR #2, based on the fork's `main` (the fork has no `develop`). The latest revision passes 436 local tests, including Redis store, lock and end-to-end monitor tests against a disposable Redis (`OLMOEARTH_TEST_REDIS_URL`); without it those 3 skip. This proves mocked contracts/workflows, not a live end-to-end deployment. No live prediction or event has been sent in this work. Studio PR #3226 and a new cross-result/events API are not prerequisites.
+The implementation is on `olmoearth-integration` in PR #2, based on the fork's `main` (the fork has no `develop`). The latest revision passes 427 local tests, including lock and end-to-end monitor tests against a disposable Redis (`OLMOEARTH_TEST_REDIS_URL`); without it those 2 skip. This proves mocked contracts/workflows, not a live end-to-end deployment. No live prediction or event has been sent in this work. Studio PR #3226 and a new cross-result/events API are not prerequisites.
 
 ## Pilot completion criteria
 

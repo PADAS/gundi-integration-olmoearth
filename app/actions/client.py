@@ -1,8 +1,11 @@
-"""Typed client for the prediction and per-result feature APIs on Studio develop."""
+"""Typed client for the OlmoEarth prediction and per-result feature APIs (Studio develop).
+
+Only the request filters and response fields the monitor uses are modelled; the
+API accepts and returns more.
+"""
 
 import json
 import logging
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -14,7 +17,6 @@ from app.services.errors import (
     IntegrationBadResponseError,
     IntegrationConfigurationError,
     IntegrationConnectionError,
-    IntegrationError,
     IntegrationRateLimitError,
     source_status_code,
 )
@@ -22,12 +24,6 @@ from app.services.errors import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
-
-# The provider's feature page defaults to 50 if the caller says nothing, which
-# is small enough to turn one poll into hundreds of round trips. Always send a
-# size; these are what we send when the config does not override them.
-DEFAULT_FEATURE_PAGE_SIZE = 500
-DEFAULT_PREDICTION_PAGE_SIZE = 100
 
 
 class _Filter(pydantic.BaseModel):
@@ -38,72 +34,26 @@ class _Filter(pydantic.BaseModel):
 
 
 class KeywordFilter(_Filter):
-    """Exact-match filter over an identifier-like field."""
-
     eq: Optional[str] = None
-    neq: Optional[str] = None
     inc: Optional[List[str]] = None
-    ninc: Optional[List[str]] = None
-    exists: Optional[bool] = None
 
 
 class StringFilter(_Filter):
-    """Keyword operators plus SQL-style `like` matching."""
-
     eq: Optional[str] = None
-    neq: Optional[str] = None
-    inc: Optional[List[str]] = None
-    ninc: Optional[List[str]] = None
-    like: Optional[str] = None
-    nlike: Optional[str] = None
-
-
-class NumericFilter(_Filter):
-    eq: Optional[float] = None
-    neq: Optional[float] = None
-    gte: Optional[float] = None
-    gt: Optional[float] = None
-    lte: Optional[float] = None
-    lt: Optional[float] = None
-
-
-class DatetimeFilter(_Filter):
-    gte: Optional[datetime] = None
-    gt: Optional[datetime] = None
-    lte: Optional[datetime] = None
-    lt: Optional[datetime] = None
-    exists: Optional[bool] = None
 
 
 class PropertyFilter(pydantic.BaseModel):
-    """A filter on one arbitrary feature property.
-
-    The model that produced the features decides what properties exist, so
-    these are the escape hatch for model-specific thresholds — the common case
-    being a confidence score: ``{"property_name": "confidence",
-    "numeric_filter": {"gte": 0.8}}``.
-    """
+    """A filter on one model-authored feature property."""
 
     property_name: str
-    keyword_filter: Optional[KeywordFilter] = None
-    string_filter: Optional[StringFilter] = None
-    numeric_filter: Optional[NumericFilter] = None
-    datetime_filter: Optional[DatetimeFilter] = None
+    keyword_filter: KeywordFilter
 
 
 class Geometry(pydantic.BaseModel):
-    """A GeoJSON geometry, kept loose on purpose.
-
-    `coordinates` is nested to a depth that depends on `type`, so it is typed
-    as Any rather than reproducing the GeoJSON grammar. Anything we send came
-    from an operator's AOI; anything we receive came from the API.
-    """
+    """A GeoJSON geometry, kept loose: ``coordinates`` nests by ``type``."""
 
     type: str
     coordinates: Any = None
-    bbox: Optional[List[float]] = None
-    # A GeometryCollection carries `geometries` instead of `coordinates`.
-    geometries: Optional[List[Dict[str, Any]]] = None
 
     class Config:
         extra = "allow"
@@ -117,43 +67,25 @@ class _SearchRequest(pydantic.BaseModel):
         extra = "forbid"
 
     def as_body(self) -> dict:
-        """The request body with every unset operator dropped.
-
-        Goes through ``json()`` rather than ``dict()`` so datetimes are ISO
-        strings and the body is JSON-serializable as-is.
-        """
+        """The request body with every unset field dropped, JSON-serializable as-is."""
         return json.loads(self.json(exclude_none=True))
 
 
 class PredictionSearchRequest(_SearchRequest):
-    sort_by: str = "creation_time"
-    sort_direction: str = "desc"
-    limit: int = DEFAULT_PREDICTION_PAGE_SIZE
-    offset: int = 0
-    id: Optional[KeywordFilter] = None
-    organization_id: Optional[KeywordFilter] = None
+    limit: int = 100
     project_id: Optional[KeywordFilter] = None
     model_id: Optional[KeywordFilter] = None
-    requester_id: Optional[KeywordFilter] = None
     name: Optional[StringFilter] = None
-    status: Optional[KeywordFilter] = None
-    workflow_type: Optional[KeywordFilter] = None
-    creation_time: Optional[DatetimeFilter] = None
-    deleted_time: Optional[DatetimeFilter] = None
 
 
 class FeatureSearchRequest(_SearchRequest):
-    limit: int = DEFAULT_FEATURE_PAGE_SIZE
+    # The API defaults to 50 per page; always send a size.
+    limit: int
     offset: int = 0
     sort_by: str = "oe_created_at"
     sort_direction: str = "asc"
-    id: Optional[KeywordFilter] = None
     intersects_geometry: Optional[Geometry] = None
-    oe_prediction_result_file_id: Optional[KeywordFilter] = None
-    oe_start_time: Optional[DatetimeFilter] = None
-    oe_end_time: Optional[DatetimeFilter] = None
-    oe_created_at: Optional[DatetimeFilter] = None
-    property_filters: Optional[List[PropertyFilter]] = None
+    property_filters: List[PropertyFilter] = pydantic.Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -166,9 +98,11 @@ class SearchMeta(pydantic.BaseModel):
         extra = "allow"
 
 
-class ApiError(pydantic.BaseModel):
-    code: Optional[str] = None
-    message: Optional[str] = None
+class _Records(pydantic.BaseModel):
+    """The ``records``/``errors`` envelope every endpoint returns."""
+
+    meta: SearchMeta = pydantic.Field(default_factory=SearchMeta)
+    errors: List[Any] = pydantic.Field(default_factory=list)
 
     class Config:
         extra = "allow"
@@ -180,23 +114,18 @@ class PredictionResult(pydantic.BaseModel):
 
 
 class Prediction(pydantic.BaseModel):
-    """One prediction run, as the dropdown and the auth check see it."""
-
     id: str
     name: Optional[str] = None
     status: Optional[str] = None
-    model_id: Optional[str] = None
-    project_id: Optional[str] = None
-    organization_id: Optional[str] = None
-    requester_id: Optional[str] = None
-    workflow_type: Optional[str] = None
-    creation_time: Optional[datetime] = None
-    deleted_time: Optional[datetime] = None
     result: Optional[PredictionResult] = None
     error_message: Optional[str] = None
 
     class Config:
         extra = "allow"
+
+
+class PredictionSearchResponse(_Records):
+    records: List[Prediction] = pydantic.Field(default_factory=list)
 
 
 class Project(pydantic.BaseModel):
@@ -207,34 +136,20 @@ class Project(pydantic.BaseModel):
         extra = "allow"
 
 
-class ProjectResponse(pydantic.BaseModel):
+class ProjectResponse(_Records):
     records: List[Project] = pydantic.Field(default_factory=list)
-    errors: List[ApiError] = pydantic.Field(default_factory=list)
-
-    class Config:
-        extra = "allow"
 
 
 class FeatureProperties(pydantic.BaseModel):
-    """The `oe_`-prefixed properties every feature carries, plus the model's own.
+    """The ``oe_`` system properties every feature carries, plus the model's own."""
 
-    The model-authored properties are the point of the record and vary per
-    model, so they arrive as extras and are read back with `model_properties()`.
-    """
-
-    oe_start_time: Optional[datetime] = None
-    oe_end_time: Optional[datetime] = None
-    oe_created_at: Optional[datetime] = None
     oe_prediction_result_id: Optional[str] = None
-    oe_prediction_result_file_id: Optional[str] = None
 
     class Config:
         extra = "allow"
 
     def model_properties(self) -> Dict[str, Any]:
-        """Everything the model itself put on the feature, without the `oe_`
-        system fields — those are provenance, and the handler reports them
-        separately rather than burying them among the model's own outputs."""
+        """Everything the model put on the feature, without the ``oe_`` provenance fields."""
         return {
             name: value
             for name, value in self.dict(exclude_none=True).items()
@@ -243,51 +158,27 @@ class FeatureProperties(pydantic.BaseModel):
 
 
 class Feature(pydantic.BaseModel):
-    """A GeoJSON Feature as returned by the features search.
+    """A GeoJSON Feature from the features search.
 
-    `id` is normalized to a string: the documented response returns an integer
-    (`"id": 1`) while the documented request filters the same field as a
-    keyword (`{"eq": ""}`). Picking one here means a feature's identity does not
-    change type depending on which end of the API it came from — which matters,
-    because it ends up in the event's provenance identity and in the state
-    row that stops a detection being ingested twice.
+    ``id`` is normalized to a string: the API returns integers here but filters
+    the same field as a keyword, and the ID feeds each event's stable identity.
     """
 
     id: Optional[str] = None
-    type: str = "Feature"
     geometry: Optional[Geometry] = None
-    bbox: Optional[List[float]] = None
     properties: FeatureProperties = pydantic.Field(default_factory=FeatureProperties)
 
     class Config:
         extra = "allow"
 
 
-class PredictionSearchResponse(pydantic.BaseModel):
-    records: List[Prediction] = pydantic.Field(default_factory=list)
-    meta: SearchMeta = pydantic.Field(default_factory=SearchMeta)
-    errors: List[ApiError] = pydantic.Field(default_factory=list)
-
-    class Config:
-        extra = "allow"
-
-
-class FeatureSearchResponse(pydantic.BaseModel):
+class FeatureSearchResponse(_Records):
     records: List[Feature] = pydantic.Field(default_factory=list)
-    meta: SearchMeta = pydantic.Field(default_factory=SearchMeta)
-    errors: List[ApiError] = pydantic.Field(default_factory=list)
-
-    class Config:
-        extra = "allow"
 
 
 # --------------------------------------------------------------------------
 # Client
 # --------------------------------------------------------------------------
-class RequestNotSentError(IntegrationConnectionError):
-    """The connection failed before the request left, so the server saw nothing."""
-
-
 class OlmoEarthClient:
     """Async transport for prediction lifecycle and feature searches.
 
@@ -354,10 +245,6 @@ class OlmoEarthClient:
                     response.raise_for_status()
                 except httpx.HTTPStatusError as e:
                     raise _classify_status_error(e) from e
-                except (httpx.ConnectError, httpx.ConnectTimeout) as e:
-                    raise RequestNotSentError(
-                        f"Could not connect to the OlmoEarth API at {self.base_url}: {e}"
-                    ) from e
                 except httpx.HTTPError as e:
                     raise IntegrationConnectionError(
                         f"Could not reach the OlmoEarth API at {self.base_url}: {e}"
@@ -398,7 +285,8 @@ class OlmoEarthClient:
 
     async def create_prediction(self, body: dict) -> Prediction:
         path = "/api/v1/predictions"
-        # Studio has no idempotency key: an ambiguous POST must be reconciled, never retried.
+        # Studio has no idempotency key: never retry the POST. The monitor looks the
+        # prediction up by its unique name before posting again.
         return self._one(
             PredictionSearchResponse,
             await self._request("POST", path, body, attempts=1),
@@ -435,21 +323,6 @@ class OlmoEarthClient:
         """
         response = await self.search_predictions(PredictionSearchRequest(limit=1))
         return response.meta.total
-
-
-# Statuses with which the API rejects a create before creating anything.
-_REJECTED_BEFORE_CREATE = frozenset({400, 401, 403, 404, 422, 429})
-
-
-def definitely_not_created(exc: BaseException) -> bool:
-    """Whether a failed create certainly left nothing behind, so it may be retried.
-
-    Timeouts, 5xx and malformed success replies are ambiguous and return False.
-    """
-    return isinstance(exc, RequestNotSentError) or (
-        isinstance(exc, IntegrationError)
-        and exc.status_code in _REJECTED_BEFORE_CREATE
-    )
 
 
 def _is_transient(exc: BaseException) -> bool:

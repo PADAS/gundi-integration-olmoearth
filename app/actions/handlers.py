@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from app import settings
-from app.actions.core import ReferenceDataResponse, ReferenceOption, action_title
+from app.actions.core import action_title
 from app.services.action_scheduler import crontab_schedule
 from app.services.activity_logger import activity_logger
 from app.services.errors import IntegrationConfigurationError
@@ -14,7 +14,6 @@ from app.services.utils import find_config_for_action
 from . import client
 from .configurations import (
     AuthenticateConfig,
-    ListPredictionsConfig,
     PullEventsConfig,
     ResolveDeliveryConfig,
     SubmitPredictionsConfig,
@@ -22,7 +21,6 @@ from .configurations import (
 from .delivery import GundiEventSender
 from .monitor import Monitor
 from .monitor_state import STATE_ACTION
-from .monitor_store import RedisMonitorStore
 
 state_manager = IntegrationStateManager()
 # The runner cancels every action after MAX_ACTION_EXECUTION_TIME; the margin lets a
@@ -63,30 +61,6 @@ async def action_auth(integration, action_config: AuthenticateConfig) -> dict:
     return {"valid_credentials": True, "predictions_visible": total}
 
 
-@action_title("List Predictions")
-async def action_list_predictions(
-    integration, action_config: ListPredictionsConfig
-) -> dict:
-    query = client.PredictionSearchRequest(
-        project_id=client.KeywordFilter(eq=str(action_config.project_id)),
-        limit=action_config.limit,
-    )
-    if action_config.model_id:
-        query.model_id = client.KeywordFilter(eq=str(action_config.model_id))
-    async with client_for(integration) as api:
-        response = await api.search_predictions(query)
-    return ReferenceDataResponse(
-        options=[
-            ReferenceOption(
-                value=p.id, label=p.name or p.id, description=p.status, group=p.model_id
-            )
-            for p in response.records
-        ],
-        truncated=response.meta.total is not None
-        and response.meta.total > len(response.records),
-    ).dict()
-
-
 async def run_monitor(
     integration,
     config: PullEventsConfig,
@@ -103,7 +77,7 @@ async def run_monitor(
                 integration_id,
                 config,
                 api,
-                RedisMonitorStore(state_manager, integration_id),
+                state_manager,
                 GundiEventSender(integration_id),
                 datetime.now(timezone.utc),
             )

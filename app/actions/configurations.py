@@ -16,7 +16,6 @@ from .core import (
     ExecutableActionMixin,
     GenericActionConfiguration,
     PullActionConfiguration,
-    ReferenceActionConfiguration,
 )
 
 
@@ -102,12 +101,6 @@ class PullEventsConfig(PullActionConfiguration):
         title="First prediction date (UTC)",
         description="Missed schedule slots are processed oldest first.",
     )
-    imagery_lag_days: int = pydantic.Field(
-        14,
-        ge=0,
-        le=365,
-        description="Reference date precedes each schedule slot by this many days; verify for the chosen model.",
-    )
     select_all_types: bool = FieldWithUIOptions(True, title="Select all change types")
     post_change_types: List[PostChange] = FieldWithUIOptions(
         default_factory=list,
@@ -121,25 +114,15 @@ class PullEventsConfig(PullActionConfiguration):
         description="Verified polygon property containing an ISO date, not a timestep index or encoded month count.",
     )
     change_date_precision: str = pydantic.Field("month", regex="^(day|month)$")
-    change_date_aggregation: str = pydantic.Field(
-        ...,
-        min_length=1,
-        description="Document the model's reduction, e.g. percentile_10. This does not change the model config.",
+    change_date_aggregation: Optional[str] = pydantic.Field(
+        None,
+        description="Optional note of the model's date reduction (e.g. percentile_10), copied into each event. It does not change the model.",
     )
     changes_since: Optional[date] = pydantic.Field(
         None,
         description="Optional fixed event-date cutoff. Never advanced as an ingestion watermark.",
     )
     event_type: str = pydantic.Field("olmoearth_detection", min_length=1)
-    feature_page_size: int = pydantic.Field(100, ge=1, le=1000)
-    pages_per_poll: int = pydantic.Field(5, ge=1, le=20)
-    overlap_threshold: float = pydantic.Field(
-        0.7,
-        gt=0,
-        le=1,
-        description="Minimum polygon intersection-over-union for a repeat detection across runs.",
-    )
-    date_tolerance_days: int = pydantic.Field(31, ge=0, le=365)
 
     _valid_area = pydantic.validator("area_of_interest", allow_reuse=True)(
         polygon_geometry
@@ -165,16 +148,9 @@ class SubmitPredictionsConfig(PullActionConfiguration):
     )
 
 
-class ListPredictionsConfig(ReferenceActionConfiguration):
-    project_id: UUID
-    model_id: Optional[UUID] = None
-    limit: int = pydantic.Field(100, ge=1, le=1000)
-
-
 class ResolveDeliveryConfig(GenericActionConfiguration, ExecutableActionMixin):
     batch_id: UUID
-    outcome: Literal["confirmed_delivered", "confirmed_not_delivered"]
-    gundi_object_ids: List[str] = pydantic.Field(
-        default_factory=list,
-        description="For confirmed delivery, the Gundi object IDs in outbox event order. Confirm the entire batch before resolving.",
+    outcome: Literal["confirmed_delivered", "confirmed_not_delivered"] = pydantic.Field(
+        ...,
+        description="Check Gundi for the whole batch first. Partial delivery must be reconciled by hand before choosing either.",
     )
