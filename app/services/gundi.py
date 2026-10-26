@@ -22,7 +22,7 @@ from app import settings  # noqa: F401
 from gundi_client_v2.client import GundiClient, GundiDataSenderClient
 
 from .activity_logger import ephemeral_run
-from .errors import IntegrationBadResponseError
+from .errors import IntegrationBadResponseError, IntegrationConnectionError
 from .retry_policies import is_transient_gundi_error
 
 
@@ -95,13 +95,6 @@ async def _get_sensors_api_client(integration_id):
     return sensors_api_client
 
 
-async def _post_events(events: List[dict], integration_id) -> list:
-    """One undecorated POST; callers choose whether to wrap it in a retry."""
-    _block_if_ephemeral("send_events_to_gundi")
-    sensors_api_client = await _get_sensors_api_client(integration_id=str(integration_id))
-    return await sensors_api_client.post_events(data=events)
-
-
 @stamina.retry(**GUNDI_API_RETRY)
 async def send_events_to_gundi(events: List[dict], **kwargs) -> dict:
     """
@@ -125,9 +118,11 @@ async def send_events_to_gundi(events: List[dict], **kwargs) -> dict:
     :param kwargs: integration_id: The UUID of the related integration
     :return: A dict with the response from the API
     """
+    _block_if_ephemeral("send_events_to_gundi")
     integration_id = kwargs.get("integration_id")
     assert integration_id, "integration_id is required"
-    return await _post_events(events, integration_id)
+    sensors_api_client = await _get_sensors_api_client(integration_id=str(integration_id))
+    return await sensors_api_client.post_events(data=events)
 
 
 @stamina.retry(**GUNDI_API_RETRY)
@@ -229,9 +224,26 @@ def valid_event_receipts(receipts, expected_count: int) -> bool:
     )
 
 
+class EventsNotSentError(IntegrationConnectionError):
+    """Failed before any event was posted, so the batch can safely be sent again."""
+
+
 async def send_events_once_to_gundi(events: List[dict], integration_id: str) -> list[str]:
-    """Submit an outbox batch once; its owner reconciles ambiguous delivery instead of retrying."""
-    response = await _post_events(events, integration_id)
+    """Submit an outbox batch once; its owner reconciles ambiguous delivery instead of retrying.
+
+    Only the POST is one-shot. Fetching the integration's API key is idempotent, so it
+    keeps the usual retry policy, and a failure there raises EventsNotSentError.
+    """
+    _block_if_ephemeral("send_events_once_to_gundi")
+    try:
+        sender = await stamina.retry(**GUNDI_API_RETRY)(_get_sensors_api_client)(
+            integration_id=str(integration_id)
+        )
+    except Exception as exc:
+        raise EventsNotSentError(
+            f"Could not prepare the Gundi sender; no events were sent: {exc}"
+        ) from exc
+    response = await sender.post_events(data=events)
     if not isinstance(response, list) or any(
         not isinstance(item, dict) or item.get("errors") for item in response
     ):

@@ -7,6 +7,7 @@ from uuid import UUID
 
 import pydantic
 from shapely.geometry import shape
+from shapely.geometry.base import BaseGeometry
 
 from app.services.utils import FieldWithUIOptions, UIOptions
 
@@ -49,6 +50,12 @@ class PostChange(str, Enum):
 
 
 def polygon_geometry(value: dict) -> dict:
+    polygon_shape(value)
+    return value
+
+
+def polygon_shape(value: dict) -> BaseGeometry:
+    """The shapely geometry for a regional, valid WGS84 (Multi)Polygon."""
     try:
         geom = shape(value)
         if (
@@ -67,7 +74,7 @@ def polygon_geometry(value: dict) -> dict:
             )
     except (KeyError, TypeError, AttributeError) as exc:
         raise ValueError("Expected a GeoJSON Polygon or MultiPolygon geometry") from exc
-    return value
+    return geom
 
 
 class PullEventsConfig(PullActionConfiguration):

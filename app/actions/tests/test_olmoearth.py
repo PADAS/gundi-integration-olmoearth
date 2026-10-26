@@ -414,6 +414,8 @@ async def test_invalid_event_does_not_advance_or_drop_a_page(config, api, store)
     with pytest.raises(IntegrationBadResponseError):
         await monitor.collect()
     assert store.value["jobs"][0]["offset"] == 0
+    assert store.value["jobs"][0]["status"] == "failed"
+    assert "offset 0" in store.value["jobs"][0]["error"]
     monitor.send.assert_not_called()
 
 
@@ -721,3 +723,165 @@ async def test_submission_http_rejection_vs_ambiguous_failure(
     assert len(calls) == 1
     assert store.value["next_slot"] == (0 if retryable_slot else 1)
     assert bool(store.value["jobs"]) is not retryable_slot
+
+
+def two_jobs(config):
+    return [
+        Job(
+            name=pid,
+            request={"start_time": "2026-10-01T00:00:00Z"},
+            config=config,
+            prediction_id=pid,
+            status="pending",
+        )
+        for pid in ["bad", "good"]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_invalid_feature_fails_only_its_own_job(config, api, store):
+    config.pages_per_poll = 2
+    monitor = await seed(config, api, store, two_jobs(config))
+    api.get_prediction.side_effect = [prediction("bad", result_id="rb"), prediction("good")]
+    api.search_features.side_effect = [page([feature(changed=145)]), page([feature()])]
+    with pytest.raises(IntegrationBadResponseError):
+        await make_monitor(config, api, store).collect()
+    assert [j["status"] for j in store.value["jobs"]] == ["failed", "complete"]
+    assert len(store.value["known_events"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_raster_only_result_does_not_block_other_jobs(config, api, store):
+    await seed(config, api, store, two_jobs(config))
+    api.get_prediction.side_effect = [prediction(formats=["png"]), prediction("good")]
+    api.search_features.return_value = page([feature()])
+    with pytest.raises(IntegrationConfigurationError, match="vector"):
+        await make_monitor(config, api, store).collect()
+    assert [j["status"] for j in store.value["jobs"]] == ["failed", "complete"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["needs_export", "failed"])
+async def test_stopped_job_does_not_block_next_submission(config, api, store, status):
+    monitor = await seed(config, api, store)
+    monitor.state.jobs[0].status = status
+    monitor.state.next_slot = 1
+    await monitor.save()
+    result = await make_monitor(config, api, store).submit()
+    assert result["submitted_prediction_id"] == "p1"
+
+
+@pytest.mark.asyncio
+async def test_connection_failure_before_sending_releases_slot(config, api, store):
+    api.create_prediction.side_effect = client.RequestNotSentError("refused")
+    with pytest.raises(IntegrationConnectionError):
+        await make_monitor(config, api, store).submit()
+    assert store.value["jobs"] == [] and store.value["next_slot"] == 0
+
+
+@pytest.mark.asyncio
+async def test_unfound_submission_is_released_after_grace(config, api, store):
+    api.create_prediction.side_effect = IntegrationConnectionError("timeout")
+    with pytest.raises(IntegrationConnectionError):
+        await make_monitor(config, api, store).submit()
+    api.search_predictions.return_value = client.PredictionSearchResponse(records=[])
+    later = NOW + dt.timedelta(hours=2)
+    result = await make_monitor(config, api, store, now=later).submit()
+    assert result["status"] == "unsent_submission_released"
+    assert store.value["jobs"] == [] and store.value["next_slot"] == 0
+    api.create_prediction.side_effect = None
+    await make_monitor(config, api, store, now=later).submit()
+    assert store.value["jobs"][0]["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_submissions_are_never_released(config, api, store):
+    api.create_prediction.side_effect = IntegrationConnectionError("timeout")
+    with pytest.raises(IntegrationConnectionError):
+        await make_monitor(config, api, store).submit()
+    api.search_predictions.return_value = client.PredictionSearchResponse(
+        records=[prediction("a"), prediction("b")], meta=client.SearchMeta(total=2)
+    )
+    later = NOW + dt.timedelta(hours=2)
+    with pytest.raises(IntegrationConfigurationError, match="unknown outcome"):
+        await make_monitor(config, api, store, now=later).submit()
+    assert store.value["jobs"][0]["status"] == "submitting"
+
+
+@pytest.mark.asyncio
+async def test_sender_setup_failure_leaves_outbox_resendable(config, api, store):
+    from app.services.gundi import EventsNotSentError
+
+    monitor = await seed(config, api, store)
+    api.search_features.return_value = page([feature()])
+    monitor.send.side_effect = EventsNotSentError("portal down")
+    with pytest.raises(EventsNotSentError):
+        await monitor.collect()
+    assert store.value["outbox"]["delivery_status"] == "pending"
+    monitor.send.side_effect = None
+    monitor.send.return_value = ["gundi-receipt-1"]
+    assert (await monitor.collect())["events_sent"] == 1
+
+
+@pytest.mark.asyncio
+async def test_gundi_key_failure_is_reported_as_not_sent(mocker):
+    from app.services.gundi import EventsNotSentError, send_events_once_to_gundi
+
+    mocker.patch(
+        "app.services.gundi._get_sensors_api_client",
+        AsyncMock(side_effect=AssertionError("no key")),
+    )
+    with pytest.raises(EventsNotSentError):
+        await send_events_once_to_gundi([{"title": "test"}], "integration-1")
+
+
+@pytest.mark.asyncio
+async def test_polygon_split_in_later_run_is_one_repeat(config, api, store):
+    monitor = await seed(config, api, store)
+    api.search_features.return_value = page([feature()])
+    await monitor.collect()
+    monitor.state.jobs.append(
+        Job(
+            name="second",
+            request={"start_time": "2026-10-08T00:00:00Z"},
+            config=config,
+            prediction_id="p2",
+            status="pending",
+        )
+    )
+    await monitor.save()
+    api.get_prediction.return_value = prediction("p2", result_id="r2")
+    api.search_features.return_value = page([feature("part-a"), feature("part-b")])
+    result = await monitor.collect()
+    assert result["events_sent"] == 0
+    assert store.value["known_events"][0]["observations"] == 2
+
+
+def test_known_events_saved_before_first_prediction_id_still_load():
+    from app.actions.monitor_state import KnownEvent
+
+    event = KnownEvent.parse_obj(
+        {
+            "external_id": "e",
+            "geometry": AREA,
+            "change_type": "mining",
+            "change_date": "2026-09-10",
+            "first_seen_at": NOW,
+            "last_seen_at": NOW,
+            "last_prediction_id": "p1",
+        }
+    )
+    assert event.first_prediction_id == "p1"
+
+
+@pytest.mark.asyncio
+async def test_project_organization_parses_typed_response():
+    def route(request):
+        return httpx.Response(
+            200, json={"records": [{"id": PROJECT, "organization_id": ORG}]}
+        )
+
+    async with client.OlmoEarthClient(
+        "https://example.test", "token", transport=httpx.MockTransport(route)
+    ) as http:
+        assert await http.project_organization(PROJECT) == ORG

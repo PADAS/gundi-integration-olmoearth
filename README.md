@@ -99,13 +99,17 @@ tracked. An action lock and shorter execution timeout prevent the two schedules 
 writing this state concurrently.
 
 Before submission the connector saves its exact request and unique name. Explicit
-400/401/403/404/422/429 rejections preserve the schedule slot for the next attempt;
-timeouts, server errors and malformed success responses remain ambiguous. It never retries
-an ambiguous creation POST. The next submission action searches that name within the
-project/model and recovers a single matching ID. Zero or multiple matches require an
-operator to reconcile the saved job; they never cause an automatic second POST.
+400/401/403/404/422/429 rejections, and connections that fail before the request is sent,
+preserve the schedule slot for the next attempt; timeouts, server errors and malformed
+success responses remain ambiguous. It never retries an ambiguous creation POST. The next
+submission action searches that name within the project/model and recovers a single
+matching ID. If no prediction with that name has appeared an hour after submission, the
+slot is released and submitted again on the next run. Multiple matches require an
+operator to delete the duplicates; they never cause an automatic second POST.
 
-A page's payload is stored before delivery. The Gundi POST is attempted once. A successful
+A page's payload is stored before delivery. The Gundi POST is attempted once; fetching the
+integration's Gundi key beforehand is retried, and if it still fails the batch stays
+`pending` and is sent on the next collection. A successful
 acknowledgement saves every returned object ID before committing the page offset. If the
 outcome is unknown, the outbox stays `sending` and subsequent collection pauses rather
 than potentially creating duplicates. **Resolve LCC Delivery** requires the exact batch ID:
@@ -118,9 +122,11 @@ than potentially creating duplicates. **Resolve LCC Delivery** requires the exac
   wholly undelivered. There is no claim of automatic exactly-once delivery.
 
 The page budget pauses with a saved offset. Reaching Elasticsearch's 10,000-feature window
-marks the job `needs_export` and blocks new submissions; it is never reported complete.
-Use a smaller AOI for the prototype. Empty vector results complete normally; raster-only
-results and malformed dates fail visibly. Upstream vectorization can itself remove/cap
+marks the job `needs_export`; it is never reported complete, but later scheduled runs
+continue. Use a smaller AOI for the prototype. Empty vector results complete normally.
+A raster-only result, a changed result ID, or a detection with an invalid polygon or
+malformed date marks only that job `failed` at the offending page (no detection is
+skipped silently); the run reports the error after the other jobs are collected. Upstream vectorization can itself remove/cap
 polygons: use an uncapped model and inspect its sieve/simplification settings for the pilot.
 
 History is bounded at 1,000 jobs and 10,000 known events and stops visibly at those limits.

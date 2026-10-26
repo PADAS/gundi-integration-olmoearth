@@ -2,13 +2,33 @@
 
 import hashlib
 from datetime import date, datetime
+from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, root_validator
 
 from .configurations import PullEventsConfig
 
 STATE_ACTION = "lcc_monitor_v1"
+
+
+class JobStatus(str, Enum):
+    SUBMITTING = "submitting"  # POST sent or about to be; outcome unknown
+    PENDING = "pending"
+    COLLECTING = "collecting"
+    COMPLETE = "complete"
+    FAILED = "failed"
+    NEEDS_EXPORT = "needs_export"
+
+
+# Jobs that still have work to do; a new submission waits for these.
+ACTIVE_JOB_STATUSES = frozenset({JobStatus.PENDING, JobStatus.COLLECTING})
+
+
+class DeliveryStatus(str, Enum):
+    PENDING = "pending"
+    SENDING = "sending"  # POST may have reached Gundi; never resent automatically
+    ACCEPTED = "accepted"
 
 
 class Job(BaseModel):
@@ -17,7 +37,8 @@ class Job(BaseModel):
     config: PullEventsConfig
     prediction_id: Optional[str] = None
     result_id: Optional[str] = None
-    status: str = "submitting"
+    status: JobStatus = JobStatus.SUBMITTING
+    submitted_at: Optional[datetime] = None
     offset: int = 0
     error: Optional[str] = None
 
@@ -29,14 +50,21 @@ class KnownEvent(BaseModel):
     change_date: date
     first_seen_at: datetime
     last_seen_at: datetime
+    first_prediction_id: str
     last_prediction_id: str
     observations: int = 1
     gundi_object_id: Optional[str] = None
 
+    @root_validator(pre=True)
+    def default_first_prediction(cls, values):
+        # Records saved before first_prediction_id existed.
+        values.setdefault("first_prediction_id", values.get("last_prediction_id"))
+        return values
+
 
 class Outbox(BaseModel):
     batch_id: str
-    delivery_status: str = "pending"
+    delivery_status: DeliveryStatus = DeliveryStatus.PENDING
     receipts: list[str] = Field(default_factory=list)
     job_name: str
     events: list[dict]

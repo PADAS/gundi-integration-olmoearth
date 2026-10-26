@@ -5,6 +5,7 @@ from typing import Optional
 from uuid import NAMESPACE_URL, uuid5
 
 from shapely.geometry import shape
+from shapely.geometry.base import BaseGeometry
 
 from app.services.errors import (
     IntegrationBadResponseError,
@@ -12,15 +13,19 @@ from app.services.errors import (
 )
 
 from .client import Feature
-from .configurations import polygon_geometry
+from .configurations import polygon_shape
 from .monitor_state import Job, KnownEvent
 
 MAX_EVENTS = 10000
 
 
+class InvalidFeatureError(IntegrationBadResponseError):
+    """A detection in a result is unusable; retrying the same page cannot fix it."""
+
+
 def parse_change_date(value) -> date:
     if not isinstance(value, str):
-        raise IntegrationBadResponseError(
+        raise InvalidFeatureError(
             "LCC change date must be an ISO date string; encoded months and timestep indices are unsupported."
         )
     try:
@@ -31,7 +36,7 @@ def parse_change_date(value) -> date:
             raise ValueError("Missing timezone")
         return stamp.astimezone(timezone.utc).date()
     except ValueError as exc:
-        raise IntegrationBadResponseError(
+        raise InvalidFeatureError(
             "LCC change date is missing or is not an ISO date/time."
         ) from exc
 
@@ -40,26 +45,21 @@ def prepare_event(
     feature: Feature,
     job: Job,
     known: list[KnownEvent],
+    shapes: dict[str, BaseGeometry],
     *,
     integration_id: str,
     now: datetime,
 ) -> Optional[dict]:
     """Build a new event or record a repeat in the caller's staged history.
 
-    Mutates only ``known``, the page-local copy committed with the delivery outbox.
+    Mutates only ``known``, the page-local copy committed with the delivery outbox,
+    and ``shapes``, a cache of known-event geometries keyed by external ID.
     This function performs no persistence or network operations.
     """
     if feature.id is None or feature.geometry is None:
-        raise IntegrationBadResponseError(
-            "A detection has no stable feature ID or polygon geometry."
+        raise InvalidFeatureError(
+            f"Detection {feature.id} has no stable feature ID or polygon geometry."
         )
-    geometry = feature.geometry.dict(exclude_none=True)
-    try:
-        polygon_geometry(geometry)
-    except ValueError as exc:
-        raise IntegrationBadResponseError(
-            "Detection geometry is not a valid regional polygon."
-        ) from exc
     props = feature.properties.model_properties()
     change_type = props.get("post_change")
     if change_type not in job.config.selected_types:
@@ -67,7 +67,13 @@ def prepare_event(
     changed = parse_change_date(props.get(job.config.change_date_property))
     if job.config.changes_since and changed < job.config.changes_since:
         return None
-    geom = shape(geometry)
+    geometry = feature.geometry.dict(exclude_none=True)
+    try:
+        geom = polygon_shape(geometry)
+    except ValueError as exc:
+        raise InvalidFeatureError(
+            f"Detection {feature.id} geometry is not a valid regional polygon."
+        ) from exc
     external_id = str(
         uuid5(NAMESPACE_URL, f"{integration_id}:{job.result_id}:{feature.id}")
     )
@@ -75,14 +81,17 @@ def prepare_event(
         return None
     matches = []
     for previous in known:
+        # Detections from the same run are distinct polygons, never repeats.
         if (
             previous.change_type != change_type
-            or previous.last_prediction_id == job.prediction_id
+            or previous.first_prediction_id == job.prediction_id
         ):
             continue
         if abs((previous.change_date - changed).days) > job.config.date_tolerance_days:
             continue
-        old_geom = shape(previous.geometry)
+        old_geom = shapes.get(previous.external_id)
+        if old_geom is None:
+            old_geom = shapes[previous.external_id] = shape(previous.geometry)
         if not geom.intersects(old_geom):
             continue
         union = geom.union(old_geom).area
@@ -92,8 +101,10 @@ def prepare_event(
     if len(matches) == 1:
         previous = matches[0]
         previous.last_seen_at = now
-        previous.last_prediction_id = job.prediction_id
-        previous.observations += 1
+        # A polygon split into several features this run is still one observation.
+        if previous.last_prediction_id != job.prediction_id:
+            previous.last_prediction_id = job.prediction_id
+            previous.observations += 1
         return None
     if len(known) >= MAX_EVENTS:
         raise IntegrationConfigurationError(
@@ -107,9 +118,11 @@ def prepare_event(
             change_date=changed,
             first_seen_at=now,
             last_seen_at=now,
+            first_prediction_id=job.prediction_id,
             last_prediction_id=job.prediction_id,
         )
     )
+    shapes[external_id] = geom
     point = geom.representative_point()
     props.update(
         {

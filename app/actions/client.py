@@ -199,6 +199,22 @@ class Prediction(pydantic.BaseModel):
         extra = "allow"
 
 
+class Project(pydantic.BaseModel):
+    id: str
+    organization_id: str = pydantic.Field(..., min_length=1)
+
+    class Config:
+        extra = "allow"
+
+
+class ProjectResponse(pydantic.BaseModel):
+    records: List[Project] = pydantic.Field(default_factory=list)
+    errors: List[ApiError] = pydantic.Field(default_factory=list)
+
+    class Config:
+        extra = "allow"
+
+
 class FeatureProperties(pydantic.BaseModel):
     """The `oe_`-prefixed properties every feature carries, plus the model's own.
 
@@ -268,6 +284,10 @@ class FeatureSearchResponse(pydantic.BaseModel):
 # --------------------------------------------------------------------------
 # Client
 # --------------------------------------------------------------------------
+class RequestNotSentError(IntegrationConnectionError):
+    """The connection failed before the request left, so the server saw nothing."""
+
+
 class OlmoEarthClient:
     """Async transport for prediction lifecycle and feature searches.
 
@@ -334,6 +354,10 @@ class OlmoEarthClient:
                     response.raise_for_status()
                 except httpx.HTTPStatusError as e:
                     raise _classify_status_error(e) from e
+                except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                    raise RequestNotSentError(
+                        f"Could not connect to the OlmoEarth API at {self.base_url}: {e}"
+                    ) from e
                 except httpx.HTTPError as e:
                     raise IntegrationConnectionError(
                         f"Could not reach the OlmoEarth API at {self.base_url}: {e}"
@@ -370,34 +394,27 @@ class OlmoEarthClient:
 
     async def get_prediction(self, prediction_id: str) -> Prediction:
         path = f"/api/v1/predictions/{prediction_id}"
-        return self._one_prediction(await self._request("GET", path), path)
+        return self._one(PredictionSearchResponse, await self._request("GET", path), path)
 
     async def create_prediction(self, body: dict) -> Prediction:
         path = "/api/v1/predictions"
         # Studio has no idempotency key: an ambiguous POST must be reconciled, never retried.
-        return self._one_prediction(
-            await self._request("POST", path, body, attempts=1), path
+        return self._one(
+            PredictionSearchResponse,
+            await self._request("POST", path, body, attempts=1),
+            path,
         )
 
-    def _one_prediction(self, payload: dict, path: str) -> Prediction:
-        response = self._parse(PredictionSearchResponse, payload, path)
+    def _one(self, model, payload: dict, path: str):
+        response = self._parse(model, payload, path)
         if len(response.records) != 1:
-            raise IntegrationBadResponseError(f"Expected one prediction from {path}.")
+            raise IntegrationBadResponseError(f"Expected exactly one record from {path}.")
         return response.records[0]
 
     async def project_organization(self, project_id: str) -> str:
         path = f"/api/v1/projects/{project_id}"
-        payload = await self._request("GET", path)
-        records = payload.get("records", [])
-        if (
-            payload.get("errors")
-            or len(records) != 1
-            or not records[0].get("organization_id")
-        ):
-            raise IntegrationBadResponseError(
-                "Project has no organization or returned an incomplete response."
-            )
-        return records[0]["organization_id"]
+        project = self._one(ProjectResponse, await self._request("GET", path), path)
+        return project.organization_id
 
     async def search_features(
         self, result_id: str, request: FeatureSearchRequest
