@@ -69,7 +69,7 @@ flowchart LR
         Ledger["ledger: jobs, offsets, schedule slot, outbox"]
         Events["events: hash of known events by external ID"]
         Index["by_date.change_type: event IDs scored by change date"]
-        Lock["lock: one run at a time (TTL 900 s)"]
+        Lock["lock: one run at a time, outlives the runner timeout"]
     end
     Page[Feature page] -->|change type + date window| Index
     Index -->|candidate IDs| Events
@@ -129,9 +129,9 @@ Do not put real secrets in notes or committed examples. An EarthRanger admin log
 | Shared `routers/actions.py` | Runner HTTP action endpoints |
 | Shared services | Gundi authentication/configuration, Redis and ingestion |
 
-Changes to the shared runner code (`app/services`, from the upstream action-runner template) are kept small and general: `IntegrationStateManager.key()` and `.lock()`, `gundi.get_gundi_sender()` (a retried client lookup), and making `retry_policies.retryable_status` public. Existing key names and send helpers are unchanged.
+Changes to the shared runner code (`app/services`, from the upstream action-runner template) are kept small and general: `IntegrationStateManager.key()` and `.lock()`, and `gundi.get_gundi_sender()` (a retried client lookup). Existing key names and send helpers are unchanged.
 
-The implementation is on `olmoearth-integration` in PR #2, based on the fork's `main` (the fork has no `develop`). The latest revision passes 437 local tests, including Redis store, lock and end-to-end monitor tests against a disposable Redis (`OLMOEARTH_TEST_REDIS_URL`); without it those 3 skip. This proves mocked contracts/workflows, not a live end-to-end deployment. No live prediction or event has been sent in this work. Studio PR #3226 and a new cross-result/events API are not prerequisites.
+The implementation is on `olmoearth-integration` in PR #2, based on the fork's `main` (the fork has no `develop`). The latest revision passes 436 local tests, including Redis store, lock and end-to-end monitor tests against a disposable Redis (`OLMOEARTH_TEST_REDIS_URL`); without it those 3 skip. This proves mocked contracts/workflows, not a live end-to-end deployment. No live prediction or event has been sent in this work. Studio PR #3226 and a new cross-result/events API are not prerequisites.
 
 ## Pilot completion criteria
 

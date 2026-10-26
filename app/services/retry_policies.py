@@ -20,7 +20,7 @@ from .errors import source_status_code
 REDIS_RETRY = dict(on=RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0)
 
 
-def retryable_status(status_code: int) -> bool:
+def _retryable_status(status_code: int) -> bool:
     # 429 and 5xx are the server's problem for now. Any other status is a
     # definite answer that will not change on the next attempt.
     return status_code == 429 or status_code >= 500
@@ -49,5 +49,5 @@ def is_transient_gundi_error(exc: BaseException) -> bool:
     if isinstance(exc, (httpx.HTTPError, GundiAPIError, AuthenticationError)):
         status_code = source_status_code(exc)
         # An httpx error without a status is a transport failure.
-        return True if status_code is None else retryable_status(status_code)
+        return True if status_code is None else _retryable_status(status_code)
     return False

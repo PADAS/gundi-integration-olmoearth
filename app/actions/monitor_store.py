@@ -7,8 +7,10 @@ within tolerance and committing a page writes only the events it changed.
 
 The ledger goes through ``IntegrationStateManager.get_state``/``set_state``;
 the history and the atomic commit need Redis hashes, sorted sets and
-transactions, which the manager does not wrap. Callers must not reach this
-store on the ephemeral path (``run_monitor`` refuses it before taking the lock).
+transactions, which the manager does not wrap. The ledger written inside the
+commit transaction uses the same encoding as ``set_state``. The runner never
+executes monitor actions on the ephemeral path, so this store is not guarded
+against it.
 """
 
 import json
@@ -96,11 +98,13 @@ class RedisMonitorStore:
                             self._events,
                             mapping={event.external_id: event.json() for event in events},
                         )
+                    by_type: dict[str, dict[str, int]] = {}
                     for event in events:
-                        pipe.zadd(
-                            self._index(event.change_type),
-                            {event.external_id: event.change_date.toordinal()},
-                        )
+                        by_type.setdefault(event.change_type, {})[
+                            event.external_id
+                        ] = event.change_date.toordinal()
+                    for change_type, scores in by_type.items():
+                        pipe.zadd(self._index(change_type), scores)
                     pipe.set(
                         self._state.key(self._integration_id, STATE_ACTION, "ledger"),
                         json.dumps(ledger, default=str),

@@ -18,7 +18,6 @@ from app.services.errors import (
     IntegrationRateLimitError,
     source_status_code,
 )
-from app.services.retry_policies import retryable_status
 
 logger = logging.getLogger(__name__)
 
@@ -458,7 +457,7 @@ def _is_transient(exc: BaseException) -> bool:
     if isinstance(exc, IntegrationConnectionError):
         return True
     status = source_status_code(exc)
-    return status is not None and retryable_status(status)
+    return status is not None and (status == 429 or status >= 500)
 
 
 def _classify_status_error(exc: httpx.HTTPStatusError):

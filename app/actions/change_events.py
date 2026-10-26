@@ -55,20 +55,13 @@ def classify(feature: Feature, job: Job) -> Optional[tuple[str, date]]:
     return change_type, changed
 
 
-def candidate_windows(features: list[Feature], job: Job) -> dict[str, tuple[date, date]]:
-    """Per change type, the change-date range any repeat of these features can fall in.
-
-    Features that prepare_event would skip or reject are ignored here; it reports them.
-    """
+def candidate_windows(
+    classified: list[tuple[str, date]], job: Job
+) -> dict[str, tuple[date, date]]:
+    """Per change type, the change-date range any repeat of these detections can fall in."""
     dates: dict[str, list[date]] = {}
-    for feature in features:
-        try:
-            found = classify(feature, job)
-        except InvalidFeatureError:
-            continue
-        if found:
-            change_type, changed = found
-            dates.setdefault(change_type, []).append(changed)
+    for change_type, changed in classified:
+        dates.setdefault(change_type, []).append(changed)
     tolerance = timedelta(days=job.config.date_tolerance_days)
     return {
         change_type: (min(found) - tolerance, max(found) + tolerance)
@@ -92,6 +85,7 @@ class EventStage:
 
 def prepare_event(
     feature: Feature,
+    found: tuple[str, date],
     job: Job,
     stage: EventStage,
     shapes: dict[str, BaseGeometry],
@@ -101,6 +95,7 @@ def prepare_event(
 ) -> Optional[dict]:
     """Build a new event or record a repeat in the page's staged history.
 
+    ``found`` is ``classify(feature, job)`` for a detection the job monitors.
     Mutates only ``stage`` and ``shapes``, a cache of known-event geometries keyed
     by external ID. This function performs no persistence or network operations.
     """
@@ -108,9 +103,6 @@ def prepare_event(
         raise InvalidFeatureError(
             f"Detection {feature.id} has no stable feature ID or polygon geometry."
         )
-    found = classify(feature, job)
-    if found is None:
-        return None
     change_type, changed = found
     geometry = feature.geometry.dict(exclude_none=True)
     try:

@@ -300,24 +300,6 @@ async def test_late_discovery_uses_change_date_and_keeps_both_result_ids(
 
 
 @pytest.mark.asyncio
-async def test_out_of_order_completion_does_not_skip_older_job(config, api, store):
-    jobs = [
-        pending_job(config, pid, name=pid, reference_time="2026-10-01T00:00:00Z")
-        for pid in ["older", "newer"]
-    ]
-    monitor = await seed(config, api, store, jobs)
-    api.get_prediction.side_effect = [
-        prediction("older", status="predicting"),
-        prediction("newer"),
-    ]
-    await monitor.collect()
-    assert [j["status"] for j in store.value["jobs"]] == ["pending", "complete"]
-    api.get_prediction.side_effect = [prediction("older")]
-    await monitor.collect()
-    assert [j["status"] for j in store.value["jobs"]] == ["complete", "complete"]
-
-
-@pytest.mark.asyncio
 async def test_page_budget_resumes_without_marking_complete(config, api, store):
     monitor = await seed(config, api, store)
     api.search_features.side_effect = [
@@ -451,7 +433,7 @@ async def test_config_changes_do_not_mix_monitor_identity(config, api, store):
 @pytest.mark.asyncio
 async def test_auth_failure_prevents_optional_auth_feature_search(config, api, store):
     monitor = await seed(config, api, store)
-    api.verify_token.side_effect = IntegrationAuthError("expired")
+    api.get_prediction.side_effect = IntegrationAuthError("expired")
     with pytest.raises(IntegrationAuthError):
         await monitor.collect()
     api.search_features.assert_not_called()
@@ -703,35 +685,6 @@ async def test_submission_http_rejection_vs_ambiguous_failure(
     assert len(calls) == 1
     assert store.value["next_slot"] == (0 if retryable_slot else 1)
     assert bool(store.value["jobs"]) is not retryable_slot
-
-
-def two_jobs(config):
-    return [
-        pending_job(config, pid, name=pid, reference_time="2026-10-01T00:00:00Z")
-        for pid in ["bad", "good"]
-    ]
-
-
-@pytest.mark.asyncio
-async def test_invalid_feature_fails_only_its_own_job(config, api, store):
-    config.pages_per_poll = 2
-    await seed(config, api, store, two_jobs(config))
-    api.get_prediction.side_effect = [prediction("bad", result_id="rb"), prediction("good")]
-    api.search_features.side_effect = [page([feature(changed=145)]), page([feature()])]
-    with pytest.raises(IntegrationBadResponseError):
-        await make_monitor(config, api, store).collect()
-    assert [j["status"] for j in store.value["jobs"]] == ["failed", "complete"]
-    assert len(store.value["known_events"]) == 1
-
-
-@pytest.mark.asyncio
-async def test_raster_only_result_does_not_block_other_jobs(config, api, store):
-    await seed(config, api, store, two_jobs(config))
-    api.get_prediction.side_effect = [prediction(formats=["png"]), prediction("good")]
-    api.search_features.return_value = page([feature()])
-    with pytest.raises(IntegrationConfigurationError, match="vector"):
-        await make_monitor(config, api, store).collect()
-    assert [j["status"] for j in store.value["jobs"]] == ["failed", "complete"]
 
 
 @pytest.mark.asyncio
@@ -1005,3 +958,24 @@ async def test_wrong_receipt_count_or_value_pauses_outbox(config, api, store, re
     with pytest.raises(IntegrationBadResponseError):
         await monitor.collect()
     assert store.value["outbox"]["delivery_status"] == "sending"
+
+
+@pytest.mark.asyncio
+async def test_deleted_prediction_fails_its_job_instead_of_wedging(config, api, store):
+    monitor = await seed(config, api, store)
+    api.get_prediction.side_effect = IntegrationBadResponseError("gone", status_code=404)
+    with pytest.raises(IntegrationBadResponseError, match="no longer exists"):
+        await monitor.collect()
+    assert store.value["jobs"][0]["status"] == "failed"
+    api.get_prediction.reset_mock()
+    await make_monitor(config, api, store).collect()
+    api.get_prediction.assert_not_awaited()
+    assert (await make_monitor(config, api, store).submit())["submitted_prediction_id"] == "p1"
+
+
+@pytest.mark.asyncio
+async def test_identity_change_names_the_changed_settings(config, api, store):
+    await seed(config, api, store)
+    config.imagery_lag_days = 7
+    with pytest.raises(IntegrationConfigurationError, match=r"\(imagery_lag_days\)"):
+        await make_monitor(config, api, store).collect()

@@ -1,12 +1,12 @@
 """Gundi actions for scheduling and collecting an OlmoEarth LCC monitor."""
 
-import asyncio
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
+from app import settings
 from app.actions.core import ReferenceDataResponse, ReferenceOption, action_title
 from app.services.action_scheduler import crontab_schedule
-from app.services.activity_logger import activity_logger, ephemeral_run
+from app.services.activity_logger import activity_logger
 from app.services.errors import IntegrationConfigurationError
 from app.services.state import IntegrationStateManager
 from app.services.utils import find_config_for_action
@@ -25,9 +25,9 @@ from .monitor_state import STATE_ACTION
 from .monitor_store import RedisMonitorStore
 
 state_manager = IntegrationStateManager()
-RUN_LOCK_TTL_SECONDS = 900
-# Margin for the cancelled run to unwind (close clients, release) inside the TTL.
-RUN_TIMEOUT_SECONDS = RUN_LOCK_TTL_SECONDS - 300
+# The runner cancels every action after MAX_ACTION_EXECUTION_TIME; the margin lets a
+# cancelled run unwind and release the lock before it could expire under it.
+RUN_LOCK_TTL_SECONDS = settings.MAX_ACTION_EXECUTION_TIME + 300
 
 
 def get_auth_config(integration) -> AuthenticateConfig:
@@ -92,10 +92,6 @@ async def run_monitor(
     config: PullEventsConfig,
     work: Callable[[Monitor], Awaitable[dict]],
 ) -> dict:
-    if ephemeral_run.get():
-        raise IntegrationConfigurationError(
-            "Save this integration before running the monitor."
-        )
     integration_id = str(integration.id)
     async with state_manager.lock(
         integration_id, STATE_ACTION, ttl_seconds=RUN_LOCK_TTL_SECONDS
@@ -111,8 +107,7 @@ async def run_monitor(
                 GundiEventSender(integration_id),
                 datetime.now(timezone.utc),
             )
-            # Finish/cancel before the shared lock expires, even on a stalled provider.
-            return await asyncio.wait_for(work(monitor), timeout=RUN_TIMEOUT_SECONDS)
+            return await work(monitor)
 
 
 @action_title("Submit LCC Predictions")

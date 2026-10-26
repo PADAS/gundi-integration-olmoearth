@@ -1,6 +1,6 @@
 """Persisted monitor records and the identity that keeps configurations isolated."""
 
-import hashlib
+import json
 from datetime import date, datetime
 from enum import Enum
 from typing import Optional
@@ -78,28 +78,30 @@ class MonitorState(BaseModel):
     """The ledger: everything except the event history, which the store keeps
     per event so a page reads and writes only the events it touches."""
 
-    identity: str
+    identity: dict
     next_slot: int = 0
     jobs: list[Job] = Field(default_factory=list)
     outbox: Optional[Outbox] = None
 
 
-def monitor_identity(config: PullEventsConfig, base_url: str) -> str:
-    fields = {
-        "project_id",
-        "organization_id",
-        "model_id",
-        "area_of_interest",
-        "schedule_start",
-        "cadence",
-        "imagery_lag_days",
-        "change_date_property",
-        "change_date_aggregation",
-        "change_date_precision",
-        "event_type",
+IDENTITY_FIELDS = {
+    "project_id",
+    "organization_id",
+    "model_id",
+    "area_of_interest",
+    "schedule_start",
+    "cadence",
+    "imagery_lag_days",
+    "change_date_property",
+    "change_date_aggregation",
+    "change_date_precision",
+    "event_type",
+}
+
+
+def monitor_identity(config: PullEventsConfig, base_url: str) -> dict:
+    """The settings a monitor's jobs and event IDs depend on; changing any needs a new monitor."""
+    return {
+        "base_url": base_url.rstrip("/"),
+        **json.loads(config.json(include=IDENTITY_FIELDS)),
     }
-    return hashlib.sha256(
-        (
-            base_url.rstrip("/") + "\n" + config.json(include=fields, sort_keys=True)
-        ).encode()
-    ).hexdigest()

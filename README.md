@@ -107,8 +107,11 @@ events, their index entries and the advanced job offset are written in one Redis
 Configure durable Redis persistence/backups before a real deployment: losing the event
 history means already-delivered detections are resent.
 There is no prediction-creation or feature-time watermark: late-completing jobs remain
-tracked. An action lock and shorter execution timeout prevent the two schedules from
-writing this state concurrently.
+tracked. A run lock, held a few minutes longer than the runner's action timeout
+(`MAX_ACTION_EXECUTION_TIME`), prevents the two schedules from writing this state
+concurrently. Only one prediction is in flight at a time, so a collection run pages that
+one job. A changed environment or monitor setting is refused with the names of the
+settings that differ.
 
 Before submission the connector saves the job's unique name, reference time and configuration. Explicit
 400/401/403/404/422/429 rejections, and connections that fail before the request is sent,
@@ -159,9 +162,8 @@ downstream event updates are follow-up work.
 - `app/actions/change_events.py`: date parsing, repeat matching and event construction.
 
 Shared runner code in `app/services` comes from the upstream action-runner template, so
-changes there stay small and general: `IntegrationStateManager.key()`/`.lock()`,
-`gundi.get_gundi_sender()`, and a public `retry_policies.retryable_status`. Existing state
-key names and send helpers are unchanged.
+changes there stay small and general: `IntegrationStateManager.key()`/`.lock()` and
+`gundi.get_gundi_sender()`. Existing state key names and send helpers are unchanged.
 
 Event preparation works on a page-local stage: copies of the candidate events the page can
 match, plus the events it creates or updates. The monitor stores that stage's changes in

@@ -15,6 +15,7 @@ from .change_events import (
     EventStage,
     InvalidFeatureError,
     candidate_windows,
+    classify,
     event_id,
     prepare_event,
 )
@@ -97,9 +98,16 @@ class Monitor:
         self.state = (
             MonitorState.parse_obj(raw) if raw else MonitorState(identity=identity)
         )
-        if self.state.identity != identity:
+        changed = sorted(
+            key
+            for key in identity.keys() | self.state.identity.keys()
+            if identity.get(key) != self.state.identity.get(key)
+        )
+        if changed:
             raise IntegrationConfigurationError(
-                "Environment, model, area, project, date semantics or schedule changed. Create a new monitor integration to preserve existing jobs and event identity."
+                f"Monitor settings changed ({', '.join(changed)}). Environment, model, area, "
+                "project, date semantics or schedule changes need a new monitor integration "
+                "to preserve existing jobs and event identity."
             )
 
     async def save(self):
@@ -114,12 +122,6 @@ class Monitor:
     async def submit(self) -> dict:
         await self.load()
         project_id, model_id = str(self.config.project_id), str(self.config.model_id)
-        if self.config.organization_id:
-            organization = await self.api.project_organization(project_id)
-            if organization != str(self.config.organization_id):
-                raise IntegrationConfigurationError(
-                    "The selected project does not belong to the configured organization."
-                )
         uncertain = next(
             (j for j in self.state.jobs if j.status == JobStatus.SUBMITTING), None
         )
@@ -134,6 +136,12 @@ class Monitor:
             raise IntegrationConfigurationError(
                 "Prototype job history is full; archive the monitor before submitting more runs."
             )
+        if self.config.organization_id:
+            organization = await self.api.project_organization(project_id)
+            if organization != str(self.config.organization_id):
+                raise IntegrationConfigurationError(
+                    "The selected project does not belong to the configured organization."
+                )
         reference = datetime.combine(
             slot - timedelta(days=self.config.imagery_lag_days), time(), timezone.utc
         ).isoformat()
@@ -263,16 +271,18 @@ class Monitor:
         await self.save()
         return {"batch_id": box.batch_id, "status": box.delivery_status.value}
 
-    async def _stage(self, job: Job, features: list) -> EventStage:
-        """Fetch only the committed history this page's features can touch."""
-        windows = candidate_windows(features, job)
+    async def _stage(self, job: Job, classified: list) -> EventStage:
+        """Fetch only the committed history this page's detections can touch."""
+        windows = candidate_windows([found for _, found in classified], job)
         *found, known_ids = await asyncio.gather(
             *(
                 self.store.candidates(change_type, start, end)
                 for change_type, (start, end) in windows.items()
             ),
             self.store.known_ids(
-                event_id(self.integration_id, job, f) for f in features if f.id is not None
+                event_id(self.integration_id, job, feature)
+                for feature, _ in classified
+                if feature.id is not None
             ),
         )
         return EventStage([event for events in found for event in events], known_ids)
@@ -282,15 +292,24 @@ class Monitor:
         job.error = error
         await self.save()
 
-    async def _fail_job(
-        self, job: Job, error: IntegrationError, errors: list[IntegrationError]
-    ):
+    async def _fail_job(self, job: Job, error: IntegrationError):
         await self._stop_job(job, JobStatus.FAILED, str(error))
-        errors.append(error)
+        raise error
 
-    async def _ready_for_paging(self, job: Job, errors: list[IntegrationError]) -> bool:
-        """Advance an active job from its prediction; True once it has a result to page."""
-        prediction = await self.api.get_prediction(job.prediction_id)
+    async def _ready_for_paging(self, job: Job) -> bool:
+        """Advance the active job from its prediction; True once it has a result to page."""
+        try:
+            prediction = await self.api.get_prediction(job.prediction_id)
+        except IntegrationBadResponseError as exc:
+            if exc.status_code == 404:
+                await self._fail_job(
+                    job,
+                    IntegrationBadResponseError(
+                        f"Prediction {job.prediction_id} no longer exists in OlmoEarth.",
+                        status_code=404,
+                    ),
+                )
+            raise
         if prediction.status in {"failed", "cancelled"}:
             await self._stop_job(
                 job, JobStatus.FAILED, prediction.error_message or prediction.status
@@ -304,28 +323,22 @@ class Monitor:
                 IntegrationConfigurationError(
                     "Completed prediction has no vector result. Use an LCC model configured with vectorization."
                 ),
-                errors,
             )
-            return False
         if job.result_id is not None and job.result_id != prediction.result.id:
             await self._fail_job(
                 job,
                 IntegrationBadResponseError(
                     "Prediction result changed while paging; earlier pages came from a different result."
                 ),
-                errors,
             )
-            return False
         if job.result_id is None or job.status != JobStatus.COLLECTING:
             job.result_id = prediction.result.id
             job.status = JobStatus.COLLECTING
             await self.save()
         return True
 
-    async def _collect_page(
-        self, job: Job, shapes: dict, errors: list[IntegrationError]
-    ) -> int:
-        """Read, stage and deliver one page of a collecting job; return events sent."""
+    async def _collect_page(self, job: Job, shapes: dict) -> int:
+        """Read, stage and deliver one page of the collecting job; return events sent."""
         if job.offset >= RESULT_WINDOW:
             await self._stop_job(
                 job,
@@ -342,14 +355,20 @@ class Monitor:
                 "Result exceeds the feature search window; use a smaller AOI or export.",
             )
             return 0
-        stage = await self._stage(job, response.records)
         try:
+            classified = [
+                (feature, found)
+                for feature in response.records
+                if (found := classify(feature, job))
+            ]
+            stage = await self._stage(job, classified)
             events = [
                 event
-                for feature in response.records
+                for feature, found in classified
                 if (
                     event := prepare_event(
                         feature,
+                        found,
                         job,
                         stage,
                         shapes,
@@ -359,10 +378,9 @@ class Monitor:
                 )
             ]
         except InvalidFeatureError as exc:
-            # Never skip a detection silently: stop this job at this page.
+            # Never skip a detection silently: stop the job at this page.
             await self._stop_job(job, JobStatus.FAILED, f"At offset {job.offset}: {exc}")
-            errors.append(exc)
-            return 0
+            raise
         batch = f"{self.integration_id}:{job.name}:{job.offset}"
         self.state.outbox = Outbox(
             batch_id=str(uuid5(NAMESPACE_URL, batch)),
@@ -382,25 +400,18 @@ class Monitor:
 
     async def collect(self) -> dict:
         await self.load()
-        await self.api.verify_token()
         sent = await self.flush_outbox()
         pages = 0
-        # A bad result fails only its own job; the first such error is raised at the
-        # end so the run is still reported as an error once the other jobs are done.
-        errors: list[IntegrationError] = []
-        # Shapely geometries of known events, built at most once per run.
-        shapes = {}
-        for job in self.state.jobs:
-            if pages >= self.config.pages_per_poll:
-                break
-            if job.status not in ACTIVE_JOB_STATUSES:
-                continue
-            if not await self._ready_for_paging(job, errors):
-                continue
+        # submit() never starts a prediction while another is active, so there is
+        # at most one job to collect.
+        job = next((j for j in self.state.jobs if j.status in ACTIVE_JOB_STATUSES), None)
+        if job and await self._ready_for_paging(job):
+            # Shapely geometries of known events, built at most once per run.
+            shapes = {}
             while pages < self.config.pages_per_poll and job.status == JobStatus.COLLECTING:
-                sent += await self._collect_page(job, shapes, errors)
+                sent += await self._collect_page(job, shapes)
                 pages += 1
-        summary = {
+        return {
             "events_sent": sent,
             "pages_read": pages,
             "jobs": [
@@ -413,11 +424,3 @@ class Monitor:
                 for j in self.state.jobs
             ],
         }
-        if errors:
-            first = errors[0]
-            raise type(first)(
-                f"{first} (this run still sent {sent} events from {pages} pages; "
-                f"{len(errors)} job(s) failed)",
-                status_code=first.status_code,
-            ) from first
-        return summary
