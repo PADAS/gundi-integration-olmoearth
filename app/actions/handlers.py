@@ -2,6 +2,8 @@
 
 import asyncio
 from datetime import datetime, timezone
+from functools import partial
+from typing import Awaitable, Callable
 
 from app.actions.core import ReferenceDataResponse, ReferenceOption, action_title
 from app.services.action_scheduler import crontab_schedule
@@ -83,7 +85,9 @@ async def action_list_predictions(
 
 
 async def run_monitor(
-    integration, config: PullEventsConfig, operation: str, resolution=None
+    integration,
+    config: PullEventsConfig,
+    work: Callable[[Monitor], Awaitable[dict]],
 ) -> dict:
     if ephemeral_run.get():
         raise IntegrationConfigurationError(
@@ -96,27 +100,17 @@ async def run_monitor(
     if not await lock.acquire():
         return {"status": "already_running"}
     try:
-
-        async def send(events):
-            return await send_events_once_to_gundi(
-                events=events, integration_id=integration_id
-            )
-
         async with client_for(integration) as api:
             monitor = Monitor(
                 integration_id,
                 config,
                 api,
                 state_manager,
-                send,
+                partial(send_events_once_to_gundi, integration_id=integration_id),
                 datetime.now(timezone.utc),
             )
-            if operation == "resolve":
-                work = monitor.resolve_delivery(resolution)
-            else:
-                work = monitor.submit() if operation == "submit" else monitor.collect()
             # Finish/cancel before the shared lock expires, even on a stalled provider.
-            return await asyncio.wait_for(work, timeout=600)
+            return await asyncio.wait_for(work(monitor), timeout=600)
     finally:
         await lock.release()
 
@@ -127,14 +121,14 @@ async def run_monitor(
 async def action_submit_predictions(
     integration, action_config: SubmitPredictionsConfig
 ) -> dict:
-    return await run_monitor(integration, get_monitor_config(integration), "submit")
+    return await run_monitor(integration, get_monitor_config(integration), Monitor.submit)
 
 
 @action_title("Collect LCC Events")
 @crontab_schedule("15 */4 * * *")
 @activity_logger()
 async def action_pull_events(integration, action_config: PullEventsConfig) -> dict:
-    return await run_monitor(integration, action_config, "collect")
+    return await run_monitor(integration, action_config, Monitor.collect)
 
 
 @action_title("Resolve LCC Delivery")
@@ -143,5 +137,7 @@ async def action_resolve_delivery(
     integration, action_config: ResolveDeliveryConfig
 ) -> dict:
     return await run_monitor(
-        integration, get_monitor_config(integration), "resolve", action_config
+        integration,
+        get_monitor_config(integration),
+        lambda monitor: monitor.resolve_delivery(action_config),
     )

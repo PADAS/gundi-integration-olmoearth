@@ -17,6 +17,7 @@ from app.services.errors import (
     IntegrationRateLimitError,
     source_status_code,
 )
+from app.services.retry_policies import retryable_status
 
 logger = logging.getLogger(__name__)
 
@@ -294,7 +295,6 @@ class OlmoEarthClient:
                 "No API token is configured; run the Authenticate action first."
             )
         self.base_url = base_url.rstrip("/")
-        self._api_token = api_token
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=timeout,
@@ -318,9 +318,6 @@ class OlmoEarthClient:
         await self._client.aclose()
 
     # -- transport ---------------------------------------------------------
-    async def _post(self, path: str, body: dict) -> dict:
-        return await self._request("POST", path, body)
-
     async def _request(
         self, method: str, path: str, body: Optional[dict] = None, attempts: int = 3
     ) -> dict:
@@ -366,7 +363,9 @@ class OlmoEarthClient:
     async def search_predictions(
         self, request: PredictionSearchRequest
     ) -> PredictionSearchResponse:
-        payload = await self._post(self.PREDICTIONS_PATH, request.as_body())
+        payload = await self._request(
+            "POST", self.PREDICTIONS_PATH, request.as_body()
+        )
         return self._parse(PredictionSearchResponse, payload, self.PREDICTIONS_PATH)
 
     async def get_prediction(self, prediction_id: str) -> Prediction:
@@ -404,7 +403,7 @@ class OlmoEarthClient:
         self, result_id: str, request: FeatureSearchRequest
     ) -> FeatureSearchResponse:
         path = self.FEATURES_PATH.format(result_id=result_id)
-        payload = await self._post(path, request.as_body())
+        payload = await self._request("POST", path, request.as_body())
         return self._parse(FeatureSearchResponse, payload, path)
 
     async def verify_token(self) -> Optional[int]:
@@ -423,11 +422,10 @@ class OlmoEarthClient:
 
 def _is_transient(exc: BaseException) -> bool:
     """Retry predicate: transport failures, 429 and 5xx are worth another try."""
-    if isinstance(exc, (IntegrationConnectionError, IntegrationRateLimitError)):
+    if isinstance(exc, IntegrationConnectionError):
         return True
-    if isinstance(exc, IntegrationBadResponseError):
-        return (source_status_code(exc) or 0) >= 500
-    return False
+    status = source_status_code(exc)
+    return status is not None and retryable_status(status)
 
 
 def _classify_status_error(exc: httpx.HTTPStatusError):

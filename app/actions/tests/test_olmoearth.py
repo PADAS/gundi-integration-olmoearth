@@ -519,7 +519,7 @@ async def test_lock_prevents_overlapping_actions(config, mocker):
     mocker.patch.object(handlers.state_manager.db_client, "lock", return_value=lock)
     api_factory = mocker.patch.object(handlers, "client_for")
     assert await handlers.run_monitor(
-        SimpleNamespace(id="integration-1"), config, "submit"
+        SimpleNamespace(id="integration-1"), config, Monitor.submit
     ) == {"status": "already_running"}
     api_factory.assert_not_called()
 
@@ -533,7 +533,7 @@ async def test_lock_released_after_failure(config, mocker):
     )
     with pytest.raises(RuntimeError):
         await handlers.run_monitor(
-            SimpleNamespace(id="integration-1"), config, "submit"
+            SimpleNamespace(id="integration-1"), config, Monitor.submit
         )
     lock.release.assert_awaited_once()
 

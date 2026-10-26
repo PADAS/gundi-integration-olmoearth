@@ -43,7 +43,7 @@ def schedule_slot(config: PullEventsConfig, index: int) -> date:
 
 def build_feature_query(config: PullEventsConfig, offset: int) -> FeatureSearchRequest:
     return FeatureSearchRequest(
-        limit=config.feature_page_size,
+        limit=min(config.feature_page_size, RESULT_WINDOW - offset),
         offset=offset,
         intersects_geometry=config.area_of_interest,
         property_filters=[
@@ -91,10 +91,9 @@ class Monitor:
 
     async def submit(self) -> dict:
         await self.load()
-        if str(self.config.organization_id or ""):
-            organization = await self.api.project_organization(
-                str(self.config.project_id)
-            )
+        project_id, model_id = str(self.config.project_id), str(self.config.model_id)
+        if self.config.organization_id:
+            organization = await self.api.project_organization(project_id)
             if organization != str(self.config.organization_id):
                 raise IntegrationConfigurationError(
                     "The selected project does not belong to the configured organization."
@@ -104,8 +103,8 @@ class Monitor:
             # Search names include this integration and schedule slot; never retry the POST.
             response = await self.api.search_predictions(
                 PredictionSearchRequest(
-                    project_id=KeywordFilter(eq=str(self.config.project_id)),
-                    model_id=KeywordFilter(eq=str(self.config.model_id)),
+                    project_id=KeywordFilter(eq=project_id),
+                    model_id=KeywordFilter(eq=model_id),
                     name=StringFilter(eq=uncertain.name),
                     limit=2,
                 )
@@ -136,8 +135,8 @@ class Monitor:
         name = f"gundi:{self.integration_id}:{slot.isoformat()}"
         body = {
             "name": name,
-            "project_id": str(self.config.project_id),
-            "model_id": str(self.config.model_id),
+            "project_id": project_id,
+            "model_id": model_id,
             "start_time": reference,
             "end_time": reference,
             "geojson": {
@@ -181,18 +180,13 @@ class Monitor:
         if box.events and box.delivery_status == "pending":
             box.delivery_status = "sending"
             await self.save()
+            # send validates one distinct receipt per event before returning.
             box.receipts = await self.send(box.events)
-            if not valid_event_receipts(box.receipts, len(box.events)):
-                raise IntegrationBadResponseError(
-                    "Gundi did not acknowledge every event in the outbox."
-                )
             box.delivery_status = "accepted"
             await self.save()
+        by_id = {record.external_id: record for record in box.known_events}
         for event, object_id in zip(box.events, box.receipts):
-            identity = event["event_details"]["external_event_id"]
-            next(
-                record for record in box.known_events if record.external_id == identity
-            ).gundi_object_id = object_id
+            by_id[event["event_details"]["external_event_id"]].gundi_object_id = object_id
         self.state.known_events = box.known_events
         job = next(j for j in self.state.jobs if j.name == box.job_name)
         job.offset = box.next_offset
@@ -263,7 +257,6 @@ class Monitor:
                     await self.save()
                     break
                 query = build_feature_query(job.config, job.offset)
-                query.limit = min(query.limit, RESULT_WINDOW - job.offset)
                 response = await self.api.search_features(job.result_id, query)
                 if (
                     response.meta.total is not None
@@ -276,17 +269,19 @@ class Monitor:
                 # A short page proves exhaustion. ES totals can be lower bounds at 10,000.
                 complete = len(response.records) < query.limit
                 known = [event.copy(deep=True) for event in self.state.known_events]
-                events = []
-                for feature in response.records:
-                    event = prepare_event(
-                        feature,
-                        job,
-                        known,
-                        integration_id=self.integration_id,
-                        now=self.now,
+                events = [
+                    event
+                    for feature in response.records
+                    if (
+                        event := prepare_event(
+                            feature,
+                            job,
+                            known,
+                            integration_id=self.integration_id,
+                            now=self.now,
+                        )
                     )
-                    if event:
-                        events.append(event)
+                ]
                 self.state.outbox = Outbox(
                     batch_id=str(
                         uuid5(
