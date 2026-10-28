@@ -3,20 +3,29 @@
 from typing import Optional
 
 import stamina
-from gundi_client_v2.client import GundiDataSenderClient
 
 from app.services.errors import IntegrationBadResponseError
-from app.services.gundi import GUNDI_API_RETRY, _get_sensors_api_client
+from app.services.gundi import (  # app.settings loads before gundi_client_v2
+    GUNDI_API_RETRY,
+    GundiClient,
+    GundiDataSenderClient,
+)
 
 
 @stamina.retry(**GUNDI_API_RETRY)
 async def get_gundi_client(integration_id: str) -> GundiDataSenderClient:
-    """The template's client lookup, retried on its own.
+    """The integration's Gundi sender, looked up with the template's retry policy.
 
     ``send_events_to_gundi`` retries the lookup and the POST together, which could
     send a batch twice, so delivery fetches the client here and posts exactly once.
     """
-    return await _get_sensors_api_client(integration_id=str(integration_id))
+    async with GundiClient() as gundi:
+        api_key = await gundi.get_integration_api_key(integration_id=str(integration_id))
+    if not api_key:
+        raise IntegrationBadResponseError(
+            f"Gundi returned no API key for integration {integration_id}."
+        )
+    return GundiDataSenderClient(integration_api_key=api_key)
 
 
 class GundiEventSender:

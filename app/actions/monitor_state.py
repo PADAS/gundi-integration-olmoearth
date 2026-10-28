@@ -52,7 +52,6 @@ class SiteRecord(BaseModel):
     """What has been alerted at one site (a ``site_id`` cell) across predictions."""
 
     first_seen_at: datetime
-    first_prediction_id: str
     last_prediction_id: str
     # Each change type seen at the site, with the prediction that first reported it.
     change_types: dict[str, str] = Field(default_factory=dict)
@@ -60,17 +59,12 @@ class SiteRecord(BaseModel):
 
 
 class Outbox(BaseModel):
-    """One page's delivery and the site-history changes it commits.
-
-    The site changes are applied only once Gundi has accepted ``events``, in the
-    same ledger write that advances the job's offset.
-    """
+    """One page's delivery; the job's offset advances only once Gundi accepts it."""
 
     batch_id: str
     delivery_status: DeliveryStatus = DeliveryStatus.PENDING
     job_name: str
     events: list[dict]
-    site_updates: dict[str, SiteRecord] = Field(default_factory=dict)
     next_offset: int
     complete: bool
 
@@ -91,15 +85,13 @@ IDENTITY_FIELDS = {
     "schedule_start",
     "cadence",
     "change_date_property",
-    "change_date_aggregation",
     "change_date_precision",
-    "event_type",
 }
 
 
 def monitor_identity(config: PullEventsConfig, base_url: str) -> dict:
     """The settings a monitor's jobs and event IDs depend on; changing any needs a new monitor."""
     return {
-        "base_url": base_url.rstrip("/"),
+        "base_url": base_url,
         **json.loads(config.json(include=IDENTITY_FIELDS)),
     }

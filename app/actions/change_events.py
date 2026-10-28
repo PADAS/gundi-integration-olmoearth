@@ -9,17 +9,16 @@ from datetime import date, datetime, time, timezone
 from typing import Optional
 from uuid import NAMESPACE_URL, uuid5
 
-from shapely.geometry.base import BaseGeometry
-
 from app.services.errors import IntegrationBadResponseError
 
 from .client import Feature
 from .configurations import PullEventsConfig, polygon_shape
 from .monitor_state import Job, SiteRecord
 
-# Geohash precision for site_id: 7 characters is a cell about 150 m across. A site
-# that drifts or grows across a cell edge gets a second ID and is reported as new.
-# A stand-in until OlmoEarth assigns its own site or track IDs.
+# site_id is "gh7:" plus the 7-character geohash (a cell about 150 m across) of a
+# point inside the polygon. A site that drifts or grows across a cell edge gets a
+# second ID and is reported as new. A stand-in until OlmoEarth assigns its own site
+# or track IDs; the scheme prefix keeps the two kinds of ID from colliding.
 SITE_PRECISION = 7
 
 NEW_SITE = "new_site"
@@ -72,11 +71,6 @@ def geohash(lat: float, lon: float, precision: int) -> str:
     return "".join(out)
 
 
-def site_id(geom: BaseGeometry) -> str:
-    point = geom.representative_point()
-    return geohash(point.y, point.x, SITE_PRECISION)
-
-
 def event_id(integration_id: str, job: Job, feature: Feature) -> str:
     """The stable Gundi external ID for one detection in one prediction result."""
     return str(uuid5(NAMESPACE_URL, f"{integration_id}:{job.result_id}:{feature.id}"))
@@ -99,43 +93,25 @@ def classify(
     return change_type, changed
 
 
-class SiteStage:
-    """One page's view of the site history: committed records plus staged copies.
-
-    Nothing is persisted until the page's outbox is committed.
-    """
-
-    def __init__(self, sites: dict[str, SiteRecord]):
-        self.sites = sites
-        self.updated: dict[str, SiteRecord] = {}
-
-    def observe(
-        self, site: str, change_type: str, job: Job, now: datetime
-    ) -> tuple[str, SiteRecord]:
-        """Record a detection at ``site``; return how it relates to earlier predictions."""
-        record = self.updated.get(site)
-        if record is None:
-            committed = self.sites.get(site)
-            record = (
-                committed.copy(deep=True)
-                if committed
-                else SiteRecord(
-                    first_seen_at=now,
-                    first_prediction_id=job.prediction_id,
-                    last_prediction_id=job.prediction_id,
-                )
-            )
-            self.updated[site] = record
-        # Count predictions, not features: one prediction may split a site in several.
-        if record.last_prediction_id != job.prediction_id:
-            record.last_prediction_id = job.prediction_id
-            record.predictions += 1
-        record.change_types.setdefault(change_type, job.prediction_id)
-        if record.first_prediction_id == job.prediction_id:
-            return NEW_SITE, record
-        if record.change_types[change_type] == job.prediction_id:
-            return NEW_CHANGE_TYPE, record
-        return SEEN_BEFORE, record
+def observe(
+    sites: dict[str, SiteRecord], site: str, change_type: str, job: Job, now: datetime
+) -> tuple[str, SiteRecord]:
+    """Record a detection at ``site``; return how it relates to earlier predictions."""
+    record = sites.get(site)
+    if record is None:
+        record = sites[site] = SiteRecord(
+            first_seen_at=now, last_prediction_id=job.prediction_id
+        )
+    # Count predictions, not features: one prediction may split a site in several.
+    elif record.last_prediction_id != job.prediction_id:
+        record.last_prediction_id = job.prediction_id
+        record.predictions += 1
+    record.change_types.setdefault(change_type, job.prediction_id)
+    if record.predictions == 1:
+        return NEW_SITE, record
+    if record.change_types[change_type] == job.prediction_id:
+        return NEW_CHANGE_TYPE, record
+    return SEEN_BEFORE, record
 
 
 def prepare_event(
@@ -143,15 +119,16 @@ def prepare_event(
     found: tuple[str, date],
     job: Job,
     config: PullEventsConfig,
-    stage: SiteStage,
+    sites: dict[str, SiteRecord],
     *,
     integration_id: str,
     now: datetime,
 ) -> dict:
     """Build the Gundi event for one monitored detection and record its site.
 
-    ``found`` is ``classify(feature, job, config)``. Mutates only ``stage``; performs
-    no persistence or network operations.
+    ``found`` is ``classify(feature, job, config)``. Mutates only ``sites``, the
+    caller's working copy of the site records; performs no persistence or network
+    operations.
     """
     if feature.id is None or feature.geometry is None:
         raise InvalidFeatureError(
@@ -165,15 +142,15 @@ def prepare_event(
         raise InvalidFeatureError(
             f"Detection {feature.id} geometry is not a valid regional polygon."
         ) from exc
-    site = site_id(geom)
-    kind, record = stage.observe(site, change_type, job, now)
+    point = geom.representative_point()
+    site = f"gh{SITE_PRECISION}:{geohash(point.y, point.x, SITE_PRECISION)}"
+    kind, record = observe(sites, site, change_type, job, now)
     label = change_type.replace("_", " ")
     title = {
         NEW_SITE: f"OlmoEarth: {label} (new site)",
         NEW_CHANGE_TYPE: f"OlmoEarth: {label} (new change at known site)",
         SEEN_BEFORE: f"OlmoEarth: {label} (seen before, {record.predictions} predictions)",
     }[kind]
-    point = geom.representative_point()
     props = feature.properties.model_properties()
     props.update(
         {

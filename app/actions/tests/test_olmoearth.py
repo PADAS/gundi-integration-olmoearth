@@ -3,6 +3,8 @@
 import copy
 import datetime as dt
 import json
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -12,7 +14,7 @@ import pytest_asyncio
 from pydantic import ValidationError
 
 from app.actions import client, handlers
-from app.actions.change_events import parse_change_date
+from app.actions.change_events import geohash, parse_change_date
 from app.actions.configurations import (
     Cadence,
     PullEventsConfig,
@@ -25,13 +27,16 @@ from app.actions.monitor import (
     build_feature_query,
     schedule_slot,
 )
-from app.actions.monitor_state import Job
+from app.actions.delivery import GundiEventSender
+from app.actions.monitor_state import STATE_ACTION, Job
 from app.services.errors import (
     IntegrationAuthError,
     IntegrationBadResponseError,
     IntegrationConfigurationError,
     IntegrationConnectionError,
+    IntegrationError,
 )
+from app.services.state import IntegrationStateManager
 
 UTC = dt.timezone.utc
 NOW = dt.datetime(2026, 10, 23, tzinfo=UTC)
@@ -146,7 +151,7 @@ async def seed(config, api, store, jobs=None):
     monitor = make_monitor(config, api, store)
     await monitor.load()
     monitor.state.jobs = jobs or [
-        pending_job(config, "p1", name="job", reference_time="2026-10-01T00:00:00Z")
+        pending_job(config, name="job")
     ]
     await monitor.save()
     return monitor
@@ -394,8 +399,6 @@ async def test_distant_detection_is_a_different_site(config, api, store):
 
 
 def test_site_id_is_a_standard_geohash():
-    from app.actions.change_events import geohash
-
     assert geohash(57.64911, 10.40744, 11) == "u4pruydqqvj"
 
 
@@ -611,8 +614,6 @@ async def test_event_and_monitor_id_are_separate(config, api, store):
 
 
 def test_portal_schema_and_example_keep_environment_and_ids_configurable():
-    from pathlib import Path
-
     example = json.loads(
         (
             Path(__file__).resolve().parents[3] / "examples" / "lcc-monitor.json"
@@ -677,8 +678,6 @@ async def test_failed_submission_saves_nothing_and_posts_once(config, store, sta
     async with client.OlmoEarthClient(
         "https://example.test", "token", transport=httpx.MockTransport(route)
     ) as api:
-        from app.services.errors import IntegrationError
-
         with pytest.raises(IntegrationError):
             await make_monitor(config, api, store).submit()
     assert len(posts) == 1
@@ -710,14 +709,28 @@ async def test_project_organization_parses_typed_response():
 
 
 @pytest.mark.asyncio
-async def test_undelivered_page_commits_no_event_history(config, api, store):
+async def test_undelivered_page_is_kept_with_its_sites_for_resend(config, api, store):
     monitor = await seed(config, api, store)
     api.search_features.return_value = page([feature()])
-    monitor.sender.post.side_effect = RuntimeError("lost")
-    with pytest.raises(RuntimeError):
+    monitor.sender.prepare.side_effect = IntegrationConnectionError("portal down")
+    with pytest.raises(IntegrationConnectionError):
         await monitor.collect()
-    assert store.value["sites"] == {}
-    assert len(store.value["outbox"]["site_updates"]) == 1
+    assert store.value["outbox"]["delivery_status"] == "pending"
+    assert store.value["jobs"][0]["offset"] == 0
+    assert len(store.value["sites"]) == 1
+    monitor.sender.prepare.side_effect = None
+    result = await monitor.collect()
+    assert result["events_sent"] == 1
+    assert result["detections_by_kind"] == {"new_site": 1}
+    assert monitor.sender.post.call_args.args[0][0]["event_details"]["detection_kind"] == "new_site"
+
+
+@pytest.mark.asyncio
+async def test_event_type_and_aggregation_note_can_change(config, api, store):
+    await seed(config, api, store)
+    config.event_type = "olmoearth_mining"
+    config.change_date_aggregation = None
+    await make_monitor(config, api, store).collect()
 
 
 @pytest.mark.asyncio
@@ -736,11 +749,7 @@ async def redis_state_manager():
 
     Never the app's own REDIS_HOST: these tests flush the database they use.
     """
-    import os
-
     import redis.asyncio as redis
-
-    from app.services.state import IntegrationStateManager
 
     url = os.environ.get("OLMOEARTH_TEST_REDIS_URL")
     if not url:
@@ -755,18 +764,13 @@ async def redis_state_manager():
 
 @pytest.mark.asyncio
 async def test_monitor_site_tracking_on_redis(config, api, redis_state_manager):
-    from app.actions.monitor_state import STATE_ACTION
-
     monitor = await seed(config, api, redis_state_manager)
     api.search_features.return_value = page([feature()])
     assert (await monitor.collect())["events_sent"] == 1
-    monitor.state.jobs.append(
-        pending_job(config, "p2", name="second", reference_time="2026-10-08T00:00:00Z")
+    result = await run_second_prediction(
+        monitor, config, api, [feature("again", changed="2026-09-12")]
     )
-    await monitor.save()
-    api.get_prediction.return_value = prediction("p2", result_id="r2")
-    api.search_features.return_value = page([feature("again", changed="2026-09-12")])
-    assert (await monitor.collect())["detections_by_kind"] == {"seen_before": 1}
+    assert result["detections_by_kind"] == {"seen_before": 1}
     ledger = await redis_state_manager.get_state("integration-1", STATE_ACTION)
     (site,) = ledger["sites"].values()
     assert site["predictions"] == 2
@@ -788,8 +792,6 @@ async def test_sender_setup_failure_leaves_outbox_pending(config, api, store):
 
 @pytest.mark.asyncio
 async def test_event_sender_posts_once_and_reuses_its_client(mocker):
-    from app.actions.delivery import GundiEventSender
-
     client_ = SimpleNamespace(
         post_events=AsyncMock(side_effect=httpx.ReadTimeout("lost acknowledgement"))
     )
@@ -810,8 +812,6 @@ async def test_event_sender_posts_once_and_reuses_its_client(mocker):
     "response", [{"object_id": "1"}, [], ["id"], [{"errors": ["rejected"]}]]
 )
 async def test_event_sender_rejects_unclean_acknowledgement(mocker, response):
-    from app.actions.delivery import GundiEventSender
-
     client_ = SimpleNamespace(post_events=AsyncMock(return_value=response))
     mocker.patch("app.actions.delivery.get_gundi_client", AsyncMock(return_value=client_))
     sender = GundiEventSender("integration-1")

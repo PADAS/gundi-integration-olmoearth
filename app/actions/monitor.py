@@ -13,7 +13,7 @@ from app.services.errors import (
 )
 from app.services.state import IntegrationStateManager
 
-from .change_events import InvalidFeatureError, SiteStage, classify, prepare_event
+from .change_events import InvalidFeatureError, classify, prepare_event
 from .client import (
     FeatureSearchRequest,
     KeywordFilter,
@@ -36,7 +36,6 @@ from .monitor_state import (
     monitor_identity,
 )
 
-MAX_JOBS = 1000
 # Elasticsearch's from+size limit for the features search.
 RESULT_WINDOW = 10000
 FEATURE_PAGE_SIZE = 100
@@ -121,10 +120,6 @@ class Monitor:
         slot = schedule_slot(self.config, self.state.next_slot)
         if slot > self.now.date():
             return {"status": "not_due", "next_prediction_date": slot.isoformat()}
-        if len(self.state.jobs) >= MAX_JOBS:
-            raise IntegrationConfigurationError(
-                "Prototype job history is full; archive the monitor before submitting more runs."
-            )
         project_id, model_id = str(self.config.project_id), str(self.config.model_id)
         if self.config.organization_id:
             organization = await self.api.project_organization(project_id)
@@ -198,10 +193,11 @@ class Monitor:
             )
         return response.records[0] if response.records else None
 
-    async def flush_outbox(self) -> int:
+    async def flush_outbox(self) -> list[dict]:
+        """Deliver and commit the pending page, if any; return the events it sent."""
         box = self.state.outbox
         if box is None:
-            return 0
+            return []
         if box.delivery_status == DeliveryStatus.SENDING:
             raise IntegrationConfigurationError(
                 f"Delivery outcome is unknown for batch {box.batch_id}. Use Resolve LCC Delivery after checking Gundi; it will not be resent automatically."
@@ -215,13 +211,12 @@ class Monitor:
             await self.sender.post(box.events)
             box.delivery_status = DeliveryStatus.ACCEPTED
             await self.save()
-        self.state.sites.update(box.site_updates)
         job = next(j for j in self.state.jobs if j.name == box.job_name)
         job.offset = box.next_offset
         job.status = JobStatus.COMPLETE if box.complete else JobStatus.COLLECTING
         self.state.outbox = None
         await self.save()
-        return len(box.events)
+        return box.events
 
     async def resolve_delivery(self, resolution) -> dict:
         await self.load()
@@ -292,15 +287,15 @@ class Monitor:
             await self.save()
         return True
 
-    async def _collect_page(self, job: Job, kinds: Counter) -> int:
-        """Read, stage and deliver one page; return events sent and tally their kinds."""
+    async def _collect_page(self, job: Job) -> list[dict]:
+        """Read, stage and deliver one page; return the events sent."""
         if job.offset >= RESULT_WINDOW:
             await self._stop_job(
                 job,
                 JobStatus.NEEDS_EXPORT,
                 "Result reaches the 10,000-feature search window; completeness requires an export or a smaller AOI.",
             )
-            return 0
+            return []
         query = build_feature_query(self.config, job, job.offset)
         response = await self.api.search_features(job.result_id, query)
         if response.meta.total is not None and response.meta.total > RESULT_WINDOW:
@@ -309,8 +304,9 @@ class Monitor:
                 JobStatus.NEEDS_EXPORT,
                 "Result exceeds the feature search window; use a smaller AOI or export.",
             )
-            return 0
-        stage = SiteStage(self.state.sites)
+            return []
+        # A working copy: an invalid page leaves the committed site records untouched.
+        sites = {site: record.copy(deep=True) for site, record in self.state.sites.items()}
         try:
             events = [
                 prepare_event(
@@ -318,7 +314,7 @@ class Monitor:
                     found,
                     job,
                     self.config,
-                    stage,
+                    sites,
                     integration_id=self.integration_id,
                     now=self.now,
                 )
@@ -329,12 +325,14 @@ class Monitor:
             # Never skip a detection silently: stop the job at this page.
             await self._stop_job(job, JobStatus.FAILED, f"At offset {job.offset}: {exc}")
             raise
+        # The site records are saved with the outbox, which is always delivered or
+        # resolved, never dropped, so they cannot run ahead of what is sent.
+        self.state.sites = sites
         batch = f"{self.integration_id}:{job.name}:{job.offset}"
         self.state.outbox = Outbox(
             batch_id=str(uuid5(NAMESPACE_URL, batch)),
             job_name=job.name,
             events=events,
-            site_updates=stage.updated,
             next_offset=job.offset + len(response.records),
             # A short page proves exhaustion. ES totals can be lower bounds at 10,000.
             complete=len(response.records) < query.limit,
@@ -343,24 +341,22 @@ class Monitor:
             # Persist the payload before sending; a page with nothing to send is
             # committed directly by flush_outbox.
             await self.save()
-        sent = await self.flush_outbox()
-        kinds.update(event["event_details"]["detection_kind"] for event in events)
-        return sent
+        return await self.flush_outbox()
 
     async def collect(self) -> dict:
         await self.load()
-        sent = await self.flush_outbox()
+        sent = list(await self.flush_outbox())
         pages = 0
-        kinds: Counter = Counter()
         # submit() never starts a prediction while another is active, so there is
         # at most one job to collect.
         job = next((j for j in self.state.jobs if j.status in ACTIVE_JOB_STATUSES), None)
         if job and await self._ready_for_paging(job):
             while pages < PAGES_PER_POLL and job.status == JobStatus.COLLECTING:
-                sent += await self._collect_page(job, kinds)
+                sent += await self._collect_page(job)
                 pages += 1
+        kinds = Counter(event["event_details"]["detection_kind"] for event in sent)
         return {
-            "events_sent": sent,
+            "events_sent": len(sent),
             "detections_by_kind": dict(kinds),
             "pages_read": pages,
             "known_sites": len(self.state.sites),

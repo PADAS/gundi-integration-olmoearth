@@ -72,16 +72,18 @@ annual coverage. Missed slots catch up oldest first, with at most one job in fli
 - `changes_since`, if set, is a fixed initial event-date cutoff. It never advances as a cursor.
 - Selected classes and `changes_since` are snapshotted per submitted job. Changing them
   affects future jobs, not a half-read result or already delivered history.
-- Environment/project/model/area/schedule/date semantics changes require a new monitor integration,
-  preserving old jobs instead of silently mixing identities.
+- Environment/project/organization/model/area/schedule, date property or date precision
+  changes require a new monitor integration, preserving old jobs instead of silently mixing
+  identities; the refusal names the settings that changed. The event type and aggregation
+  note can be edited freely.
 
 Every new event gets a deterministic `event_details.external_event_id`. Gundi's REST
 `source` identifies the monitor, **not** a per-event idempotency key. See the
 [Gundi API guide](https://support.earthranger.com/en_US/become-a-data-provider/gundi-api).
 
 Every monitored detection is sent as an event; nothing is suppressed. Each one carries a
-`site_id`, the 7-character geohash (a cell about 150 m across) of a point inside its
-polygon, and is marked by how it relates to earlier predictions:
+`site_id`, `gh7:` plus the 7-character geohash (a cell about 150 m across) of a point inside
+its polygon, and is marked by how it relates to earlier predictions:
 
 | `detection_kind` | When | Title |
 | --- | --- | --- |
@@ -148,8 +150,7 @@ scheduled submission proceeds. Upstream
 vectorization can itself remove/cap polygons: use an uncapped model and inspect its
 sieve/simplification settings for the pilot.
 
-The job ledger is bounded at 1,000 jobs and stops visibly at that limit. Large-result
-export and downstream event updates are follow-up work.
+Large-result export and downstream event updates are follow-up work.
 
 ## Code layout
 
@@ -165,10 +166,10 @@ export and downstream event updates are follow-up work.
 Shared runner code in `app/services` comes from the upstream action-runner template and is
 unchanged; the connector only calls its existing helpers.
 
-Event preparation works on a page-local stage: the committed site records plus copies of the
-ones the page touches. The monitor stores that stage's changes in
-the outbox and commits them only after delivery. This keeps polygon logic independent of
-network and storage while preserving the delivery/checkpoint boundary.
+Event preparation works on a copy of the site records. The monitor saves the updated records
+in the same write as the page's outbox, which is always delivered or resolved and never
+dropped, and advances the page offset only after delivery. This keeps polygon logic
+independent of network and storage while preserving the delivery/checkpoint boundary.
 
 ## Verification
 

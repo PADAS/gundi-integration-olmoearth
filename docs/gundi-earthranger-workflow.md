@@ -44,7 +44,7 @@ These are logical responsibilities, not a verified deployment inventory. Gundi i
 3. Search for the slot's unique prediction name; adopt a single match, otherwise call `POST /api/v1/predictions` once. Record the job (name, prediction ID, reference time, selected classes) only once a prediction ID is in hand, so a lost response is recovered by name on the next run and any failure leaves the slot due. Use a model already configured for vectorization; there is no request-level vectorization flag.
 4. Collect LCC Events polls `GET /api/v1/predictions/{id}`. Once complete, read the nested `result.id`.
 5. Search `POST /api/v1/prediction-results/{result_id}/features/search` with AOI and class filters. Read date properties from the returned polygons and apply any fixed `changes_since` cutoff locally.
-6. For each page, build an event for every monitored detection, marked by its site (`new_site`, `new_change_type` or `seen_before`), and stage the page's site updates in the outbox. Post the batch to Gundi once; once every event is acknowledged, commit the site updates and page checkpoint in the same ledger save.
+6. For each page, build an event for every monitored detection, marked by its site (`new_site`, `new_change_type` or `seen_before`), and save the updated site records together with the page's outbox. Post the batch to Gundi once; once every event is acknowledged, advance the page checkpoint.
 7. Gundi routes events to EarthRanger. An ingestion receipt does not prove final destination delivery; verify that separately.
 
 The model reference time is the due slot minus an imagery lag (14 days, `IMAGERY_LAG_DAYS`). Its own model configuration controls imagery lookbehind. Cadence is not the model's observation window or date precision.
@@ -57,7 +57,7 @@ The polygon comes from `post_change`; the change date is an auxiliary property o
 - `first_discovered_at`: when the connector found the detection.
 - `changes_since`: optional fixed cutoff; never advances as a polling watermark.
 
-A late-finishing prediction can therefore report an older change. Every detection is sent; none are suppressed. Each event carries a `site_id` (the geohash cell, about 150 m, containing the polygon) and a title marking it as a new site, a new change type at a known site, or seen before, because EarthRanger cannot filter on event details today. This lets a site's progression (cleared, then mined, then a road) arrive as separate alerts that share a `site_id`. The grid cell is a stand-in for site or change tracking on OlmoEarth's roadmap: a site that crosses a cell edge is reported as new, and unrelated changes in one cell share an ID. Updating or reversing an already delivered EarthRanger event is not implemented.
+A late-finishing prediction can therefore report an older change. Every detection is sent; none are suppressed. Each event carries a `site_id` (`gh7:` plus the geohash cell, about 150 m, containing the polygon) and a title marking it as a new site, a new change type at a known site, or seen before, because EarthRanger cannot filter on event details today. This lets a site's progression (cleared, then mined, then a road) arrive as separate alerts that share a `site_id`. The grid cell is a stand-in for site or change tracking on OlmoEarth's roadmap: a site that crosses a cell edge is reported as new, and unrelated changes in one cell share an ID. Updating or reversing an already delivered EarthRanger event is not implemented.
 
 ## State and delivery
 
@@ -68,13 +68,13 @@ flowchart LR
     subgraph Ledger["Ledger value for one monitor"]
         Jobs["jobs: prediction, offset, status, selected classes"]
         Sites["sites: site_id to first seen, change types, predictions"]
-        Outbox["outbox: one page's events and site updates"]
+        Outbox["outbox: one page's events"]
     end
     Page[Feature page] --> Mark[Mark each detection by site]
     Sites --> Mark
-    Mark -->|every detection + site updates| Outbox
-    Outbox -->|after Gundi acknowledges: same save| Sites
-    Outbox -->|same save| Jobs
+    Mark -->|updated site records, saved with the outbox| Sites
+    Mark -->|every detection| Outbox
+    Outbox -->|after Gundi acknowledges: offset advances| Jobs
 ```
 
 The outbox holds one page at a time and moves through these states:
@@ -88,7 +88,7 @@ stateDiagram-v2
     sending --> sending: outcome unknown, collection pauses
     sending --> accepted: Resolve LCC Delivery, confirmed_delivered
     sending --> pending: Resolve LCC Delivery, confirmed_not_delivered
-    accepted --> [*]: events and offset committed in one save
+    accepted --> [*]: page offset committed
 ```
 
 A page with nothing to send skips straight to the commit. Partial acceptance or a lost acknowledgement requires manual reconciliation. Search is limited to the 10,000-feature window; reaching it marks the job `needs_export` without blocking later runs. A raster-only result, a changed result ID, a malformed detection or a prediction deleted in OlmoEarth fails that job at the page where it happened, and the next scheduled submission proceeds. Redis needs durable storage/backups for live use: losing the ledger means every site is reported as new again.
@@ -128,7 +128,7 @@ Do not put real secrets in notes or committed examples. An EarthRanger admin log
 
 The shared runner code (`app/services`, from the upstream action-runner template) is unchanged; the connector only calls its existing helpers.
 
-The implementation is on `olmoearth-integration` in PR #2, based on the fork's `main` (the fork has no `develop`). The latest revision passes 428 local tests, including an end-to-end monitor test against a disposable Redis (`OLMOEARTH_TEST_REDIS_URL`); without it that test skips. This proves mocked contracts/workflows, not a live end-to-end deployment. No live prediction or event has been sent in this work. Studio PR #3226 and a new cross-result/events API are not prerequisites.
+The implementation is on `olmoearth-integration` in PR #2, based on the fork's `main` (the fork has no `develop`). The latest revision passes 429 local tests, including an end-to-end monitor test against a disposable Redis (`OLMOEARTH_TEST_REDIS_URL`); without it that test skips. This proves mocked contracts/workflows, not a live end-to-end deployment. No live prediction or event has been sent in this work. Studio PR #3226 and a new cross-result/events API are not prerequisites.
 
 ## Pilot completion criteria
 

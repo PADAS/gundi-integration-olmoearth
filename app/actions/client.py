@@ -5,7 +5,6 @@ API accepts and returns more.
 """
 
 import json
-import logging
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -20,8 +19,6 @@ from app.services.errors import (
     IntegrationRateLimitError,
     source_status_code,
 )
-
-logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
 
