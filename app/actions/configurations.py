@@ -2,7 +2,7 @@
 
 from datetime import date
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 import pydantic
@@ -14,7 +14,6 @@ from app.services.utils import FieldWithUIOptions, UIOptions
 from .core import (
     AuthActionConfiguration,
     ExecutableActionMixin,
-    GenericActionConfiguration,
     PullActionConfiguration,
 )
 
@@ -78,11 +77,6 @@ def polygon_shape(value: dict) -> BaseGeometry:
 
 class PullEventsConfig(PullActionConfiguration):
     project_id: UUID = FieldWithUIOptions(..., title="OlmoEarth project")
-    organization_id: Optional[UUID] = FieldWithUIOptions(
-        None,
-        title="OlmoEarth organization",
-        description="If supplied, must own the selected project.",
-    )
     model_id: UUID = FieldWithUIOptions(
         ...,
         title="LCC model",
@@ -147,10 +141,3 @@ class SubmitPredictionsConfig(PullActionConfiguration):
         description="Uses the saved Collect LCC events configuration. Running manually also submits a due prediction.",
     )
 
-
-class ResolveDeliveryConfig(GenericActionConfiguration, ExecutableActionMixin):
-    batch_id: UUID
-    outcome: Literal["confirmed_delivered", "confirmed_not_delivered"] = pydantic.Field(
-        ...,
-        description="Check Gundi for the whole batch first. Partial delivery must be reconciled by hand before choosing either.",
-    )

@@ -167,9 +167,6 @@ def prepare_event(
             "prediction_reference_time": job.reference_time,
             "site_id": site,
             "detection_kind": kind,
-            "site_first_seen_at": record.first_seen_at.isoformat(),
-            "site_predictions": record.predictions,
-            "site_change_types": sorted(record.change_types),
         }
     )
     return {

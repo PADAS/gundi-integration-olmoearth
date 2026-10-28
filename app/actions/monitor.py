@@ -4,7 +4,6 @@ import calendar
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
-from uuid import NAMESPACE_URL, uuid5
 
 from app.services.errors import (
     IntegrationBadResponseError,
@@ -28,7 +27,6 @@ from .delivery import GundiEventSender
 from .monitor_state import (
     ACTIVE_JOB_STATUSES,
     STATE_ACTION,
-    DeliveryStatus,
     Job,
     JobStatus,
     MonitorState,
@@ -121,12 +119,6 @@ class Monitor:
         if slot > self.now.date():
             return {"status": "not_due", "next_prediction_date": slot.isoformat()}
         project_id, model_id = str(self.config.project_id), str(self.config.model_id)
-        if self.config.organization_id:
-            organization = await self.api.project_organization(project_id)
-            if organization != str(self.config.organization_id):
-                raise IntegrationConfigurationError(
-                    "The selected project does not belong to the configured organization."
-                )
         reference = datetime.combine(
             slot - timedelta(days=IMAGERY_LAG_DAYS), time(), timezone.utc
         ).isoformat()
@@ -194,48 +186,23 @@ class Monitor:
         return response.records[0] if response.records else None
 
     async def flush_outbox(self) -> list[dict]:
-        """Deliver and commit the pending page, if any; return the events it sent."""
+        """Deliver and commit the pending page, if any; return the events it sent.
+
+        Delivery is at least once: if the POST fails, or its response is lost, the
+        page stays in the outbox and is sent again on the next run. Each event keeps
+        its external_event_id, so a rare duplicate is recognizable.
+        """
         box = self.state.outbox
         if box is None:
             return []
-        if box.delivery_status == DeliveryStatus.SENDING:
-            raise IntegrationConfigurationError(
-                f"Delivery outcome is unknown for batch {box.batch_id}. Use Resolve LCC Delivery after checking Gundi; it will not be resent automatically."
-            )
-        if box.events and box.delivery_status == DeliveryStatus.PENDING:
-            # Resolve the Gundi client first: a failure here provably sent nothing,
-            # so the batch stays pending and goes out on the next run.
-            await self.sender.prepare()
-            box.delivery_status = DeliveryStatus.SENDING
-            await self.save()
-            await self.sender.post(box.events)
-            box.delivery_status = DeliveryStatus.ACCEPTED
-            await self.save()
+        if box.events:
+            await self.sender.send(box.events)
         job = next(j for j in self.state.jobs if j.name == box.job_name)
         job.offset = box.next_offset
         job.status = JobStatus.COMPLETE if box.complete else JobStatus.COLLECTING
         self.state.outbox = None
         await self.save()
         return box.events
-
-    async def resolve_delivery(self, resolution) -> dict:
-        await self.load()
-        box = self.state.outbox
-        if (
-            box is None
-            or box.batch_id != str(resolution.batch_id)
-            or box.delivery_status != DeliveryStatus.SENDING
-        ):
-            raise IntegrationConfigurationError(
-                "That batch is not awaiting delivery reconciliation."
-            )
-        box.delivery_status = (
-            DeliveryStatus.ACCEPTED
-            if resolution.outcome == "confirmed_delivered"
-            else DeliveryStatus.PENDING
-        )
-        await self.save()
-        return {"batch_id": box.batch_id, "status": box.delivery_status.value}
 
     async def _stop_job(self, job: Job, status: JobStatus, error: str):
         job.status = status
@@ -325,12 +292,10 @@ class Monitor:
             # Never skip a detection silently: stop the job at this page.
             await self._stop_job(job, JobStatus.FAILED, f"At offset {job.offset}: {exc}")
             raise
-        # The site records are saved with the outbox, which is always delivered or
-        # resolved, never dropped, so they cannot run ahead of what is sent.
+        # The site records are saved with the outbox, which is resent until delivered
+        # and never dropped, so they cannot run ahead of what is sent.
         self.state.sites = sites
-        batch = f"{self.integration_id}:{job.name}:{job.offset}"
         self.state.outbox = Outbox(
-            batch_id=str(uuid5(NAMESPACE_URL, batch)),
             job_name=job.name,
             events=events,
             next_offset=job.offset + len(response.records),

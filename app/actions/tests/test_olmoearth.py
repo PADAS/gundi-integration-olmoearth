@@ -18,7 +18,6 @@ from app.actions.change_events import geohash, parse_change_date
 from app.actions.configurations import (
     Cadence,
     PullEventsConfig,
-    ResolveDeliveryConfig,
     SubmitPredictionsConfig,
 )
 from app.actions import monitor as monitor_module
@@ -134,7 +133,7 @@ def page(features, total=None):
 
 
 def make_monitor(config, api, store, now=NOW):
-    sender = SimpleNamespace(prepare=AsyncMock(), post=AsyncMock())
+    sender = SimpleNamespace(send=AsyncMock())
     return Monitor("integration-1", config, api, store, sender, now)
 
 
@@ -223,15 +222,6 @@ async def test_future_slot_does_not_submit(config, api, store):
 
 
 @pytest.mark.asyncio
-async def test_organization_mismatch_cannot_submit(config, api, store):
-    config.organization_id = ORG
-    api.project_organization.return_value = "different-org"
-    with pytest.raises(IntegrationConfigurationError):
-        await make_monitor(config, api, store).submit()
-    api.create_prediction.assert_not_called()
-
-
-@pytest.mark.asyncio
 async def test_lost_submission_is_recovered_by_name_without_a_second_post(
     config, api, store
 ):
@@ -276,7 +266,7 @@ async def test_late_discovery_uses_change_date_and_keeps_both_result_ids(
     monitor = await seed(config, api, store)
     api.search_features.return_value = page([feature()])
     result = await monitor.collect()
-    event = monitor.sender.post.call_args.args[0][0]
+    event = monitor.sender.send.call_args.args[0][0]
     assert event["recorded_at"].startswith("2026-09-10")
     assert event["geometry"] == AREA
     assert event["event_details"]["first_discovered_at"].startswith("2026-10-23")
@@ -302,29 +292,19 @@ async def test_page_budget_resumes_without_marking_complete(config, api, store):
 
 
 @pytest.mark.asyncio
-async def test_failed_delivery_replays_identical_outbox_then_advances(
-    config, api, store
-):
+async def test_failed_delivery_resends_the_same_batch_next_run(config, api, store):
     monitor = await seed(config, api, store)
     api.search_features.return_value = page([feature()])
-    monitor.sender.post.side_effect = RuntimeError("delivery acknowledgement lost")
+    monitor.sender.send.side_effect = RuntimeError("delivery acknowledgement lost")
     with pytest.raises(RuntimeError):
         await monitor.collect()
-    first = copy.deepcopy(monitor.sender.post.call_args.args[0])
+    first = copy.deepcopy(monitor.sender.send.call_args.args[0])
     assert store.value["jobs"][0]["offset"] == 0
     assert store.value["outbox"] is not None
-    with pytest.raises(IntegrationConfigurationError, match="unknown"):
-        await monitor.collect()
-    monitor.sender.post.assert_awaited_once()
-    await monitor.resolve_delivery(
-        ResolveDeliveryConfig(
-            batch_id=store.value["outbox"]["batch_id"],
-            outcome="confirmed_not_delivered",
-        )
-    )
-    monitor.sender.post.side_effect = None
-    await monitor.collect()
-    assert monitor.sender.post.call_args.args[0] == first
+    monitor.sender.send.side_effect = None
+    result = await monitor.collect()
+    assert monitor.sender.send.call_args.args[0] == first
+    assert result["events_sent"] == 1
     api.search_features.assert_awaited_once()
     assert store.value["jobs"][0]["status"] == "complete"
     assert store.value["outbox"] is None
@@ -351,14 +331,13 @@ async def test_repeat_detection_is_sent_and_marked_seen_before(config, api, stor
     )
     assert result["events_sent"] == 1
     assert result["detections_by_kind"] == {"seen_before": 1}
-    event = monitor.sender.post.call_args.args[0][0]
+    event = monitor.sender.send.call_args.args[0][0]
     assert event["title"] == "OlmoEarth: mining (seen before, 2 predictions)"
-    details = event["event_details"]
-    assert details["detection_kind"] == "seen_before"
-    assert details["site_predictions"] == 2
-    assert details["site_first_seen_at"].startswith("2026-10-23")
+    assert event["event_details"]["detection_kind"] == "seen_before"
+    assert event["event_details"]["site_id"].startswith("gh7:")
     (site,) = store.value["sites"].values()
     assert site["predictions"] == 2
+    assert site["first_seen_at"] == NOW
 
 
 @pytest.mark.asyncio
@@ -370,9 +349,10 @@ async def test_new_change_type_at_known_site_is_marked(config, api, store):
     api.search_features.return_value = page([feature()])
     await monitor.collect()
     await run_second_prediction(monitor, config, api, [feature("road", change_type="new_road")])
-    event = monitor.sender.post.call_args.args[0][0]
+    event = monitor.sender.send.call_args.args[0][0]
     assert event["title"] == "OlmoEarth: new road (new change at known site)"
-    assert event["event_details"]["site_change_types"] == ["mining", "new_road"]
+    (site,) = store.value["sites"].values()
+    assert sorted(site["change_types"]) == ["mining", "new_road"]
 
 
 @pytest.mark.asyncio
@@ -431,7 +411,7 @@ async def test_invalid_event_does_not_advance_or_drop_a_page(config, api, store)
     assert store.value["jobs"][0]["offset"] == 0
     assert store.value["jobs"][0]["status"] == "failed"
     assert "offset 0" in store.value["jobs"][0]["error"]
-    monitor.sender.post.assert_not_called()
+    monitor.sender.send.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -563,24 +543,6 @@ async def test_lock_released_after_failure(config, mocker):
 
 
 @pytest.mark.asyncio
-async def test_confirmed_delivery_commits_without_reposting(config, api, store):
-    monitor = await seed(config, api, store)
-    api.search_features.return_value = page([feature()])
-    monitor.sender.post.side_effect = RuntimeError("lost acknowledgement")
-    with pytest.raises(RuntimeError):
-        await monitor.collect()
-    await monitor.resolve_delivery(
-        ResolveDeliveryConfig(
-            batch_id=store.value["outbox"]["batch_id"], outcome="confirmed_delivered"
-        )
-    )
-    await monitor.collect()
-    monitor.sender.post.assert_awaited_once()
-    assert len(store.value["sites"]) == 1
-    assert store.value["jobs"][0]["status"] == "complete"
-
-
-@pytest.mark.asyncio
 async def test_result_creation_failure_can_recover_later(config, api, store):
     monitor = await seed(config, api, store)
     api.get_prediction.return_value = prediction(status="result_creation_failed")
@@ -608,7 +570,7 @@ async def test_event_and_monitor_id_are_separate(config, api, store):
     monitor = await seed(config, api, store)
     api.search_features.return_value = page([feature()])
     await monitor.collect()
-    event = monitor.sender.post.call_args.args[0][0]
+    event = monitor.sender.send.call_args.args[0][0]
     assert event["source"] == "olmoearth-monitor:integration-1"
     assert event["event_details"]["external_event_id"] != event["source"]
 
@@ -654,13 +616,13 @@ async def test_environment_change_cannot_reuse_saved_jobs(config, api, store):
 
 
 @pytest.mark.asyncio
-async def test_unacknowledged_batch_pauses_outbox(config, api, store):
+async def test_unacknowledged_batch_stays_in_outbox(config, api, store):
     monitor = await seed(config, api, store)
     api.search_features.return_value = page([feature("f1"), feature("f2")])
-    monitor.sender.post.side_effect = IntegrationBadResponseError("not acknowledged")
+    monitor.sender.send.side_effect = IntegrationBadResponseError("not acknowledged")
     with pytest.raises(IntegrationBadResponseError):
         await monitor.collect()
-    assert store.value["outbox"]["delivery_status"] == "sending"
+    assert len(store.value["outbox"]["events"]) == 2
     assert store.value["jobs"][0]["offset"] == 0
 
 
@@ -696,33 +658,20 @@ async def test_stopped_job_does_not_block_next_submission(config, api, store, st
 
 
 @pytest.mark.asyncio
-async def test_project_organization_parses_typed_response():
-    def route(request):
-        return httpx.Response(
-            200, json={"records": [{"id": PROJECT, "organization_id": ORG}]}
-        )
-
-    async with client.OlmoEarthClient(
-        "https://example.test", "token", transport=httpx.MockTransport(route)
-    ) as http:
-        assert await http.project_organization(PROJECT) == ORG
-
-
-@pytest.mark.asyncio
 async def test_undelivered_page_is_kept_with_its_sites_for_resend(config, api, store):
     monitor = await seed(config, api, store)
     api.search_features.return_value = page([feature()])
-    monitor.sender.prepare.side_effect = IntegrationConnectionError("portal down")
+    monitor.sender.send.side_effect = IntegrationConnectionError("portal down")
     with pytest.raises(IntegrationConnectionError):
         await monitor.collect()
-    assert store.value["outbox"]["delivery_status"] == "pending"
+    assert store.value["outbox"] is not None
     assert store.value["jobs"][0]["offset"] == 0
     assert len(store.value["sites"]) == 1
-    monitor.sender.prepare.side_effect = None
+    monitor.sender.send.side_effect = None
     result = await monitor.collect()
     assert result["events_sent"] == 1
     assert result["detections_by_kind"] == {"new_site": 1}
-    assert monitor.sender.post.call_args.args[0][0]["event_details"]["detection_kind"] == "new_site"
+    assert monitor.sender.send.call_args.args[0][0]["event_details"]["detection_kind"] == "new_site"
 
 
 @pytest.mark.asyncio
@@ -778,20 +727,7 @@ async def test_monitor_site_tracking_on_redis(config, api, redis_state_manager):
 
 
 @pytest.mark.asyncio
-async def test_sender_setup_failure_leaves_outbox_pending(config, api, store):
-    monitor = await seed(config, api, store)
-    api.search_features.return_value = page([feature()])
-    monitor.sender.prepare.side_effect = IntegrationConnectionError("portal down")
-    with pytest.raises(IntegrationConnectionError):
-        await monitor.collect()
-    assert store.value["outbox"]["delivery_status"] == "pending"
-    monitor.sender.post.assert_not_called()
-    monitor.sender.prepare.side_effect = None
-    assert (await monitor.collect())["events_sent"] == 1
-
-
-@pytest.mark.asyncio
-async def test_event_sender_posts_once_and_reuses_its_client(mocker):
+async def test_event_sender_posts_once_per_call_and_reuses_its_client(mocker):
     client_ = SimpleNamespace(
         post_events=AsyncMock(side_effect=httpx.ReadTimeout("lost acknowledgement"))
     )
@@ -799,12 +735,11 @@ async def test_event_sender_posts_once_and_reuses_its_client(mocker):
         "app.actions.delivery.get_gundi_client", AsyncMock(return_value=client_)
     )
     sender = GundiEventSender("integration-1")
-    await sender.prepare()
-    await sender.prepare()
-    with pytest.raises(httpx.ReadTimeout):
-        await sender.post([{"title": "test"}])
+    for _ in range(2):
+        with pytest.raises(httpx.ReadTimeout):
+            await sender.send([{"title": "test"}])
     lookup.assert_awaited_once()
-    client_.post_events.assert_awaited_once()
+    assert client_.post_events.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -814,10 +749,8 @@ async def test_event_sender_posts_once_and_reuses_its_client(mocker):
 async def test_event_sender_rejects_unclean_acknowledgement(mocker, response):
     client_ = SimpleNamespace(post_events=AsyncMock(return_value=response))
     mocker.patch("app.actions.delivery.get_gundi_client", AsyncMock(return_value=client_))
-    sender = GundiEventSender("integration-1")
-    await sender.prepare()
     with pytest.raises(IntegrationBadResponseError):
-        await sender.post([{"title": "test"}])
+        await GundiEventSender("integration-1").send([{"title": "test"}])
 
 
 @pytest.mark.asyncio

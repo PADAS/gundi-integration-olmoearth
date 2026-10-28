@@ -24,12 +24,6 @@ class JobStatus(str, Enum):
 ACTIVE_JOB_STATUSES = frozenset({JobStatus.PENDING, JobStatus.COLLECTING})
 
 
-class DeliveryStatus(str, Enum):
-    PENDING = "pending"
-    SENDING = "sending"  # POST may have reached Gundi; never resent automatically
-    ACCEPTED = "accepted"
-
-
 class Job(BaseModel):
     """One submitted prediction and how far its result has been read.
 
@@ -61,8 +55,6 @@ class SiteRecord(BaseModel):
 class Outbox(BaseModel):
     """One page's delivery; the job's offset advances only once Gundi accepts it."""
 
-    batch_id: str
-    delivery_status: DeliveryStatus = DeliveryStatus.PENDING
     job_name: str
     events: list[dict]
     next_offset: int
@@ -79,7 +71,6 @@ class MonitorState(BaseModel):
 
 IDENTITY_FIELDS = {
     "project_id",
-    "organization_id",
     "model_id",
     "area_of_interest",
     "schedule_start",

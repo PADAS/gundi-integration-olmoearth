@@ -125,18 +125,6 @@ class PredictionSearchResponse(_Records):
     records: List[Prediction] = pydantic.Field(default_factory=list)
 
 
-class Project(pydantic.BaseModel):
-    id: str
-    organization_id: str = pydantic.Field(..., min_length=1)
-
-    class Config:
-        extra = "allow"
-
-
-class ProjectResponse(_Records):
-    records: List[Project] = pydantic.Field(default_factory=list)
-
-
 class FeatureProperties(pydantic.BaseModel):
     """The ``oe_`` system properties every feature carries, plus the model's own."""
 
@@ -295,11 +283,6 @@ class OlmoEarthClient:
         if len(response.records) != 1:
             raise IntegrationBadResponseError(f"Expected exactly one record from {path}.")
         return response.records[0]
-
-    async def project_organization(self, project_id: str) -> str:
-        path = f"/api/v1/projects/{project_id}"
-        project = self._one(ProjectResponse, await self._request("GET", path), path)
-        return project.organization_id
 
     async def search_features(
         self, result_id: str, request: FeatureSearchRequest

@@ -22,7 +22,7 @@ Gundi runner credentials.
 
 1. Save **Collect LCC Events** (`pull_events`) using `examples/lcc-monitor.json` as a
    starting point. Every ID and the small example polygon are placeholders. Replace the
-   project/model/organization, area, date-property name and aggregation through the form.
+   project/model, area, date-property name and aggregation through the form.
 2. Choose mining or other `post_change` labels in the multi-select, or enable **Select all
    change types**. The enum is the current LCC legend, excluding nodata and `none`; verify
    it against the selected registered model before using a different model version.
@@ -38,8 +38,8 @@ Gundi runner credentials.
 6. Configure the Gundi route/EarthRanger event type and verify polygon rendering in the
    destination. The event carries both the polygon and a point guaranteed inside it.
 
-The prediction API requires a project. A partner project is a useful default. Organization
-is optional; when supplied it must own that project. API credentials still enforce access.
+The prediction API requires a project. A partner project is a useful default; Studio rejects
+a project the API token cannot use.
 Neither IDs nor the OlmoEarth environment are hardcoded in the connector.
 
 ## Workflow
@@ -49,7 +49,6 @@ Neither IDs nor the OlmoEarth environment are hardcoded in the connector.
 | `auth` | on demand | Verify token using authenticated prediction search. |
 | `submit_predictions` | every four hours, opt-in | Submit one due schedule slot if no job is in flight. |
 | `pull_events` | every four hours, at :15 | Poll saved jobs, filter features, and deliver events. |
-| `resolve_delivery` | manual only | Resolve a delivery whose acknowledgement was lost. |
 
 Submission calls `POST /api/v1/predictions`, saves its ID, and collection polls
 `GET /api/v1/predictions/{id}` until complete. Collection reads the actual nested
@@ -72,7 +71,7 @@ annual coverage. Missed slots catch up oldest first, with at most one job in fli
 - `changes_since`, if set, is a fixed initial event-date cutoff. It never advances as a cursor.
 - Selected classes and `changes_since` are snapshotted per submitted job. Changing them
   affects future jobs, not a half-read result or already delivered history.
-- Environment/project/organization/model/area/schedule, date property or date precision
+- Environment/project/model/area/schedule, date property or date precision
   changes require a new monitor integration, preserving old jobs instead of silently mixing
   identities; the refusal names the settings that changed. The event type and aggregation
   note can be edited freely.
@@ -91,8 +90,9 @@ its polygon, and is marked by how it relates to earlier predictions:
 | `new_change_type` | The site is known, but not with this change type | `OlmoEarth: new road (new change at known site)` |
 | `seen_before` | The site was reported with this change type before | `OlmoEarth: mining (seen before, 3 predictions)` |
 
-EarthRanger has no filtering for these today, so the title carries the marker; the
-details also include `site_first_seen_at`, `site_predictions` and `site_change_types`.
+EarthRanger has no filtering for these today, so the title carries the marker. The event
+details carry only `site_id` and `detection_kind`, so a future OlmoEarth site ID can replace
+`site_id` without changing anything else; first-seen dates and counts stay in the ledger.
 Detections from the same prediction never count as repeats of each other, and each
 collection run reports `detections_by_kind`. Gundi's v2 event schema has no priority
 field, so repeats cannot be colored lower.
@@ -126,19 +126,11 @@ job is recorded only once a prediction ID is in hand; any failure leaves the slo
 next run. Multiple predictions with the name stop submission until an operator deletes the
 extras.
 
-A page's payload is stored in the outbox before delivery, with the page's new and updated
-events. The Gundi POST is attempted once; fetching the integration's Gundi key beforehand is
-retried, and if it still fails the batch stays `pending` and is sent on the next collection.
-Once Gundi acknowledges every event, the events and the page offset are committed in the same
-save. If the outcome is unknown, the outbox stays `sending` and subsequent collection pauses
-rather than potentially creating duplicates. **Resolve LCC Delivery** takes the batch ID and
-an outcome:
-
-- `confirmed_delivered`: the next collection commits the page without resending.
-- `confirmed_not_delivered`: only after checking the entire batch, the next collection sends
-  the saved payload again.
-- Partial delivery requires manual reconciliation of the whole batch first. Do not mark it
-  wholly undelivered. There is no claim of automatic exactly-once delivery.
+A page's events are stored in the outbox before delivery. Delivery is at least once: the
+Gundi POST is attempted once per run, and if it fails or its response is lost the page stays
+in the outbox and is sent again on the next collection, before any new page is read. A rare
+duplicate event carries the same `event_details.external_event_id` as the original, so it can
+be recognized. Once Gundi acknowledges every event, the page offset advances.
 
 The page budget pauses with a saved offset. Reaching Elasticsearch's 10,000-feature window
 marks the job `needs_export`; it is never reported complete, but later scheduled runs
@@ -167,8 +159,8 @@ Shared runner code in `app/services` comes from the upstream action-runner templ
 unchanged; the connector only calls its existing helpers.
 
 Event preparation works on a copy of the site records. The monitor saves the updated records
-in the same write as the page's outbox, which is always delivered or resolved and never
-dropped, and advances the page offset only after delivery. This keeps polygon logic
+in the same write as the page's outbox, which is resent until delivered and never dropped,
+and advances the page offset only after delivery. This keeps polygon logic
 independent of network and storage while preserving the delivery/checkpoint boundary.
 
 ## Verification

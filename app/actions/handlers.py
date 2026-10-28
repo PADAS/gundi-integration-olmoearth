@@ -15,7 +15,6 @@ from . import client
 from .configurations import (
     AuthenticateConfig,
     PullEventsConfig,
-    ResolveDeliveryConfig,
     SubmitPredictionsConfig,
 )
 from .delivery import GundiEventSender
@@ -103,14 +102,3 @@ async def action_submit_predictions(
 async def action_pull_events(integration, action_config: PullEventsConfig) -> dict:
     return await run_monitor(integration, action_config, Monitor.collect)
 
-
-@action_title("Resolve LCC Delivery")
-@activity_logger()
-async def action_resolve_delivery(
-    integration, action_config: ResolveDeliveryConfig
-) -> dict:
-    return await run_monitor(
-        integration,
-        get_monitor_config(integration),
-        lambda monitor: monitor.resolve_delivery(action_config),
-    )

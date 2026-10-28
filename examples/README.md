@@ -9,7 +9,7 @@ untracked environment file, not these examples.
 | --- | --- | --- |
 | OlmoEarth environment URL | `olmoearth-site.json` | Integration site/base URL |
 | OlmoEarth API token | `olmoearth-auth.json` | Authenticate action |
-| Project, optional organization, model, area, cadence, classes and date semantics | `lcc-monitor.json` | Collect LCC Events action |
+| Project, model, area, cadence, classes and date semantics | `lcc-monitor.json` | Collect LCC Events action |
 | Gundi OAuth client ID/secret, issuer/audience and API URLs | `../local/.env.local.example` | Copy to `local/.env.local` for the runner |
 
 The Gundi environment example contains staging URL/client defaults and a secret
@@ -37,7 +37,7 @@ collection; it does not enable prediction submission.
 This is a configuration draft, not a ready-to-run integration. The AOI remains
 the example polygon, the date property/aggregation remain placeholders, and
 cadence, start date, imagery lag, precision and event type remain unconfirmed
-example settings. The optional organization ID is omitted until known. Collection
+example settings. Collection
 is disabled on schedule in this draft; keep submission disabled too.
 
 Confirm the production API base URL separately from the Studio UI URL, enter the
