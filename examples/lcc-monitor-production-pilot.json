@@ -1,0 +1,42 @@
+{
+  "project_id": "6205704f-b09e-432b-af61-d68b1ebe018f",
+  "model_id": "f96ef025-780e-4393-9083-e732a324670e",
+  "area_of_interest": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [
+          10,
+          10
+        ],
+        [
+          10.01,
+          10
+        ],
+        [
+          10.01,
+          10.01
+        ],
+        [
+          10,
+          10.01
+        ],
+        [
+          10,
+          10
+        ]
+      ]
+    ]
+  },
+  "cadence": "monthly",
+  "schedule_start": "2026-10-23",
+  "select_all_types": false,
+  "post_change_types": [
+    "mining"
+  ],
+  "change_date_property": "REPLACE_WITH_VERIFIED_ISO_DATE_PROPERTY",
+  "change_date_precision": "month",
+  "change_date_aggregation": "REPLACE_WITH_MODEL_AGGREGATION",
+  "event_type": "olmoearth_detection",
+  "run_on_schedule": false
+}
