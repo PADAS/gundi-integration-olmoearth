@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from app import settings
-from app.actions.core import action_title
+from app.actions.core import ReferenceDataResponse, ReferenceOption, action_title
 from app.services.action_scheduler import crontab_schedule
 from app.services.activity_logger import activity_logger
 from app.services.errors import IntegrationConfigurationError
@@ -14,6 +14,8 @@ from app.services.utils import find_config_for_action
 from . import client
 from .configurations import (
     AuthenticateConfig,
+    ListModelsConfig,
+    ListProjectsConfig,
     PullEventsConfig,
     SubmitPredictionsConfig,
 )
@@ -58,6 +60,37 @@ async def action_auth(integration, action_config: AuthenticateConfig) -> dict:
     async with client_for(integration, action_config) as api:
         total = await api.verify_token()
     return {"valid_credentials": True, "predictions_visible": total}
+
+
+def reference_options(response: client.NamedRecordResponse) -> dict:
+    return ReferenceDataResponse(
+        options=[
+            ReferenceOption(value=record.id, label=record.name or record.id)
+            for record in response.records
+        ],
+        truncated=response.meta.total is not None
+        and response.meta.total > len(response.records),
+    ).dict()
+
+
+@action_title("List Projects")
+async def action_list_projects(integration, action_config: ListProjectsConfig) -> dict:
+    async with client_for(integration) as api:
+        return reference_options(
+            await api.search_projects(client.ProjectSearchRequest())
+        )
+
+
+@action_title("List LCC Models")
+async def action_list_models(integration, action_config: ListModelsConfig) -> dict:
+    # Only finished fine-tuned models can run predictions.
+    request = client.ModelSearchRequest(
+        project_id=client.KeywordFilter(eq=str(action_config.project_id)),
+        model_type=client.KeywordFilter(eq="fine_tuned"),
+        status=client.KeywordFilter(eq="completed"),
+    )
+    async with client_for(integration) as api:
+        return reference_options(await api.search_models(request))
 
 
 async def run_monitor(

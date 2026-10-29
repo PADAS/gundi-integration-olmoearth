@@ -32,6 +32,7 @@ class Job(BaseModel):
     """
 
     name: str
+    submitted_at: datetime
     prediction_id: str
     reference_time: str
     selected_types: list[str]

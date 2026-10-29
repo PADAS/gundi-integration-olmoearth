@@ -79,7 +79,7 @@ flowchart LR
 
 The outbox holds one page at a time. Delivery is at least once: a failed or unacknowledged post leaves the page in the outbox, and the next run sends the same batch again before reading anything new. A rare duplicate keeps its `external_event_id`, so it can be recognized in EarthRanger.
 
-A page with nothing to send skips straight to the commit. Search is limited to the 10,000-feature window; reaching it marks the job `needs_export` without blocking later runs. A raster-only result, a changed result ID, a malformed detection or a prediction deleted in OlmoEarth fails that job at the page where it happened, and the next scheduled submission proceeds. Redis needs durable storage/backups for live use: losing the ledger means every site is reported as new again.
+A page with nothing to send skips straight to the commit. Search is limited to the 10,000-feature window; reaching it marks the job `needs_export` without blocking later runs. A raster-only result, a changed result ID, a malformed detection, a prediction deleted in OlmoEarth, or one still unfinished 3 days after submission fails that job, and the next scheduled submission proceeds. Every stopped job (failed, cancelled, timed out or `needs_export`) also logs a warning in the portal's activity log. Redis needs durable storage/backups for live use: losing the ledger means every site is reported as new again.
 
 ## Reusable areas — agreed next step, not implemented
 
@@ -116,7 +116,7 @@ Do not put real secrets in notes or committed examples. An EarthRanger admin log
 
 The shared runner code (`app/services`, from the upstream action-runner template) is unchanged; the connector only calls its existing helpers.
 
-The implementation is on `olmoearth-integration` in PR #2, based on the fork's `main` (the fork has no `develop`). The latest revision passes 425 local tests, including an end-to-end monitor test against a disposable Redis (`OLMOEARTH_TEST_REDIS_URL`); without it that test skips. This proves mocked contracts/workflows, not a live end-to-end deployment. No live prediction or event has been sent in this work. Studio PR #3226 and a new cross-result/events API are not prerequisites.
+The implementation is on `olmoearth-integration` in PR #2, based on the fork's `main` (the fork has no `develop`). The latest revision passes 431 local tests, including an end-to-end monitor test against a disposable Redis (`OLMOEARTH_TEST_REDIS_URL`); without it that test skips. This proves mocked contracts/workflows, not a live end-to-end deployment. No live prediction or event has been sent in this work. Studio PR #3226 and a new cross-result/events API are not prerequisites.
 
 ## Pilot completion criteria
 

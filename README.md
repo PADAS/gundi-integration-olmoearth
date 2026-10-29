@@ -22,7 +22,10 @@ Gundi runner credentials.
 
 1. Save **Collect LCC Events** (`pull_events`) using `examples/lcc-monitor.json` as a
    starting point. Every ID and the small example polygon are placeholders. Replace the
-   project/model, area, date-property name and aggregation through the form.
+   project/model, area, date-property name and aggregation through the form. Project and
+   model are UUIDs (as in their Studio URLs). Portals with reference-data support offer
+   them as dropdowns once Authenticate is saved: projects the token can access, then the
+   finished fine-tuned models in the chosen project. Otherwise they are text fields.
 2. Choose mining or other `post_change` labels in the multi-select, or enable **Select all
    change types**. The enum is the current LCC legend, excluding nodata and `none`; verify
    it against the selected registered model before using a different model version.
@@ -48,7 +51,9 @@ Neither IDs nor the OlmoEarth environment are hardcoded in the connector.
 | --- | --- | --- |
 | `auth` | on demand | Verify token using authenticated prediction search. |
 | `submit_predictions` | every four hours, opt-in | Submit one due schedule slot if no job is in flight. |
-| `pull_events` | every four hours, at :15 | Poll saved jobs, filter features, and deliver events. |
+| `pull_events` | every four hours, at :15 | Poll the active job, filter features, and deliver events. |
+| `list_projects` | reference lookup | Project dropdown: projects the API token can access. |
+| `list_models` | reference lookup | Model dropdown: finished fine-tuned models in a project. |
 
 Submission calls `POST /api/v1/predictions`, saves its ID, and collection polls
 `GET /api/v1/predictions/{id}` until complete. Collection reads the actual nested
@@ -138,7 +143,12 @@ continue. Use a smaller AOI for the prototype. Empty vector results complete nor
 A raster-only result, a changed result ID, or a detection with an invalid polygon or
 malformed date, or a prediction deleted in OlmoEarth, marks the job `failed` at the
 offending page (no detection is skipped silently) and the run reports the error; the next
-scheduled submission proceeds. Upstream
+scheduled submission proceeds. A prediction that has not finished 3 days after submission
+(`MAX_PREDICTION_WAIT`: stalled, or in a status the monitor does not know) is failed the
+same way, so the monitor moves on to the next slot. Whenever a job stops (failed,
+cancelled, timed out or `needs_export`), collection logs a warning to the portal's activity
+log, since the run itself still succeeds. Each run's result describes only the job it
+worked on. Upstream
 vectorization can itself remove/cap polygons: use an uncapped model and inspect its
 sieve/simplification settings for the pilot.
 

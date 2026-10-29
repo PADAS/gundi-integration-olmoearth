@@ -75,6 +75,17 @@ class PredictionSearchRequest(_SearchRequest):
     name: Optional[StringFilter] = None
 
 
+class ProjectSearchRequest(_SearchRequest):
+    limit: int = 1000
+
+
+class ModelSearchRequest(_SearchRequest):
+    limit: int = 1000
+    project_id: Optional[KeywordFilter] = None
+    model_type: Optional[KeywordFilter] = None
+    status: Optional[KeywordFilter] = None
+
+
 class FeatureSearchRequest(_SearchRequest):
     # The API defaults to 50 per page; always send a size.
     limit: int
@@ -103,6 +114,20 @@ class _Records(pydantic.BaseModel):
 
     class Config:
         extra = "allow"
+
+
+class NamedRecord(pydantic.BaseModel):
+    """A project or model, as far as a dropdown needs it."""
+
+    id: str
+    name: Optional[str] = None
+
+    class Config:
+        extra = "allow"
+
+
+class NamedRecordResponse(_Records):
+    records: List[NamedRecord] = pydantic.Field(default_factory=list)
 
 
 class PredictionResult(pydantic.BaseModel):
@@ -283,6 +308,17 @@ class OlmoEarthClient:
         if len(response.records) != 1:
             raise IntegrationBadResponseError(f"Expected exactly one record from {path}.")
         return response.records[0]
+
+    async def search_projects(self, request: ProjectSearchRequest) -> NamedRecordResponse:
+        """Projects the API token can access."""
+        path = "/api/v1/projects/search"
+        payload = await self._request("POST", path, request.as_body())
+        return self._parse(NamedRecordResponse, payload, path)
+
+    async def search_models(self, request: ModelSearchRequest) -> NamedRecordResponse:
+        path = "/api/v1/models/search"
+        payload = await self._request("POST", path, request.as_body())
+        return self._parse(NamedRecordResponse, payload, path)
 
     async def search_features(
         self, result_id: str, request: FeatureSearchRequest

@@ -5,6 +5,7 @@ from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
 
+from app.services.activity_logger import LogLevel, log_action_activity
 from app.services.errors import (
     IntegrationBadResponseError,
     IntegrationConfigurationError,
@@ -41,6 +42,11 @@ PAGES_PER_POLL = 5
 # Each prediction's reference date precedes its schedule slot by this much, so the
 # imagery for the slot exists; verify against the chosen model.
 IMAGERY_LAG_DAYS = 14
+# A prediction still unfinished this long after submission (stalled, or in a status
+# the monitor does not know) fails its job, so the monitor moves on to the next slot.
+MAX_PREDICTION_WAIT = timedelta(days=3)
+# The action id that collection logs under in the portal.
+COLLECT_ACTION = "pull_events"
 
 
 def schedule_slot(config: PullEventsConfig, index: int) -> date:
@@ -153,6 +159,7 @@ class Monitor:
         self.state.jobs.append(
             Job(
                 name=name,
+                submitted_at=self.now,
                 prediction_id=prediction.id,
                 reference_time=reference,
                 selected_types=self.config.selected_types,
@@ -208,6 +215,14 @@ class Monitor:
         job.status = status
         job.error = error
         await self.save()
+        # A stopped job does not fail the run, so flag it where operators look.
+        await log_action_activity(
+            self.integration_id,
+            COLLECT_ACTION,
+            f"Prediction {job.prediction_id} stopped ({status.value}): {error}",
+            level=LogLevel.WARNING,
+            data={"job": job.name, "prediction_id": job.prediction_id, "status": status.value},
+        )
 
     async def _fail_job(self, job: Job, error: IntegrationError):
         await self._stop_job(job, JobStatus.FAILED, str(error))
@@ -233,6 +248,14 @@ class Monitor:
             )
             return False
         if prediction.status != "completed":
+            waited = self.now - job.submitted_at
+            if waited > MAX_PREDICTION_WAIT:
+                await self._stop_job(
+                    job,
+                    JobStatus.FAILED,
+                    f"Prediction did not finish within {MAX_PREDICTION_WAIT.days} days "
+                    f"(last status: {prediction.status}).",
+                )
             return False
         if prediction.result is None or "mvt" not in prediction.result.file_formats:
             await self._fail_job(
@@ -325,13 +348,11 @@ class Monitor:
             "detections_by_kind": dict(kinds),
             "pages_read": pages,
             "known_sites": len(self.state.sites),
-            "jobs": [
-                {
-                    "prediction_id": j.prediction_id,
-                    "status": j.status.value,
-                    "offset": j.offset,
-                    "error": j.error,
-                }
-                for j in self.state.jobs
-            ],
+            # Only the job this run worked on, so log entries stay short as history grows.
+            "job": job and {
+                "prediction_id": job.prediction_id,
+                "status": job.status.value,
+                "offset": job.offset,
+                "error": job.error,
+            },
         }
