@@ -77,7 +77,6 @@ IDENTITY_FIELDS = {
     "schedule_start",
     "cadence",
     "change_date_property",
-    "change_date_precision",
 }
 
 

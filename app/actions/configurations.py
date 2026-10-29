@@ -119,11 +119,6 @@ class PullEventsConfig(PullActionConfiguration):
         min_length=1,
         description="Verified polygon property containing an ISO date, not a timestep index or encoded month count.",
     )
-    change_date_precision: str = pydantic.Field("month", regex="^(day|month)$")
-    change_date_aggregation: Optional[str] = pydantic.Field(
-        None,
-        description="Optional note of the model's date reduction (e.g. percentile_10), copied into each event. It does not change the model.",
-    )
     changes_since: Optional[date] = pydantic.Field(
         None,
         description="Optional fixed event-date cutoff. Never advanced as an ingestion watermark.",

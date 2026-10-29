@@ -59,7 +59,6 @@ def config():
         select_all_types=False,
         post_change_types=["mining"],
         change_date_property="onset",
-        change_date_aggregation="percentile_10",
     )
 
 
@@ -682,10 +681,9 @@ async def test_undelivered_page_is_kept_with_its_sites_for_resend(config, api, s
 
 
 @pytest.mark.asyncio
-async def test_event_type_and_aggregation_note_can_change(config, api, store):
+async def test_event_type_can_change(config, api, store):
     await seed(config, api, store)
     config.event_type = "olmoearth_mining"
-    config.change_date_aggregation = None
     await make_monitor(config, api, store).collect()
 
 
@@ -776,8 +774,8 @@ async def test_deleted_prediction_fails_its_job_instead_of_wedging(config, api, 
 @pytest.mark.asyncio
 async def test_identity_change_names_the_changed_settings(config, api, store):
     await seed(config, api, store)
-    config.change_date_precision = "day"
-    with pytest.raises(IntegrationConfigurationError, match=r"\(change_date_precision\)"):
+    config.change_date_property = "changed_on"
+    with pytest.raises(IntegrationConfigurationError, match=r"\(change_date_property\)"):
         await make_monitor(config, api, store).collect()
 
 

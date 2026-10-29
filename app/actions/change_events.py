@@ -21,6 +21,10 @@ from .monitor_state import Job, SiteRecord
 # or track IDs; the scheme prefix keeps the two kinds of ID from colliding.
 SITE_PRECISION = 7
 
+# How precise the LCC model's change dates are. A property of the model, not a
+# partner setting; revisit when the model's date output is settled.
+CHANGE_DATE_PRECISION = "month"
+
 NEW_SITE = "new_site"
 NEW_CHANGE_TYPE = "new_change_type"
 SEEN_BEFORE = "seen_before"
@@ -162,8 +166,7 @@ def prepare_event(
             "model_id": str(config.model_id),
             "first_discovered_at": now.isoformat(),
             "estimated_change_date": changed.isoformat(),
-            "change_date_precision": config.change_date_precision,
-            "change_date_aggregation": config.change_date_aggregation,
+            "change_date_precision": CHANGE_DATE_PRECISION,
             "prediction_reference_time": job.reference_time,
             "site_id": site,
             "detection_kind": kind,
