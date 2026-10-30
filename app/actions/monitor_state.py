@@ -32,6 +32,7 @@ class Job(BaseModel):
     """
 
     name: str
+    submitted_at: datetime
     prediction_id: str
     reference_time: str
     selected_types: list[str]
@@ -76,7 +77,6 @@ IDENTITY_FIELDS = {
     "schedule_start",
     "cadence",
     "change_date_property",
-    "change_date_precision",
 }
 
 

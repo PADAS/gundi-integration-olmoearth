@@ -15,6 +15,7 @@ from .core import (
     AuthActionConfiguration,
     ExecutableActionMixin,
     PullActionConfiguration,
+    ReferenceActionConfiguration,
 )
 
 
@@ -75,12 +76,23 @@ def polygon_shape(value: dict) -> BaseGeometry:
     return geom
 
 
+def _reference(action: str, params: Optional[dict] = None) -> dict:
+    """A ``gundi:reference`` ui_schema annotation: the portal fills the field from a
+    reference action's options. It deliberately sets no ``ui:widget``, so portals
+    without reference support keep showing a plain text field."""
+    return {"action": action, "target": "self", "params": params or {}, "allow_free_text": True}
+
+
 class PullEventsConfig(PullActionConfiguration):
-    project_id: UUID = FieldWithUIOptions(..., title="OlmoEarth project")
+    project_id: UUID = FieldWithUIOptions(
+        ...,
+        title="OlmoEarth project",
+        description="The project's UUID, as in its Studio URL (/projects/<uuid>).",
+    )
     model_id: UUID = FieldWithUIOptions(
         ...,
         title="LCC model",
-        description="Use a model configured to vectorize post_change and emit ISO date properties.",
+        description="The model's UUID, as in its Studio URL. Use a model configured to vectorize post_change and emit ISO date properties.",
     )
     area_of_interest: Dict[str, Any] = FieldWithUIOptions(
         ..., title="Area (GeoJSON geometry)", ui_options=UIOptions(widget="textarea")
@@ -107,11 +119,6 @@ class PullEventsConfig(PullActionConfiguration):
         min_length=1,
         description="Verified polygon property containing an ISO date, not a timestep index or encoded month count.",
     )
-    change_date_precision: str = pydantic.Field("month", regex="^(day|month)$")
-    change_date_aggregation: Optional[str] = pydantic.Field(
-        None,
-        description="Optional note of the model's date reduction (e.g. percentile_10), copied into each event. It does not change the model.",
-    )
     changes_since: Optional[date] = pydantic.Field(
         None,
         description="Optional fixed event-date cutoff. Never advanced as an ingestion watermark.",
@@ -128,6 +135,16 @@ class PullEventsConfig(PullActionConfiguration):
             raise ValueError("Select at least one change type or enable Select all")
         return values
 
+    @classmethod
+    def ui_schema(cls, *args, **kwargs):
+        ui = super().ui_schema(*args, **kwargs)
+        ui.setdefault("project_id", {})["gundi:reference"] = _reference("list_projects")
+        # $data paths start at the field's containing object, so a sibling is its key.
+        ui.setdefault("model_id", {})["gundi:reference"] = _reference(
+            "list_models", {"project_id": {"$data": "project_id"}}
+        )
+        return ui
+
     @property
     def selected_types(self) -> List[str]:
         types = list(PostChange) if self.select_all_types else self.post_change_types
@@ -141,3 +158,12 @@ class SubmitPredictionsConfig(PullActionConfiguration):
         description="Uses the saved Collect LCC events configuration. Running manually also submits a due prediction.",
     )
 
+
+class ListProjectsConfig(ReferenceActionConfiguration):
+    """Options for the project field: projects the API token can access."""
+
+
+class ListModelsConfig(ReferenceActionConfiguration):
+    """Options for the model field: finished fine-tuned models in one project."""
+
+    project_id: UUID

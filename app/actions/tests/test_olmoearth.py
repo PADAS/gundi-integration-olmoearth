@@ -59,8 +59,13 @@ def config():
         select_all_types=False,
         post_change_types=["mining"],
         change_date_property="onset",
-        change_date_aggregation="percentile_10",
     )
+
+
+@pytest.fixture(autouse=True)
+def activity_log(mocker):
+    """The template's activity log publishes to PubSub; record calls instead."""
+    return mocker.patch.object(monitor_module, "log_action_activity", AsyncMock())
 
 
 @pytest.fixture(autouse=True)
@@ -143,6 +148,7 @@ def pending_job(config, prediction_id="p1", name=None, reference_time="2026-10-0
         prediction_id=prediction_id,
         reference_time=reference_time,
         selected_types=config.selected_types,
+        submitted_at=NOW,
     )
 
 
@@ -272,7 +278,7 @@ async def test_late_discovery_uses_change_date_and_keeps_both_result_ids(
     assert event["event_details"]["first_discovered_at"].startswith("2026-10-23")
     assert event["event_details"]["prediction_result_id"] == "r1"
     assert event["event_details"]["oerun_prediction_result_id"] == "run-result-id"
-    assert result["jobs"][0]["status"] == "complete"
+    assert result["job"]["status"] == "complete"
     assert api.search_features.call_args.args[0] == "r1"
 
 
@@ -389,7 +395,7 @@ async def test_failed_prediction_is_recorded_and_other_jobs_can_continue(
     monitor = await seed(config, api, store)
     api.get_prediction.return_value = prediction(status="failed")
     result = await monitor.collect()
-    assert result["jobs"][0]["status"] == "failed"
+    assert result["job"]["status"] == "failed"
     api.search_features.assert_not_called()
 
 
@@ -420,7 +426,7 @@ async def test_search_window_is_explicitly_incomplete(config, api, store):
     monitor.state.jobs[0].offset = 10000
     await monitor.save()
     result = await monitor.collect()
-    assert result["jobs"][0]["status"] == "needs_export"
+    assert result["job"]["status"] == "needs_export"
     api.search_features.assert_not_called()
 
 
@@ -675,10 +681,9 @@ async def test_undelivered_page_is_kept_with_its_sites_for_resend(config, api, s
 
 
 @pytest.mark.asyncio
-async def test_event_type_and_aggregation_note_can_change(config, api, store):
+async def test_event_type_can_change(config, api, store):
     await seed(config, api, store)
     config.event_type = "olmoearth_mining"
-    config.change_date_aggregation = None
     await make_monitor(config, api, store).collect()
 
 
@@ -769,6 +774,105 @@ async def test_deleted_prediction_fails_its_job_instead_of_wedging(config, api, 
 @pytest.mark.asyncio
 async def test_identity_change_names_the_changed_settings(config, api, store):
     await seed(config, api, store)
-    config.change_date_precision = "day"
-    with pytest.raises(IntegrationConfigurationError, match=r"\(change_date_precision\)"):
+    config.change_date_property = "changed_on"
+    with pytest.raises(IntegrationConfigurationError, match=r"\(change_date_property\)"):
         await make_monitor(config, api, store).collect()
+
+
+@pytest.mark.asyncio
+async def test_stalled_prediction_fails_after_max_wait(config, api, store, activity_log):
+    await seed(config, api, store)
+    api.get_prediction.return_value = prediction(status="queued")
+    soon = NOW + monitor_module.MAX_PREDICTION_WAIT - dt.timedelta(hours=1)
+    assert (await make_monitor(config, api, store, now=soon).collect())["job"]["status"] == "pending"
+    activity_log.assert_not_awaited()
+    late = NOW + monitor_module.MAX_PREDICTION_WAIT + dt.timedelta(hours=1)
+    result = await make_monitor(config, api, store, now=late).collect()
+    assert result["job"]["status"] == "failed"
+    assert "did not finish within 3 days (last status: queued)" in result["job"]["error"]
+    assert activity_log.call_args.kwargs["level"] == monitor_module.LogLevel.WARNING
+    assert "submitted_prediction_id" in await make_monitor(config, api, store, now=late).submit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "setup,status",
+    [
+        (lambda api: setattr(api.get_prediction, "return_value", prediction(status="cancelled")), "failed"),
+        (lambda api: setattr(api.search_features, "return_value", page([], total=20000)), "needs_export"),
+    ],
+)
+async def test_quietly_stopped_job_logs_a_warning(config, api, store, activity_log, setup, status):
+    monitor = await seed(config, api, store)
+    setup(api)
+    result = await monitor.collect()
+    assert result["job"]["status"] == status
+    (integration_id, action_id, title), kwargs = activity_log.call_args
+    assert (integration_id, action_id) == ("integration-1", "pull_events")
+    assert f"({status})" in title
+    assert kwargs["level"] == monitor_module.LogLevel.WARNING
+
+
+@pytest.mark.asyncio
+async def test_result_reports_only_the_current_job(config, api, store):
+    monitor = await seed(config, api, store)
+    monitor.state.jobs.insert(0, pending_job(config, "old", name="old").copy(update={"status": "complete"}))
+    await monitor.save()
+    result = await make_monitor(config, api, store).collect()
+    assert result["job"]["prediction_id"] == "p1"
+    assert "jobs" not in result
+    assert (await make_monitor(config, api, store).collect())["job"] is None
+
+
+def test_form_dropdowns_name_registered_reference_actions():
+    from app.actions.core import ReferenceActionConfiguration, discover_actions
+
+    actions = discover_actions("app.actions.handlers", "action_")
+    ui = PullEventsConfig.ui_schema()
+    for field in ("project_id", "model_id"):
+        reference = ui[field]["gundi:reference"]
+        handler, config_model, _ = actions[reference["action"]]
+        assert issubclass(config_model, ReferenceActionConfiguration)
+        assert set(reference["params"]) <= set(config_model.__fields__)
+        assert "ui:widget" not in ui[field]
+    assert ui["model_id"]["gundi:reference"]["params"] == {"project_id": {"$data": "project_id"}}
+    schema = PullEventsConfig.schema()["properties"]
+    assert "UUID" in schema["project_id"]["description"]
+    assert "UUID" in schema["model_id"]["description"]
+
+
+@pytest.mark.asyncio
+async def test_reference_actions_list_projects_and_finished_models(mocker):
+    seen = []
+
+    def route(request):
+        seen.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(
+            200,
+            json={
+                "records": [{"id": PROJECT, "name": "Mining pilot"}, {"id": MODEL}],
+                "meta": {"total": 3},
+            },
+        )
+
+    mocker.patch.object(
+        handlers,
+        "client_for",
+        lambda integration: client.OlmoEarthClient(
+            "https://example.test", "token", transport=httpx.MockTransport(route)
+        ),
+    )
+    from app.actions.configurations import ListModelsConfig, ListProjectsConfig
+
+    projects = await handlers.action_list_projects(SimpleNamespace(), ListProjectsConfig())
+    assert projects["options"][0] == {
+        "value": PROJECT, "label": "Mining pilot", "description": None, "group": None
+    }
+    assert projects["options"][1]["label"] == MODEL
+    assert projects["truncated"] is True
+    await handlers.action_list_models(SimpleNamespace(), ListModelsConfig(project_id=PROJECT))
+    path, body = seen[-1]
+    assert path == "/api/v1/models/search"
+    assert body["project_id"] == {"eq": PROJECT}
+    assert body["model_type"] == {"eq": "fine_tuned"}
+    assert body["status"] == {"eq": "completed"}
