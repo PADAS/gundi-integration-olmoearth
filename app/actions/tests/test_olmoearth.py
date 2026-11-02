@@ -599,6 +599,9 @@ def test_portal_schema_and_example_keep_environment_and_ids_configurable():
     assert schema["properties"]["post_change_types"]["type"] == "array"
     assert schema["properties"]["post_change_types"]["uniqueItems"] is True
     assert PullEventsConfig.ui_schema()["post_change_types"]["ui:widget"] == "select"
+    order = PullEventsConfig.ui_schema()["ui:order"]
+    assert order[:2] == ["project_id", "model_id"]
+    assert set(order) - {"*"} <= set(schema["properties"])
     assert parsed.selected_types == ["mining"]
 
 
