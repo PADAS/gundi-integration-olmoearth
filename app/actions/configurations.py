@@ -153,6 +153,20 @@ class PullEventsConfig(PullActionConfiguration):
     @classmethod
     def ui_schema(cls, *args, **kwargs):
         ui = super().ui_schema(*args, **kwargs)
+        # The portal does not keep schema order; the model list depends on the
+        # project, so the project comes first.
+        ui["ui:order"] = [
+            "project_id",
+            "model_id",
+            "area_of_interest",
+            "cadence",
+            "schedule_start",
+            "select_all_types",
+            "post_change_types",
+            "changes_since",
+            "event_type",
+            "*",
+        ]
         ui.setdefault("project_id", {})["gundi:reference"] = _reference("list_projects")
         # $data paths start at the field's containing object, so a sibling is its key.
         ui.setdefault("model_id", {})["gundi:reference"] = _reference(

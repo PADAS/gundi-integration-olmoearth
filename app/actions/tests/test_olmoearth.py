@@ -599,6 +599,9 @@ def test_portal_schema_and_example_keep_environment_and_ids_configurable():
     assert schema["properties"]["post_change_types"]["type"] == "array"
     assert schema["properties"]["post_change_types"]["uniqueItems"] is True
     assert PullEventsConfig.ui_schema()["post_change_types"]["ui:widget"] == "select"
+    order = PullEventsConfig.ui_schema()["ui:order"]
+    assert order[:2] == ["project_id", "model_id"]
+    assert set(order) - {"*"} <= set(schema["properties"])
     assert parsed.selected_types == ["mining"]
 
 
@@ -857,6 +860,7 @@ async def test_reference_actions_list_projects_and_finished_models(mocker):
             json={
                 "records": [{"id": PROJECT, "name": "Mining pilot"}, {"id": MODEL}],
                 "meta": {"total": 3},
+                "errors": None,  # as OlmoEarth sends it on success
             },
         )
 
@@ -881,3 +885,8 @@ async def test_reference_actions_list_projects_and_finished_models(mocker):
     assert body["project_id"] == {"eq": PROJECT}
     assert body["model_type"] == {"eq": "fine_tuned"}
     assert body["status"] == {"eq": "completed"}
+
+
+def test_null_envelope_fields_read_as_empty():
+    parsed = client.NamedRecordResponse.parse_obj({"records": None, "meta": None, "errors": None})
+    assert (parsed.records, parsed.meta.total, parsed.errors) == ([], None, [])
