@@ -115,6 +115,12 @@ class _Records(pydantic.BaseModel):
     class Config:
         extra = "allow"
 
+    @pydantic.root_validator(pre=True)
+    def null_means_empty(cls, values):
+        # OlmoEarth's envelope (ApiOutputModel) sends records, meta and errors as
+        # null when empty, e.g. "errors": null on every success.
+        return {key: value for key, value in values.items() if value is not None}
+
 
 class NamedRecord(pydantic.BaseModel):
     """A project or model, as far as a dropdown needs it."""

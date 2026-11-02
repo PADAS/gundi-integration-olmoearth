@@ -860,6 +860,7 @@ async def test_reference_actions_list_projects_and_finished_models(mocker):
             json={
                 "records": [{"id": PROJECT, "name": "Mining pilot"}, {"id": MODEL}],
                 "meta": {"total": 3},
+                "errors": None,  # as OlmoEarth sends it on success
             },
         )
 
@@ -884,3 +885,8 @@ async def test_reference_actions_list_projects_and_finished_models(mocker):
     assert body["project_id"] == {"eq": PROJECT}
     assert body["model_type"] == {"eq": "fine_tuned"}
     assert body["status"] == {"eq": "completed"}
+
+
+def test_null_envelope_fields_read_as_empty():
+    parsed = client.NamedRecordResponse.parse_obj({"records": None, "meta": None, "errors": None})
+    assert (parsed.records, parsed.meta.total, parsed.errors) == ([], None, [])
