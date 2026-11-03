@@ -111,7 +111,12 @@ class PullEventsConfig(PullActionConfiguration):
     schedule_start: date = FieldWithUIOptions(
         ...,
         title="First prediction date (UTC)",
-        description="Missed schedule slots are processed oldest first.",
+        description="Changing this or the frequency restarts the schedule from the first date on or after today.",
+    )
+    extra_prediction_on: Optional[date] = FieldWithUIOptions(
+        None,
+        title="Extra prediction on (UTC)",
+        description="One prediction on this date, on top of the schedule. Set it to today to send one now. Each date runs once.",
     )
     select_all_types: bool = FieldWithUIOptions(True, title="Select all change types")
     post_change_types: List[PostChange] = FieldWithUIOptions(
@@ -161,6 +166,7 @@ class PullEventsConfig(PullActionConfiguration):
             "area_of_interest",
             "cadence",
             "schedule_start",
+            "extra_prediction_on",
             "select_all_types",
             "post_change_types",
             "changes_since",

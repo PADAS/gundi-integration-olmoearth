@@ -9,7 +9,7 @@ untracked environment file, not these examples.
 | --- | --- | --- |
 | OlmoEarth environment URL | `olmoearth-site.json` | Integration site/base URL |
 | OlmoEarth API token | `olmoearth-auth.json` | Authenticate action |
-| Project, model, area, cadence, classes and date semantics | `lcc-monitor.json` | Collect LCC Events action |
+| Project, model, area, cadence, extra prediction date and classes | `lcc-monitor.json` | Collect LCC Events action |
 | Gundi OAuth client ID/secret, issuer/audience and API URLs | `../local/.env.local.example` | Copy to `local/.env.local` for the runner |
 
 The Gundi environment example contains staging URL/client defaults and a secret

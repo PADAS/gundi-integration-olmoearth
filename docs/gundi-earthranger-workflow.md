@@ -40,7 +40,7 @@ These are logical responsibilities, not a verified deployment inventory. Gundi i
 ## One monitoring cycle
 
 1. Save one Gundi integration for one area/model. Configure the OlmoEarth base URL and token, project, model, area geometry, selected `post_change` labels and cadence.
-2. Gundi triggers Submit LCC Predictions every four hours when enabled. The runner checks whether the selected weekly/monthly/quarterly/annual slot is due. Scheduled submission defaults off.
+2. Gundi triggers Submit LCC Predictions every four hours when enabled. The runner checks whether an extra prediction date or the selected weekly/monthly/quarterly/annual slot is due. Scheduled submission defaults off.
 3. Search for the slot's unique prediction name; adopt a single match, otherwise call `POST /api/v1/predictions` once. Record the job (name, prediction ID, reference time, selected classes) only once a prediction ID is in hand, so a lost response is recovered by name on the next run and any failure leaves the slot due. Use a model already configured for vectorization; there is no request-level vectorization flag.
 4. Collect LCC Events polls `GET /api/v1/predictions/{id}`. Once complete, read the nested `result.id`.
 5. Search `POST /api/v1/prediction-results/{result_id}/features/search` with AOI and class filters. Read date properties from the returned polygons and apply any fixed `changes_since` cutoff locally.
@@ -85,7 +85,7 @@ A page with nothing to send skips straight to the commit. Search is limited to t
 
 The partner should see the selected project's existing areas and choose one, or choose **Create new area**. They name and draw/upload the boundary, save it to the OlmoEarth project, and the newly returned area ID becomes available for future selections.
 
-The desired connector contract is an area ID plus a resolved geometry snapshot for the prediction/filter boundary. The current code accepts geometry directly and snapshots the configuration per job. It does not yet list or create areas. Verify the Studio list/create endpoints, permissions and Gundi reference-field/map/upload support before implementing this flow. Define how a later edit to a saved boundary affects a monitor; do not silently mix boundaries with pending jobs.
+The desired connector contract is an area ID plus a resolved geometry snapshot for the prediction/filter boundary. The current code accepts geometry directly and snapshots the configuration per job. It does not yet list or create areas. Verify the Studio list/create endpoints, permissions and Gundi reference-field/map/upload support before implementing this flow. An edited boundary applies from the next submitted job; each job keeps the area it was submitted with.
 
 ## Credentials and configuration
 

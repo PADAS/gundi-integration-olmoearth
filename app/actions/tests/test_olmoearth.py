@@ -782,9 +782,109 @@ async def test_deleted_prediction_fails_its_job_instead_of_wedging(config, api, 
 @pytest.mark.asyncio
 async def test_identity_change_names_the_changed_settings(config, api, store):
     await seed(config, api, store)
-    config.cadence = Cadence.MONTHLY
-    with pytest.raises(IntegrationConfigurationError, match=r"\(cadence\)"):
+    config.model_id = ORG
+    with pytest.raises(IntegrationConfigurationError, match=r"\(model_id\)"):
         await make_monitor(config, api, store).collect()
+
+
+OTHER_AREA = {
+    "type": "Polygon",
+    "coordinates": [[[20, 20], [21, 20], [21, 21], [20, 21], [20, 20]]],
+}
+
+
+@pytest.mark.asyncio
+async def test_area_change_applies_to_the_next_job_only(config, api, store):
+    await make_monitor(config, api, store).submit()
+    config.area_of_interest = OTHER_AREA
+    await make_monitor(config, api, store).collect()
+    assert api.search_features.call_args.args[1].intersects_geometry.dict(
+        exclude_none=True
+    ) == AREA
+    store.value["jobs"][0]["status"] = "complete"
+    await make_monitor(config, api, store).submit()
+    body = api.create_prediction.call_args.args[0]
+    assert body["geojson"]["features"][0]["geometry"] == OTHER_AREA
+    assert store.value["jobs"][1]["area_of_interest"] == OTHER_AREA
+
+
+@pytest.mark.asyncio
+async def test_schedule_change_restarts_without_back_filling(config, api, store):
+    await make_monitor(config, api, store).submit()
+    store.value["jobs"][0]["status"] = "complete"
+    # Weekly from 1 August: 23 October is not a slot, so the next is 24 October.
+    config.schedule_start = dt.date(2026, 8, 1)
+    result = await make_monitor(config, api, store).submit()
+    assert result == {"status": "not_due", "next_prediction_date": "2026-10-24"}
+    assert store.value["schedule"]["schedule_start"] == "2026-08-01"
+    api.create_prediction.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_schedule_restarted_today_submits_today(config, api, store):
+    await make_monitor(config, api, store).submit()
+    store.value["jobs"][0]["status"] = "complete"
+    config.schedule_start = NOW.date()
+    config.cadence = Cadence.MONTHLY
+    await make_monitor(config, api, store).submit()
+    body = api.create_prediction.call_args.args[0]
+    assert body["start_time"] == "2026-10-09T00:00:00+00:00"
+    assert store.value["next_slot"] == 1
+
+
+@pytest.mark.asyncio
+async def test_extra_prediction_runs_once_and_keeps_the_schedule(config, api, store):
+    config.schedule_start = dt.date(2027, 1, 1)
+    config.extra_prediction_on = NOW.date()
+    result = await make_monitor(config, api, store).submit()
+    assert result["submitted_prediction_id"] == "p1"
+    assert store.value["jobs"][0]["name"] == "gundi:integration-1:1:extra-2026-10-23"
+    assert store.value["next_slot"] == 0
+    store.value["jobs"][0]["status"] = "complete"
+    result = await make_monitor(config, api, store).submit()
+    assert result == {"status": "not_due", "next_prediction_date": "2027-01-01"}
+    api.create_prediction.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_future_extra_prediction_waits(config, api, store):
+    config.schedule_start = dt.date(2027, 1, 1)
+    config.extra_prediction_on = dt.date(2026, 11, 1)
+    assert (await make_monitor(config, api, store).submit())["status"] == "not_due"
+    api.create_prediction.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reused_slot_date_is_a_new_prediction(config, api, store):
+    await make_monitor(config, api, store).submit()
+    store.value["jobs"][0]["status"] = "complete"
+    config.cadence = Cadence.MONTHLY
+    store.value["schedule"]["schedule_start"] = "2026-01-01"
+    config.schedule_start = dt.date(2026, 10, 23)
+    await make_monitor(config, api, store).submit()
+    names = [job["name"] for job in store.value["jobs"]]
+    assert names == ["gundi:integration-1:1:2026-10-01", "gundi:integration-1:2:2026-10-23"]
+
+
+@pytest.mark.asyncio
+async def test_state_from_before_editable_settings_keeps_its_schedule(config, api, store):
+    store.value = {
+        "identity": {
+            "base_url": api.base_url,
+            "project_id": PROJECT,
+            "model_id": MODEL,
+            "area_of_interest": AREA,
+            "schedule_start": "2026-10-01",
+            "cadence": "weekly",
+        },
+        "next_slot": 3,
+        "jobs": [],
+    }
+    config.area_of_interest = OTHER_AREA
+    await make_monitor(config, api, store).submit()
+    assert api.create_prediction.call_args.args[0]["start_time"] == "2026-10-08T00:00:00+00:00"
+    assert store.value["next_slot"] == 4
+    assert "area_of_interest" not in store.value["identity"]
 
 
 @pytest.mark.asyncio

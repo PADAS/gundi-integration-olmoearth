@@ -33,6 +33,7 @@ from .monitor_state import (
     MonitorState,
     Outbox,
     monitor_identity,
+    monitor_schedule,
 )
 
 # Elasticsearch's from+size limit for the features search.
@@ -67,7 +68,7 @@ def build_feature_query(
     return FeatureSearchRequest(
         limit=min(FEATURE_PAGE_SIZE, RESULT_WINDOW - offset),
         offset=offset,
-        intersects_geometry=config.area_of_interest,
+        intersects_geometry=job.area_of_interest or config.area_of_interest,
         property_filters=[
             PropertyFilter(
                 property_name="post_change",
@@ -101,17 +102,34 @@ class Monitor:
         self.state = (
             MonitorState.parse_obj(raw) if raw else MonitorState(identity=identity)
         )
+        # Only the identity keys still pinned are compared; older state also pinned
+        # the area and schedule, which can now change.
         changed = sorted(
-            key
-            for key in identity.keys() | self.state.identity.keys()
-            if identity.get(key) != self.state.identity.get(key)
+            key for key in identity if identity[key] != self.state.identity.get(key)
         )
         if changed:
             raise IntegrationConfigurationError(
-                f"Monitor settings changed ({', '.join(changed)}). Environment, model, area, "
-                "project, date semantics or schedule changes need a new monitor integration "
-                "to preserve existing jobs and event identity."
+                f"Monitor settings changed ({', '.join(changed)}). Environment, project "
+                "or model changes need a new monitor integration to preserve existing "
+                "jobs and event identity."
             )
+        schedule = monitor_schedule(self.config)
+        if self.state.schedule is None:
+            # State saved before the schedule could change pinned it in the identity.
+            old = {key: self.state.identity.get(key) for key in schedule}
+            self.state.schedule = old if all(old.values()) else schedule
+        self.state.identity = identity
+        if self.state.schedule != schedule:
+            await self._restart_schedule(schedule)
+
+    async def _restart_schedule(self, schedule: dict):
+        """Count the new schedule from its first date on or after today; never back-fill."""
+        index = 0
+        while schedule_slot(self.config, index) < self.now.date():
+            index += 1
+        self.state.schedule = schedule
+        self.state.next_slot = index
+        await self.save()
 
     async def save(self):
         # One value holds the whole ledger, so every save is atomic.
@@ -121,16 +139,25 @@ class Monitor:
         await self.load()
         if any(j.status in ACTIVE_JOB_STATUSES for j in self.state.jobs):
             return {"status": "waiting_for_existing_prediction"}
-        slot = schedule_slot(self.config, self.state.next_slot)
-        if slot > self.now.date():
-            return {"status": "not_due", "next_prediction_date": slot.isoformat()}
+        today = self.now.date()
+        extra = self.config.extra_prediction_on
+        if extra and extra <= today and extra != self.state.extra_submitted_for:
+            # An extra prediction goes first and leaves the schedule where it was.
+            slot, label = extra, f"extra-{extra.isoformat()}"
+        else:
+            extra = None
+            slot = schedule_slot(self.config, self.state.next_slot)
+            if slot > today:
+                return {"status": "not_due", "next_prediction_date": slot.isoformat()}
+            label = slot.isoformat()
         project_id, model_id = str(self.config.project_id), str(self.config.model_id)
         reference = datetime.combine(
             slot - timedelta(days=IMAGERY_LAG_DAYS), time(), timezone.utc
         ).isoformat()
-        # The name is unique per monitor and slot, so a POST whose outcome was lost
-        # is found here on the next run instead of being sent twice.
-        name = f"gundi:{self.integration_id}:{slot.isoformat()}"
+        # The name is unique per monitor and job, so a POST whose outcome was lost
+        # is found here on the next run instead of being sent twice. The job number
+        # keeps a date reused by a restarted schedule from matching an old prediction.
+        name = f"gundi:{self.integration_id}:{len(self.state.jobs) + 1}:{label}"
         prediction = await self._find_prediction(name, project_id, model_id)
         recovered = prediction is not None
         if not recovered:
@@ -163,10 +190,14 @@ class Monitor:
                 prediction_id=prediction.id,
                 reference_time=reference,
                 selected_types=self.config.selected_types,
+                area_of_interest=self.config.area_of_interest,
                 changes_since=self.config.changes_since,
             )
         )
-        self.state.next_slot += 1
+        if extra:
+            self.state.extra_submitted_for = extra
+        else:
+            self.state.next_slot += 1
         await self.save()
         key = "recovered_prediction_id" if recovered else "submitted_prediction_id"
         return {key: prediction.id, "reference_date": reference}
