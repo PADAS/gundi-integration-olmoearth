@@ -67,6 +67,10 @@ own configuration determines its imagery lookbehind. Frequency does not set that
 lookbehind or imply event-date precision. Annual sampling is not a promise of exhaustive
 annual coverage. Missed slots catch up oldest first, with at most one job in flight.
 
+**Extra prediction on** sends one prediction on that date (or as soon as it is due),
+on top of the schedule and without moving it. Set it to today to send one now; each date
+runs once, so saving the form again does not resend it.
+
 ## Dates and repeated detections
 
 - `recorded_at` uses the polygon's `ts_start` date (start of the change window), encoded as UTC midnight; `ts_end` is in `event_details`.
@@ -74,11 +78,14 @@ annual coverage. Missed slots catch up oldest first, with at most one job in fli
 - `first_discovered_at` is when the connector found the polygon. A late-discovered change
   is retained even if its estimated date predates the last poll.
 - `changes_since`, if set, is a fixed initial event-date cutoff. It never advances as a cursor.
-- Selected classes and `changes_since` are snapshotted per submitted job. Changing them
-  affects future jobs, not a half-read result or already delivered history.
-- Environment/project/model/area/schedule
-  changes require a new monitor integration, preserving old jobs instead of silently mixing
-  identities; the refusal names the settings that changed. The event type can be edited freely.
+- The area, selected classes and `changes_since` are snapshotted per submitted job. Changing
+  them affects future jobs, not a half-read result or already delivered history.
+- A new schedule, or a changed first prediction date or frequency, starts from its first
+  date on or after today (the next one, if a prediction was already sent today); it does
+  not back-fill earlier dates.
+- Environment/project/model changes require a new monitor integration, preserving old jobs
+  instead of silently mixing identities; the refusal names the settings that changed. The
+  event type can be edited freely.
 
 Every new event gets a deterministic `event_details.external_event_id`. Gundi's REST
 `source` identifies the monitor, **not** a per-event idempotency key. See the
