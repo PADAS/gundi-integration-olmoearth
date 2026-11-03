@@ -68,7 +68,7 @@ def build_feature_query(
     return FeatureSearchRequest(
         limit=min(FEATURE_PAGE_SIZE, RESULT_WINDOW - offset),
         offset=offset,
-        intersects_geometry=job.area_of_interest or config.area_of_interest,
+        intersects_geometry=job.area_of_interest,
         property_filters=[
             PropertyFilter(
                 property_name="post_change",
@@ -114,22 +114,46 @@ class Monitor:
                 "jobs and event identity."
             )
         schedule = monitor_schedule(self.config)
-        if self.state.schedule is None:
-            # State saved before the schedule could change pinned it in the identity.
-            old = {key: self.state.identity.get(key) for key in schedule}
-            self.state.schedule = old if all(old.values()) else schedule
+        if raw and self.state.schedule is None:
+            # State saved before the area and schedule could change pinned them in
+            # the identity; move them to where they live now.
+            self.state.schedule = {key: self.state.identity.get(key) for key in schedule}
+            for job in self.state.jobs:
+                job.area_of_interest = job.area_of_interest or self.state.identity.get(
+                    "area_of_interest", self.config.area_of_interest
+                )
         self.state.identity = identity
         if self.state.schedule != schedule:
-            await self._restart_schedule(schedule)
+            self._restart_schedule(schedule)
 
-    async def _restart_schedule(self, schedule: dict):
-        """Count the new schedule from its first date on or after today; never back-fill."""
+    def _restart_schedule(self, schedule: dict):
+        """Count a new or changed schedule from its first date after both yesterday and
+        the last submission, so it never back-fills or sends twice in a day. Kept in
+        memory; the next submission saves it."""
+        after = self.now.date() - timedelta(days=1)
+        if self.state.jobs:
+            after = max(after, self.state.jobs[-1].submitted_at.date())
         index = 0
-        while schedule_slot(self.config, index) < self.now.date():
+        while schedule_slot(self.config, index) <= after:
             index += 1
         self.state.schedule = schedule
         self.state.next_slot = index
-        await self.save()
+
+    def _due_slot(self) -> tuple[date, str, bool]:
+        """The next prediction date, its name label, and whether it is an extra one.
+        A due extra date goes first and leaves the schedule where it was."""
+        extra = self.config.extra_prediction_on
+        if extra and extra <= self.now.date():
+            label = f"extra-{extra.isoformat()}"
+            if not any(job.name == self._prediction_name(label) for job in self.state.jobs):
+                return extra, label, True
+        slot = schedule_slot(self.config, self.state.next_slot)
+        return slot, slot.isoformat(), False
+
+    def _prediction_name(self, label: str) -> str:
+        # Unique per monitor and slot, so a POST whose outcome was lost is found by
+        # name on the next run instead of being sent twice.
+        return f"gundi:{self.integration_id}:{label}"
 
     async def save(self):
         # One value holds the whole ledger, so every save is atomic.
@@ -139,25 +163,15 @@ class Monitor:
         await self.load()
         if any(j.status in ACTIVE_JOB_STATUSES for j in self.state.jobs):
             return {"status": "waiting_for_existing_prediction"}
-        today = self.now.date()
-        extra = self.config.extra_prediction_on
-        if extra and extra <= today and extra != self.state.extra_submitted_for:
-            # An extra prediction goes first and leaves the schedule where it was.
-            slot, label = extra, f"extra-{extra.isoformat()}"
-        else:
-            extra = None
-            slot = schedule_slot(self.config, self.state.next_slot)
-            if slot > today:
-                return {"status": "not_due", "next_prediction_date": slot.isoformat()}
-            label = slot.isoformat()
+        slot, label, is_extra = self._due_slot()
+        if slot > self.now.date():
+            return {"status": "not_due", "next_prediction_date": slot.isoformat()}
+        area = self.config.area_of_interest
         project_id, model_id = str(self.config.project_id), str(self.config.model_id)
         reference = datetime.combine(
             slot - timedelta(days=IMAGERY_LAG_DAYS), time(), timezone.utc
         ).isoformat()
-        # The name is unique per monitor and job, so a POST whose outcome was lost
-        # is found here on the next run instead of being sent twice. The job number
-        # keeps a date reused by a restarted schedule from matching an old prediction.
-        name = f"gundi:{self.integration_id}:{len(self.state.jobs) + 1}:{label}"
+        name = self._prediction_name(label)
         prediction = await self._find_prediction(name, project_id, model_id)
         recovered = prediction is not None
         if not recovered:
@@ -173,7 +187,7 @@ class Monitor:
                         "features": [
                             {
                                 "type": "Feature",
-                                "geometry": self.config.area_of_interest,
+                                "geometry": area,
                                 "properties": {
                                     "start_time": reference,
                                     "end_time": reference,
@@ -190,13 +204,11 @@ class Monitor:
                 prediction_id=prediction.id,
                 reference_time=reference,
                 selected_types=self.config.selected_types,
-                area_of_interest=self.config.area_of_interest,
+                area_of_interest=area,
                 changes_since=self.config.changes_since,
             )
         )
-        if extra:
-            self.state.extra_submitted_for = extra
-        else:
+        if not is_extra:
             self.state.next_slot += 1
         await self.save()
         key = "recovered_prediction_id" if recovered else "submitted_prediction_id"

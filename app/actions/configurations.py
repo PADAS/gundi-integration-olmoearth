@@ -111,7 +111,7 @@ class PullEventsConfig(PullActionConfiguration):
     schedule_start: date = FieldWithUIOptions(
         ...,
         title="First prediction date (UTC)",
-        description="Changing this or the frequency restarts the schedule from the first date on or after today.",
+        description="The schedule starts from the first date on or after today; changing this or the frequency restarts it.",
     )
     extra_prediction_on: Optional[date] = FieldWithUIOptions(
         None,

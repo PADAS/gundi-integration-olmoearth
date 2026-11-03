@@ -36,7 +36,7 @@ class Job(BaseModel):
     prediction_id: str
     reference_time: str
     selected_types: list[str]
-    # None on jobs saved before the area could change; they use the configured area.
+    # None only until load() fills it on jobs saved before the area could change.
     area_of_interest: Optional[dict] = None
     changes_since: Optional[date] = None
     result_id: Optional[str] = None
@@ -70,8 +70,6 @@ class MonitorState(BaseModel):
     # schedule could change.
     schedule: Optional[dict] = None
     next_slot: int = 0
-    # The last "Extra prediction on" date submitted, so each date runs once.
-    extra_submitted_for: Optional[date] = None
     jobs: list[Job] = Field(default_factory=list)
     sites: dict[str, SiteRecord] = Field(default_factory=dict)
     outbox: Optional[Outbox] = None
@@ -82,13 +80,14 @@ IDENTITY_FIELDS = {"project_id", "model_id"}
 SCHEDULE_FIELDS = {"schedule_start", "cadence"}
 
 
+def _settings(config: PullEventsConfig, fields: set) -> dict:
+    return json.loads(config.json(include=fields))
+
+
 def monitor_identity(config: PullEventsConfig, base_url: str) -> dict:
     """The settings a monitor's jobs and event IDs depend on; changing any needs a new monitor."""
-    return {
-        "base_url": base_url,
-        **json.loads(config.json(include=IDENTITY_FIELDS)),
-    }
+    return {"base_url": base_url, **_settings(config, IDENTITY_FIELDS)}
 
 
 def monitor_schedule(config: PullEventsConfig) -> dict:
-    return json.loads(config.json(include=SCHEDULE_FIELDS))
+    return _settings(config, SCHEDULE_FIELDS)

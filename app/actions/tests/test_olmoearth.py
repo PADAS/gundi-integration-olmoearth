@@ -54,7 +54,7 @@ def config():
         project_id=PROJECT,
         model_id=MODEL,
         area_of_interest=AREA,
-        schedule_start="2026-10-01",
+        schedule_start="2026-10-23",
         cadence="weekly",
         select_all_types=False,
         post_change_types=["mining"],
@@ -147,8 +147,15 @@ def pending_job(config, prediction_id="p1", name=None, reference_time="2026-10-0
         prediction_id=prediction_id,
         reference_time=reference_time,
         selected_types=config.selected_types,
+        area_of_interest=config.area_of_interest,
         submitted_at=NOW,
     )
+
+
+async def submit_and_complete(config, api, store, now=NOW):
+    result = await make_monitor(config, api, store, now).submit()
+    store.value["jobs"][-1]["status"] = "complete"
+    return result
 
 
 async def seed(config, api, store, jobs=None):
@@ -216,7 +223,7 @@ async def test_due_submission_is_saved_with_reference_date_and_no_vectorize_flag
     result = await make_monitor(config, api, store).submit()
     body = api.create_prediction.call_args.args[0]
     assert body["project_id"] == PROJECT
-    assert body["start_time"] == body["end_time"] == "2026-09-17T00:00:00+00:00"
+    assert body["start_time"] == body["end_time"] == "2026-10-09T00:00:00+00:00"
     assert body["geojson"]["features"][0]["geometry"] == AREA
     assert "vectorize" not in body
     assert result["submitted_prediction_id"] == "p1"
@@ -665,7 +672,6 @@ async def test_failed_submission_saves_nothing_and_posts_once(config, store, sta
 async def test_stopped_job_does_not_block_next_submission(config, api, store, status):
     monitor = await seed(config, api, store)
     monitor.state.jobs[0].status = status
-    monitor.state.next_slot = 1
     await monitor.save()
     result = await make_monitor(config, api, store).submit()
     assert result["submitted_prediction_id"] == "p1"
@@ -802,7 +808,7 @@ async def test_area_change_applies_to_the_next_job_only(config, api, store):
         exclude_none=True
     ) == AREA
     store.value["jobs"][0]["status"] = "complete"
-    await make_monitor(config, api, store).submit()
+    await make_monitor(config, api, store, now=NOW + dt.timedelta(weeks=1)).submit()
     body = api.create_prediction.call_args.args[0]
     assert body["geojson"]["features"][0]["geometry"] == OTHER_AREA
     assert store.value["jobs"][1]["area_of_interest"] == OTHER_AREA
@@ -810,26 +816,40 @@ async def test_area_change_applies_to_the_next_job_only(config, api, store):
 
 @pytest.mark.asyncio
 async def test_schedule_change_restarts_without_back_filling(config, api, store):
-    await make_monitor(config, api, store).submit()
-    store.value["jobs"][0]["status"] = "complete"
+    await submit_and_complete(config, api, store)
     # Weekly from 1 August: 23 October is not a slot, so the next is 24 October.
     config.schedule_start = dt.date(2026, 8, 1)
     result = await make_monitor(config, api, store).submit()
     assert result == {"status": "not_due", "next_prediction_date": "2026-10-24"}
-    assert store.value["schedule"]["schedule_start"] == "2026-08-01"
     api.create_prediction.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_schedule_restarted_today_submits_today(config, api, store):
-    await make_monitor(config, api, store).submit()
-    store.value["jobs"][0]["status"] = "complete"
-    config.schedule_start = NOW.date()
+    await submit_and_complete(config, api, store)
+    tomorrow = NOW + dt.timedelta(days=1)
+    config.schedule_start = tomorrow.date()
     config.cadence = Cadence.MONTHLY
-    await make_monitor(config, api, store).submit()
+    await make_monitor(config, api, store, now=tomorrow).submit()
     body = api.create_prediction.call_args.args[0]
-    assert body["start_time"] == "2026-10-09T00:00:00+00:00"
+    assert body["start_time"] == "2026-10-10T00:00:00+00:00"
     assert store.value["next_slot"] == 1
+
+
+@pytest.mark.asyncio
+async def test_schedule_change_on_a_submission_day_does_not_resend(config, api, store):
+    await submit_and_complete(config, api, store)
+    config.cadence = Cadence.MONTHLY
+    result = await make_monitor(config, api, store).submit()
+    assert result == {"status": "not_due", "next_prediction_date": "2026-11-23"}
+    api.create_prediction.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_new_monitor_does_not_back_fill_a_past_start(config, api, store):
+    config.schedule_start = dt.date(2026, 8, 1)
+    result = await make_monitor(config, api, store).submit()
+    assert result == {"status": "not_due", "next_prediction_date": "2026-10-24"}
 
 
 @pytest.mark.asyncio
@@ -838,7 +858,7 @@ async def test_extra_prediction_runs_once_and_keeps_the_schedule(config, api, st
     config.extra_prediction_on = NOW.date()
     result = await make_monitor(config, api, store).submit()
     assert result["submitted_prediction_id"] == "p1"
-    assert store.value["jobs"][0]["name"] == "gundi:integration-1:1:extra-2026-10-23"
+    assert store.value["jobs"][0]["name"] == "gundi:integration-1:extra-2026-10-23"
     assert store.value["next_slot"] == 0
     store.value["jobs"][0]["status"] = "complete"
     result = await make_monitor(config, api, store).submit()
@@ -855,15 +875,12 @@ async def test_future_extra_prediction_waits(config, api, store):
 
 
 @pytest.mark.asyncio
-async def test_reused_slot_date_is_a_new_prediction(config, api, store):
-    await make_monitor(config, api, store).submit()
-    store.value["jobs"][0]["status"] = "complete"
-    config.cadence = Cadence.MONTHLY
-    store.value["schedule"]["schedule_start"] = "2026-01-01"
-    config.schedule_start = dt.date(2026, 10, 23)
-    await make_monitor(config, api, store).submit()
-    names = [job["name"] for job in store.value["jobs"]]
-    assert names == ["gundi:integration-1:1:2026-10-01", "gundi:integration-1:2:2026-10-23"]
+async def test_each_extra_date_runs_once(config, api, store):
+    config.schedule_start = dt.date(2027, 1, 1)
+    for extra in ["2026-10-20", "2026-10-21", "2026-10-20"]:
+        config.extra_prediction_on = dt.date.fromisoformat(extra)
+        await submit_and_complete(config, api, store)
+    assert api.create_prediction.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -881,6 +898,7 @@ async def test_state_from_before_editable_settings_keeps_its_schedule(config, ap
         "jobs": [],
     }
     config.area_of_interest = OTHER_AREA
+    config.schedule_start = dt.date(2026, 10, 1)
     await make_monitor(config, api, store).submit()
     assert api.create_prediction.call_args.args[0]["start_time"] == "2026-10-08T00:00:00+00:00"
     assert store.value["next_slot"] == 4
@@ -990,3 +1008,26 @@ async def test_reference_actions_list_projects_and_finished_models(mocker):
 def test_null_envelope_fields_read_as_empty():
     parsed = client.NamedRecordResponse.parse_obj({"records": None, "meta": None, "errors": None})
     assert (parsed.records, parsed.meta.total, parsed.errors) == ([], None, [])
+
+
+@pytest.mark.asyncio
+async def test_legacy_pending_job_keeps_the_area_it_was_submitted_with(config, api, store):
+    job = pending_job(config).dict()
+    del job["area_of_interest"]
+    store.value = {
+        "identity": {
+            "base_url": api.base_url,
+            "project_id": PROJECT,
+            "model_id": MODEL,
+            "area_of_interest": AREA,
+            "schedule_start": "2026-10-23",
+            "cadence": "weekly",
+        },
+        "next_slot": 1,
+        "jobs": [job],
+    }
+    config.area_of_interest = OTHER_AREA
+    await make_monitor(config, api, store).collect()
+    assert api.search_features.call_args.args[1].intersects_geometry.dict(
+        exclude_none=True
+    ) == AREA

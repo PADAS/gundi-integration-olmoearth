@@ -80,8 +80,9 @@ runs once, so saving the form again does not resend it.
 - `changes_since`, if set, is a fixed initial event-date cutoff. It never advances as a cursor.
 - The area, selected classes and `changes_since` are snapshotted per submitted job. Changing
   them affects future jobs, not a half-read result or already delivered history.
-- Changing the first prediction date or frequency restarts the schedule from its first date
-  on or after today; it does not back-fill the dates in between.
+- A new schedule, or a changed first prediction date or frequency, starts from its first
+  date on or after today (the next one, if a prediction was already sent today); it does
+  not back-fill earlier dates.
 - Environment/project/model changes require a new monitor integration, preserving old jobs
   instead of silently mixing identities; the refusal names the settings that changed. The
   event type can be edited freely.
