@@ -123,8 +123,13 @@ def feature(fid="f1", changed="2026-09-10", change_type="mining", geometry=None)
             "properties": {
                 "post_change": change_type,
                 "ts_start": changed,
+                "ts_end": "2026-09-24",
                 "oe_start_time": "2026-10-01T00:00:00Z",
                 "oe_prediction_result_id": "run-result-id",
+                "oe_prediction_result_file_id": "file-id",
+                "oe_created_at": "2026-10-22T06:10:05Z",
+                "oe_class_id": 6,
+                "oe_area_sq_km": 0.017,
             },
         }
     )
@@ -290,9 +295,40 @@ async def test_late_discovery_uses_change_date_and_keeps_both_result_ids(
     assert event["geometry"] == AREA
     assert event["event_details"]["first_discovered_at"].startswith("2026-10-23")
     assert event["event_details"]["prediction_result_id"] == "r1"
-    assert event["event_details"]["oerun_prediction_result_id"] == "run-result-id"
+    assert event["event_details"]["oe_prediction_result_id"] == "run-result-id"
     assert result["job"]["status"] == "complete"
     assert api.search_features.call_args.args[0] == "r1"
+
+
+@pytest.mark.asyncio
+async def test_event_fills_the_earthranger_form_fields(config, api, store):
+    monitor = await seed(config, api, store)
+    api.search_features.return_value = page([feature(change_type="mining")])
+    await monitor.collect()
+    details = monitor.sender.send.call_args.args[0][0]["event_details"]
+    assert {
+        key: details[key]
+        for key in [
+            "change_outcome",
+            "class_id",
+            "area_sq_km",
+            "oe_created_at",
+            "oe_prediction_result_id",
+            "oe_prediction_result_file_id",
+            "oe_start_time",
+            "oe_end_time",
+        ]
+    } == {
+        "change_outcome": "mining",
+        "class_id": 6,
+        "area_sq_km": 0.017,
+        "oe_created_at": "2026-10-22T06:10:05Z",
+        "oe_prediction_result_id": "run-result-id",
+        "oe_prediction_result_file_id": "file-id",
+        # The change window, not OlmoEarth's imagery window (2026-10-01).
+        "oe_start_time": "2026-09-10T00:00:00+00:00",
+        "oe_end_time": "2026-09-24T00:00:00+00:00",
+    }
 
 
 @pytest.mark.asyncio

@@ -28,6 +28,20 @@ CHANGE_DATE_PRECISION = "month"
 # end of the change window as ts_start and ts_end. Both reach event_details.
 CHANGE_DATE_PROPERTY = "ts_start"
 
+# event_details keys that the EarthRanger "OlmoEarth Detection" form displays, and
+# the feature property each is filled from. The form's start and end times are the
+# change window (ts_start/ts_end), not OlmoEarth's imagery window (oe_start_time).
+FORM_START_TIME = "oe_start_time"
+FORM_END_TIME = "oe_end_time"
+FORM_FIELDS = {
+    "change_outcome": "post_change",
+    "class_id": "oe_class_id",
+    "area_sq_km": "oe_area_sq_km",
+    "oe_created_at": "oe_created_at",
+    "oe_prediction_result_id": "oe_prediction_result_id",
+    "oe_prediction_result_file_id": "oe_prediction_result_file_id",
+}
+
 NEW_SITE = "new_site"
 NEW_CHANGE_TYPE = "new_change_type"
 SEEN_BEFORE = "seen_before"
@@ -55,6 +69,20 @@ def parse_change_date(value) -> date:
         raise InvalidFeatureError(
             "LCC change date is missing or is not an ISO date/time."
         ) from exc
+
+
+def _utc_midnight(day: date) -> str:
+    return datetime.combine(day, time(), timezone.utc).isoformat()
+
+
+def form_fields(feature: Feature, changed: date) -> dict:
+    """The EarthRanger form's fields for one detection; absent properties are left out."""
+    raw = feature.properties.dict(exclude_none=True)
+    fields = {key: raw[name] for key, name in FORM_FIELDS.items() if name in raw}
+    fields[FORM_START_TIME] = _utc_midnight(changed)
+    if "ts_end" in raw:
+        fields[FORM_END_TIME] = _utc_midnight(parse_change_date(raw["ts_end"]))
+    return fields
 
 
 def geohash(lat: float, lon: float, precision: int) -> str:
@@ -163,7 +191,6 @@ def prepare_event(
         {
             "prediction_id": job.prediction_id,
             "prediction_result_id": job.result_id,
-            "oerun_prediction_result_id": feature.properties.oe_prediction_result_id,
             "external_event_id": event_id(integration_id, job, feature),
             "feature_id": feature.id,
             "model_id": str(config.model_id),
@@ -173,13 +200,14 @@ def prepare_event(
             "prediction_reference_time": job.reference_time,
             "site_id": site,
             "detection_kind": kind,
+            **form_fields(feature, changed),
         }
     )
     return {
         "title": title,
         "event_type": config.event_type,
         "source": f"olmoearth-monitor:{integration_id}",
-        "recorded_at": datetime.combine(changed, time(), timezone.utc).isoformat(),
+        "recorded_at": _utc_midnight(changed),
         "location": {"lat": point.y, "lon": point.x},
         "geometry": geometry,
         "event_details": props,

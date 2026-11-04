@@ -74,6 +74,10 @@ runs once, so saving the form again does not resend it.
 ## Dates and repeated detections
 
 - `recorded_at` uses the polygon's `ts_start` date (start of the change window), encoded as UTC midnight; `ts_end` is in `event_details`.
+- `event_details` fills the EarthRanger "OlmoEarth Detection" form by its field keys:
+  `change_outcome`, `class_id`, `area_sq_km`, `oe_created_at`, `oe_prediction_result_id`,
+  `oe_prediction_result_file_id`, and `oe_start_time`/`oe_end_time` (the change window,
+  `ts_start`/`ts_end`). The form-key mapping is `FORM_FIELDS` in `change_events.py`.
   It is an estimate; `event_details.change_date_precision` (set in code per model) says how coarse.
 - `first_discovered_at` is when the connector found the polygon. A late-discovered change
   is retained even if its estimated date predates the last poll.
