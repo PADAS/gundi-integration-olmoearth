@@ -292,7 +292,9 @@ async def test_late_discovery_uses_change_date_and_keeps_both_result_ids(
     result = await monitor.collect()
     event = monitor.sender.send.call_args.args[0][0]
     assert event["recorded_at"].startswith("2026-09-10")
-    assert event["geometry"] == AREA
+    # EarthRanger polygon event types need a GeoJSON Feature and no point location.
+    assert event["geometry"] == {"type": "Feature", "geometry": AREA, "properties": {}}
+    assert "location" not in event
     assert event["event_details"]["first_discovered_at"].startswith("2026-10-23")
     assert event["event_details"]["prediction_result_id"] == "r1"
     assert event["event_details"]["oe_prediction_result_id"] == "run-result-id"

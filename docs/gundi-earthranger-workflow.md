@@ -45,6 +45,7 @@ These are logical responsibilities, not a verified deployment inventory. Gundi i
 4. Collect LCC Events polls `GET /api/v1/predictions/{id}`. Once complete, read the nested `result.id`.
 5. Search `POST /api/v1/prediction-results/{result_id}/features/search` with AOI and class filters. Read date properties from the returned polygons and apply any fixed `changes_since` cutoff locally.
 6. For each page, build an event for every monitored detection, marked by its site (`new_site`, `new_change_type` or `seen_before`), and save the updated site records together with the page's outbox. Post the batch to Gundi; once every event is acknowledged, advance the page checkpoint. If the post fails, the same batch is sent again on the next run (at-least-once delivery).
+   Each event carries the detection polygon as a GeoJSON Feature in `geometry` and no point `location`, so the EarthRanger event type must use polygon geometry.
 7. Gundi routes events to EarthRanger. An ingestion receipt does not prove final destination delivery; verify that separately.
 
 The model reference time is the due slot minus an imagery lag (14 days, `IMAGERY_LAG_DAYS`). Its own model configuration controls imagery lookbehind. Cadence is not the model's observation window or date precision.
