@@ -208,7 +208,8 @@ def prepare_event(
         "event_type": config.event_type,
         "source": f"olmoearth-monitor:{integration_id}",
         "recorded_at": _utc_midnight(changed),
-        "location": {"lat": point.y, "lon": point.x},
-        "geometry": geometry,
+        # EarthRanger polygon events take a GeoJSON Feature (or FeatureCollection)
+        # and reject a point location alongside it.
+        "geometry": {"type": "Feature", "geometry": geometry, "properties": {}},
         "event_details": props,
     }

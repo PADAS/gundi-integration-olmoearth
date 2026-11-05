@@ -39,7 +39,7 @@ Gundi runner credentials.
    to disabled; enable it when ready, or run the action manually to submit one due job.
    A manual action can incur OlmoEarth prediction charges.
 6. Configure the Gundi route/EarthRanger event type and verify polygon rendering in the
-   destination. The event carries both the polygon and a point guaranteed inside it.
+   destination. The event carries the polygon as a GeoJSON Feature, so the EarthRanger event type must use polygon geometry.
 
 The prediction API requires a project. A partner project is a useful default; Studio rejects
 a project the API token cannot use.
