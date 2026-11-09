@@ -7,6 +7,7 @@ import httpx
 from fastapi import Request
 from app import settings
 from app.services.activity_logger import log_activity, publish_event
+from app.services.redaction import redact_secrets
 from gundi_client_v2 import GundiClient
 from gundi_core.events import IntegrationWebhookFailed, WebhookExecutionFailed
 from app.services.utils import DyntamicFactory
@@ -162,6 +163,9 @@ async def get_integration(request):
 
 
 async def process_webhook(request: Request):
+    # Bound before the try: the failure events below attach the webhook's
+    # configuration, and a failure can come before it is read.
+    integration, webhook_config_data, config_model = None, {}, None
     try:
         # Try to relate the request to an integration
         integration = await get_integration(request=request)
@@ -216,7 +220,9 @@ async def process_webhook(request: Request):
                         payload=WebhookExecutionFailed(
                             integration_id=str(integration.id),
                             webhook_id=str(integration.type.webhook.value),
-                            config_data=webhook_config_data,
+                            # Masked by key name and by the config model's
+                            # declarations, as every activity-log event is.
+                            config_data=redact_secrets(webhook_config_data, model=config_model),
                             error=message
                         )
                     ),
@@ -247,7 +253,7 @@ async def process_webhook(request: Request):
                 payload=WebhookExecutionFailed(
                     integration_id=str(integration.id) if integration else None,
                     webhook_id=str(integration.type.webhook.value) if integration and integration.type.webhook else None,
-                    config_data=webhook_config_data,
+                    config_data=redact_secrets(webhook_config_data, model=config_model),
                     error=message  # ToDo: Support storing the error traceback and other details as in action errors
                 )
             ),

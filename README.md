@@ -218,7 +218,9 @@ it afresh rather than copying old watermark state.
     - Webhook execution complete
     - Error occurred during webhook execution
 - Optionally, use  `log_action_activity()` or `log_webhook_activity()` to log custom messages which you can later see in the portal
+- The configuration attached to every activity-log event is redacted before publishing (`app/services/redaction.py`): values under secret-looking keys (`password`, `token`, `api_key`, `secret`, ...) and fields your config model declares as `SecretStr`, `Field(format="password")` or `UIOptions(widget="password")` are replaced with `**********`, matched by field name or alias and at any depth of nested models. Declare secrets that way and they never reach the portal's activity log in clear, whatever their name.
 - Optionally, use  `@crontab_schedule()` or `register.py --schedule` to make an action to run on a custom schedule
+- Actions run from PubSub are acked unless the failure is transient (the provider answered 429/5xx or could not be reached, Gundi was unavailable, the runner's own timeout expired): those answer with a 5xx so PubSub redelivers the message with backoff. The runner does not cap the attempts, and each one runs the action again and publishes another failure event, so give the subscription a dead-letter policy with a maximum number of delivery attempts: PubSub reports the attempt number only once such a policy exists, and then enforces the cap itself. With `PROCESS_PUBSUB_MESSAGES_IN_BACKGROUND=True` every message is acked on receipt and nothing is redelivered.
 
 
 ## Action Examples: 

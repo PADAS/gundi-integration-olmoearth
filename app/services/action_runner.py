@@ -1,4 +1,5 @@
 import asyncio
+import io
 import logging
 import time
 import traceback
@@ -22,13 +23,20 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from gundi_core.events import IntegrationActionFailed, ActionExecutionFailed, LogLevel
 
-from app.actions.core import AuthActionConfiguration, PullActionConfiguration, ReferenceActionConfiguration
+from app.actions.core import (
+    AuthActionConfiguration, InternalActionConfiguration, PullActionConfiguration, ReferenceActionConfiguration,
+)
 from app.api_schemas import IntegrationState
 from .config_manager import IntegrationConfigurationManager
 from .state import IntegrationStateManager
 from .utils import find_config_for_action
 from .activity_logger import publish_event, log_action_activity, ephemeral_run
-from .errors import classify_error, format_classified_error, source_status_code, IntegrationError, IntegrationConfigurationError
+from .redaction import redact_config_data
+from .retry_policies import is_retryable_failure
+from .errors import (
+    ActionTimeoutError, classify_error, format_classified_error, source_status_code,
+    IntegrationError, IntegrationConfigurationError,
+)
 from .url_policy import validate_outbound_url
 from .gundi import EphemeralWriteBlocked
 
@@ -127,6 +135,38 @@ def _request_error_response(action_id: Optional[str], message: str,
     )
 
 
+class ActionErrorResponse(JSONResponse):
+    """_handle_error's response for a saved-integration failure.
+
+    The body carries the error details for the caller; `retryable` carries
+    the redelivery verdict (retry_policies.is_retryable_failure) as an
+    attribute, so main.execute reads it directly instead of parsing the body
+    this process just built.
+    """
+
+    def __init__(self, *args, retryable: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.retryable = retryable
+
+
+def _format_exception(exc: BaseException) -> str:
+    """The traceback text for a failure event, from the exception itself.
+
+    Not traceback.format_exc(): _handle_error also runs outside an except
+    block (the runner's own timeout), where there is no active exception and
+    format_exc() renders the literal "NoneType: None".
+    """
+    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+
+def _format_task_stack(task: "asyncio.Task") -> str:
+    """The frame a still-running task is suspended in, formatted like a
+    traceback. Empty once the task has finished."""
+    buffer = io.StringIO()
+    task.print_stack(file=buffer)
+    return buffer.getvalue()
+
+
 # Server-owned text per pydantic error type, the only validation messages the
 # ephemeral path forwards. A dotted type does not prove pydantic authored the
 # message: a connector's PydanticValueError subclass gets one too
@@ -214,6 +254,7 @@ async def _handle_error(
         exc: Exception, integration_id: Optional[str], action_id: Optional[str] = None,
         config_data=None, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         *, classify_heuristics: bool = False, expose_message: bool = False,
+        error_traceback: Optional[str] = None,
 ):
     """
     Log the error and return a JSON response with details. On non-ephemeral
@@ -223,6 +264,10 @@ async def _handle_error(
     expose_message marks an exception the runner itself constructed (unknown
     action, whitelist rejection, ...). Only the ephemeral branch reads it:
     saved-integration runs always report the full message.
+
+    error_traceback replaces the exception's own traceback in the event, for
+    an exception that was never raised (the runner's timeout, which reports
+    where the handler was instead).
     """
     is_ephemeral = ephemeral_run.get()
 
@@ -270,12 +315,23 @@ async def _handle_error(
     error_details = {
         "integration_id": integration_id,
         "action_id": action_id,
-        "config_data": config_data or {},
+        # The saved configurations (auth row included) or the action's own
+        # config, as the portal stores them: raw dicts, secrets in clear.
+        # Masked here, the one place both the published event and the JSON
+        # response are built from.
+        "config_data": redact_config_data(
+            config_data, action_id=action_id,
+            config_models={aid: model for aid, (_, model, _) in action_handlers.items()},
+        ),
         "error": message,
         # Machine-readable category. Only reaches the JSON response below;
         # ActionExecutionFailed is a gundi-core model that drops unknown fields.
         "error_type": classified.error_type if classified else None,
-        "error_traceback": traceback.format_exc()
+        # Whether redelivering the triggering message could help (main.execute
+        # reads it). From the exception itself, so it holds on the paths above
+        # that leave error_type unset on purpose.
+        "retryable": is_retryable_failure(exc),
+        "error_traceback": error_traceback or _format_exception(exc),
     }
 
     # Extract additional request/response details if available.
@@ -315,9 +371,10 @@ async def _handle_error(
         topic_name=settings.INTEGRATION_EVENTS_TOPIC,
     )
 
-    return JSONResponse(
+    return ActionErrorResponse(
         status_code=status_code,
         content=jsonable_encoder({"detail": error_details}),
+        retryable=error_details["retryable"],
     )
 
 
@@ -383,6 +440,25 @@ async def _skip_invalid_config(integration_id, action_id, *, error):
                 f"(integration '{integration_id}'): {log_error}"
             )
     return {"skipped": True, "reason": "invalid_configuration"}
+
+
+async def _cancel_handler(handler_task: "asyncio.Task") -> None:
+    """Cancel a running handler and wait for it to finish unwinding, so its
+    finally blocks run before the runner reports or propagates anything (the
+    same guarantee asyncio.wait_for gave). Whatever the handler raises while
+    unwinding is logged, not reported: the runner's own verdict (the timeout,
+    or its cancellation) is the one that stands."""
+    handler_task.cancel()
+    # Collect the handler's exception, but let cancellation of this runner
+    # propagate. Catching CancelledError around a direct await confuses the two.
+    (outcome,) = await asyncio.gather(handler_task, return_exceptions=True)
+    if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
+        # A failed finally block (a state write, a session close) would
+        # otherwise vanish without a trace.
+        logger.warning(
+            f"Handler raised while unwinding after cancellation: {type(outcome).__name__}: {outcome}",
+            exc_info=outcome,
+        )
 
 
 async def execute_action(
@@ -532,16 +608,26 @@ async def _execute_action_impl(
     is_reference_action = isinstance(config_model, type) and issubclass(
         config_model, ReferenceActionConfiguration
     )
-    skip_missing_config = is_ephemeral or is_reference_action
+    # Internal actions (sub-actions another handler triggers, e.g. one per
+    # source in a fan-out) are never registered in Gundi, so the portal holds
+    # no row for them and everything they need arrives in config_overrides.
+    # Looking a row up anyway misses redis every time, and the reload that
+    # follows a miss writes absence sentinels only for the type's registered
+    # actions: a full portal fetch per triggered run.
+    is_internal_action = isinstance(config_model, type) and issubclass(
+        config_model, InternalActionConfiguration
+    )
+    skip_missing_config = is_ephemeral or is_reference_action or is_internal_action
 
     # Get the configuration needed to execute the action
     if is_ephemeral:
         action_config = find_config_for_action(integration.configurations, action_id)
-    elif is_reference_action:
-        # Stateless by contract, so there is no row to find. Looking one up
-        # anyway would miss redis every time, and get_action_configuration
-        # reloads the integration from the portal on a miss: a portal call on
-        # every dropdown open.
+    elif is_reference_action or is_internal_action:
+        # Neither has a row to find (reference actions are stateless by
+        # contract, internal ones unregistered). Looking one up anyway would
+        # miss redis every time, and get_action_configuration reloads the
+        # integration from the portal on a miss: a portal call on every
+        # dropdown open, or on every triggered sub-action.
         action_config = None
     else:
         action_config = await config_manager.get_action_configuration(integration_id, action_id)
@@ -612,6 +698,8 @@ async def _execute_action_impl(
             return None
         return {"configurations": [c.dict() for c in integration.configurations]}
 
+    deadline_expired = False
+    handler_stack = ""
     try:  # Execute the action handler with a timeout
         start_time = time.monotonic()
         handler_kwargs = {
@@ -622,18 +710,28 @@ async def _execute_action_impl(
             handler_kwargs["data"] = parsed_data
         if metadata is not None:
             handler_kwargs["metadata"] = metadata
-        result = await asyncio.wait_for(
-            handler(**handler_kwargs),
-            timeout=settings.MAX_ACTION_EXECUTION_TIME
-        )
-    except asyncio.TimeoutError:
-        return await _handle_error(
-            asyncio.TimeoutError(f"Action '{action_id}' timed out"),
-            integration_id, action_id,
-            config_data=handler_error_config_data(),
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            classify_heuristics=True,
-        )
+        # Not asyncio.wait_for: it raises the same asyncio.TimeoutError for its
+        # own expired deadline and for one the handler raised (aiohttp's
+        # provider timeout), and the two must be reported differently. Waiting
+        # on the task tells them apart by whether the task finished.
+        handler_task = asyncio.ensure_future(handler(**handler_kwargs))
+        try:
+            done, _ = await asyncio.wait({handler_task}, timeout=settings.MAX_ACTION_EXECUTION_TIME)
+        except asyncio.CancelledError:
+            # Unlike wait_for, asyncio.wait leaves what it waits on running
+            # when the waiter is cancelled. The runner going away (request
+            # aborted, process shutting down) must take the handler with it,
+            # or it keeps publishing and writing state with no deadline.
+            await _cancel_handler(handler_task)
+            raise
+        if done:
+            result = handler_task.result()  # re-raises the handler's own exception unchanged
+        else:
+            deadline_expired = True
+            # Where the handler was when the deadline expired, for the failure
+            # event: its frame is gone once it has been cancelled.
+            handler_stack = _format_task_stack(handler_task)
+            await _cancel_handler(handler_task)
     except Exception as e:
         # Saved-integration runs keep the historical 500; the ephemeral path
         # forwards the source system's verdict instead (_handle_error applies
@@ -643,6 +741,20 @@ async def _execute_action_impl(
             config_data=handler_error_config_data(),
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             classify_heuristics=True,
+        )
+    if deadline_expired:
+        # The runner's own cap, not the provider failing to answer: an
+        # asyncio.TimeoutError here would classify as connectivity and send
+        # the operator to check the provider.
+        timeout = ActionTimeoutError(f"exceeded the {settings.MAX_ACTION_EXECUTION_TIME} s execution limit")
+        return await _handle_error(
+            timeout, integration_id, action_id,
+            config_data=handler_error_config_data(),
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            classify_heuristics=True,
+            # Never raised, so it has no traceback of its own; the handler's
+            # suspended frame says where the time went.
+            error_traceback=f"{handler_stack}{type(timeout).__name__}: {timeout}\n",
         )
 
     # Success. Log the execution time and return the result
