@@ -2413,6 +2413,13 @@ async def test_execute_action_reports_the_runner_timeout_as_action_timed_out(
     assert "Could not reach the provider" not in error_details["error"]
     # The cap cancels the handler, as wait_for did.
     assert cancelled == [True]
+    # The timeout is reported outside any except block, so the traceback is
+    # built from the handler's suspended frame, not from format_exc().
+    assert "NoneType: None" not in error_details["error_traceback"]
+    assert "in slow_handler" in error_details["error_traceback"]
+    assert error_details["error_traceback"].rstrip().endswith(
+        "ActionTimeoutError: exceeded the 0.01 s execution limit"
+    )
 
 
 @pytest.mark.asyncio
@@ -2644,3 +2651,43 @@ async def test_invalid_config_failure_redacts_the_action_config_it_attaches(
     events = _published_events_of_type(mock_publish_event, IntegrationActionFailed)
     assert len(events) == 1
     assert events[0].payload.config_data == {"lookback_days": "two", "api_key": REDACTED}
+
+
+@pytest.mark.asyncio
+async def test_handler_failure_while_unwinding_after_the_timeout_is_logged(
+        mocker, mock_gundi_client_v2, integration_v2, mock_config_manager,
+        mock_publish_event, mock_action_handlers, caplog,
+):
+    # The handler's cleanup raising after cancellation must not replace the
+    # timeout verdict, but it must not vanish either: a broken finally block
+    # is a bug the handler's author needs to see.
+    import asyncio
+    import logging
+    _, config_model, transform = mock_action_handlers["pull_observations"]
+
+    async def handler_with_broken_cleanup(**kwargs):
+        try:
+            await asyncio.sleep(1)
+        finally:
+            raise RuntimeError("session close failed")
+
+    mock_action_handlers["pull_observations"] = (handler_with_broken_cleanup, config_model, transform)
+    mocker.patch.object(settings, "MAX_ACTION_EXECUTION_TIME", 0.01)
+    mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
+    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    caplog.set_level(logging.WARNING, logger="app.services.action_runner")
+
+    response = await execute_action(
+        integration_id=str(integration_v2.id),
+        action_id="pull_observations",
+    )
+
+    assert response.status_code == 504
+    assert json.loads(response.body)["detail"]["error_type"] == "timeout"
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "unwinding" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "RuntimeError: session close failed" in warnings[0].getMessage()
+    assert warnings[0].exc_info[1].args == ("session close failed",)

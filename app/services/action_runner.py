@@ -1,4 +1,5 @@
 import asyncio
+import io
 import logging
 import time
 import traceback
@@ -134,6 +135,38 @@ def _request_error_response(action_id: Optional[str], message: str,
     )
 
 
+class ActionErrorResponse(JSONResponse):
+    """_handle_error's response for a saved-integration failure.
+
+    The body carries the error details for the caller; `retryable` carries
+    the redelivery verdict (retry_policies.is_retryable_failure) as an
+    attribute, so main.execute reads it directly instead of parsing the body
+    this process just built.
+    """
+
+    def __init__(self, *args, retryable: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.retryable = retryable
+
+
+def _format_exception(exc: BaseException) -> str:
+    """The traceback text for a failure event, from the exception itself.
+
+    Not traceback.format_exc(): _handle_error also runs outside an except
+    block (the runner's own timeout), where there is no active exception and
+    format_exc() renders the literal "NoneType: None".
+    """
+    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+
+def _format_task_stack(task: "asyncio.Task") -> str:
+    """The frame a still-running task is suspended in, formatted like a
+    traceback. Empty once the task has finished."""
+    buffer = io.StringIO()
+    task.print_stack(file=buffer)
+    return buffer.getvalue()
+
+
 # Server-owned text per pydantic error type, the only validation messages the
 # ephemeral path forwards. A dotted type does not prove pydantic authored the
 # message: a connector's PydanticValueError subclass gets one too
@@ -221,6 +254,7 @@ async def _handle_error(
         exc: Exception, integration_id: Optional[str], action_id: Optional[str] = None,
         config_data=None, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         *, classify_heuristics: bool = False, expose_message: bool = False,
+        error_traceback: Optional[str] = None,
 ):
     """
     Log the error and return a JSON response with details. On non-ephemeral
@@ -230,6 +264,10 @@ async def _handle_error(
     expose_message marks an exception the runner itself constructed (unknown
     action, whitelist rejection, ...). Only the ephemeral branch reads it:
     saved-integration runs always report the full message.
+
+    error_traceback replaces the exception's own traceback in the event, for
+    an exception that was never raised (the runner's timeout, which reports
+    where the handler was instead).
     """
     is_ephemeral = ephemeral_run.get()
 
@@ -293,7 +331,7 @@ async def _handle_error(
         # reads it). From the exception itself, so it holds on the paths above
         # that leave error_type unset on purpose.
         "retryable": is_retryable_failure(exc),
-        "error_traceback": traceback.format_exc()
+        "error_traceback": error_traceback or _format_exception(exc),
     }
 
     # Extract additional request/response details if available.
@@ -333,9 +371,10 @@ async def _handle_error(
         topic_name=settings.INTEGRATION_EVENTS_TOPIC,
     )
 
-    return JSONResponse(
+    return ActionErrorResponse(
         status_code=status_code,
         content=jsonable_encoder({"detail": error_details}),
+        retryable=error_details["retryable"],
     )
 
 
@@ -407,11 +446,19 @@ async def _cancel_handler(handler_task: "asyncio.Task") -> None:
     """Cancel a running handler and wait for it to finish unwinding, so its
     finally blocks run before the runner reports or propagates anything (the
     same guarantee asyncio.wait_for gave). Whatever the handler raises while
-    unwinding is the handler's business, not the runner's."""
+    unwinding is logged, not reported: the runner's own verdict (the timeout,
+    or its cancellation) is the one that stands."""
     handler_task.cancel()
     # Collect the handler's exception, but let cancellation of this runner
     # propagate. Catching CancelledError around a direct await confuses the two.
-    await asyncio.gather(handler_task, return_exceptions=True)
+    (outcome,) = await asyncio.gather(handler_task, return_exceptions=True)
+    if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
+        # A failed finally block (a state write, a session close) would
+        # otherwise vanish without a trace.
+        logger.warning(
+            f"Handler raised while unwinding after cancellation: {type(outcome).__name__}: {outcome}",
+            exc_info=outcome,
+        )
 
 
 async def execute_action(
@@ -652,6 +699,7 @@ async def _execute_action_impl(
         return {"configurations": [c.dict() for c in integration.configurations]}
 
     deadline_expired = False
+    handler_stack = ""
     try:  # Execute the action handler with a timeout
         start_time = time.monotonic()
         handler_kwargs = {
@@ -680,6 +728,9 @@ async def _execute_action_impl(
             result = handler_task.result()  # re-raises the handler's own exception unchanged
         else:
             deadline_expired = True
+            # Where the handler was when the deadline expired, for the failure
+            # event: its frame is gone once it has been cancelled.
+            handler_stack = _format_task_stack(handler_task)
             await _cancel_handler(handler_task)
     except Exception as e:
         # Saved-integration runs keep the historical 500; the ephemeral path
@@ -695,12 +746,15 @@ async def _execute_action_impl(
         # The runner's own cap, not the provider failing to answer: an
         # asyncio.TimeoutError here would classify as connectivity and send
         # the operator to check the provider.
+        timeout = ActionTimeoutError(f"exceeded the {settings.MAX_ACTION_EXECUTION_TIME} s execution limit")
         return await _handle_error(
-            ActionTimeoutError(f"exceeded the {settings.MAX_ACTION_EXECUTION_TIME} s execution limit"),
-            integration_id, action_id,
+            timeout, integration_id, action_id,
             config_data=handler_error_config_data(),
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             classify_heuristics=True,
+            # Never raised, so it has no traceback of its own; the handler's
+            # suspended frame says where the time went.
+            error_traceback=f"{handler_stack}{type(timeout).__name__}: {timeout}\n",
         )
 
     # Success. Log the execution time and return the result

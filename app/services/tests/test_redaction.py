@@ -381,3 +381,34 @@ def test_a_secret_type_inside_a_scalar_union_masks_the_raw_value():
     out = redact_secrets(data, model=_ScalarUnionConfig)
 
     assert out == {"code": REDACTED, "maybe": REDACTED, "codes": [REDACTED, REDACTED], "plain": "kept"}
+
+
+def test_redact_config_data_masks_sensitive_keys_beside_and_inside_the_rows():
+    # The rows are walked once each, not also as part of the top-level walk:
+    # the key-name rule still applies next to "configurations", on a row's
+    # own keys, and inside non-dict data, which has no model to apply.
+    config_data = {
+        "api_token": "top-level",
+        "configurations": [
+            {
+                "id": "30f8878c",
+                "access_token": "row-level",
+                "action": {"id": "80448d1c", "type": "auth", "name": "Authenticate", "value": "auth"},
+                "data": [{"password": "in-a-list", "username": "u"}],
+            },
+        ],
+    }
+
+    out = redact_config_data(config_data, config_models=_CONFIG_MODELS)
+
+    assert out == {
+        "api_token": REDACTED,
+        "configurations": [
+            {
+                "id": "30f8878c",
+                "access_token": REDACTED,
+                "action": config_data["configurations"][0]["action"],
+                "data": [{"password": REDACTED, "username": "u"}],
+            },
+        ],
+    }

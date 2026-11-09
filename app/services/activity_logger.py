@@ -43,9 +43,23 @@ ephemeral_run: contextvars.ContextVar[bool] = contextvars.ContextVar(
 )
 
 
+def _is_transient_publish_error(exc: BaseException) -> bool:
+    """Retry predicate for PubSub publish requests (``on=`` for stamina).
+
+    The session raises for status, so a rejection arrives as a
+    ClientResponseError: 429 and 5xx may pass on a later attempt, any other
+    status (an oversize message, a missing permission) is PubSub's final
+    answer and fails at once instead of five times over several minutes.
+    Transport failures and timeouts are transient.
+    """
+    if isinstance(exc, aiohttp.ClientResponseError):
+        return exc.status == 429 or exc.status >= 500
+    return isinstance(exc, (aiohttp.ClientError, asyncio.TimeoutError))
+
+
 # Publish events for other services or system components
 @stamina.retry(
-    on=(aiohttp.ClientError, asyncio.TimeoutError),
+    on=_is_transient_publish_error,
     attempts=5,
     wait_initial=4.0,
     wait_max=60,
@@ -69,7 +83,8 @@ async def publish_event(event: SystemEventBaseModel, topic_name: str):
             response = await client.publish(topic, messages)
         except Exception as e:
             logger.exception(
-                f"Error publishing system event to topic {topic_name}: {e}. This will be retried."
+                f"Error publishing system event to topic {topic_name}: {e}. "
+                f"{'This will be retried.' if _is_transient_publish_error(e) else 'Not retried.'}"
             )
             raise e
         else:
@@ -92,7 +107,17 @@ _PUBLISH_SEPARATOR_BYTES = len(", ")
 
 
 def _serialized_size(message) -> int:
-    return len(json.dumps(message.to_repr())) + _PUBLISH_SEPARATOR_BYTES
+    """Bytes the message adds to the publish body: gcloud-aio sends it as
+    {"data": "<base64>", "attributes": {...}} (plus "orderingKey" when set).
+    The data's base64 length is computed, not produced: publish encodes the
+    whole batch anyway, and a fan-out of hundreds of commands should not be
+    base64- and JSON-encoded twice just to be measured."""
+    frame = {"data": "", "attributes": message.attributes}
+    if message.ordering_key:
+        frame["orderingKey"] = message.ordering_key
+    data = message.data if isinstance(message.data, bytes) else str(message.data).encode("utf-8")
+    base64_bytes = 4 * ((len(data) + 2) // 3)  # padded; URL-safe alphabet, same length
+    return len(json.dumps(frame)) + base64_bytes + _PUBLISH_SEPARATOR_BYTES
 
 
 def _publish_batches(messages):
@@ -116,7 +141,7 @@ def _publish_batches(messages):
 
 
 @stamina.retry(
-    on=(aiohttp.ClientError, asyncio.TimeoutError),
+    on=_is_transient_publish_error,
     attempts=5,
     wait_initial=4.0,
     wait_max=60,
@@ -129,7 +154,8 @@ async def _publish_batch(client, topic: str, messages: list, topic_name: str):
         return await client.publish(topic, messages)
     except Exception as e:
         logger.exception(
-            f"Error publishing {len(messages)} system events to topic {topic_name}: {e}. This will be retried."
+            f"Error publishing {len(messages)} system events to topic {topic_name}: {e}. "
+            f"{'This will be retried.' if _is_transient_publish_error(e) else 'Not retried.'}"
         )
         raise
 

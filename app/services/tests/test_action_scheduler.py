@@ -1,8 +1,11 @@
+import json
+
+import pydantic
 import pytest
 
 from app import settings
 from app.conftest import AsyncMock
-from app.services.action_scheduler import trigger_actions
+from app.services.action_scheduler import trigger_action, trigger_actions
 
 
 class _Config:
@@ -37,9 +40,11 @@ async def test_trigger_actions_with_no_configs_publishes_nothing(mocker):
     mocker.patch.object(settings, "TRIGGER_ACTIONS_ALWAYS_SYNC", False)
     mocker.patch.object(settings, "INTEGRATION_COMMANDS_TOPIC", "actions-topic")
 
-    await trigger_actions(integration_id="int-1", action_id="read_per_collar", configs=[])
+    response = await trigger_actions(integration_id="int-1", action_id="read_per_collar", configs=[])
 
     assert not mock_publish_events.called
+    # The same shape publish_events gives an empty list.
+    assert response == {"messageIds": []}
 
 
 @pytest.mark.asyncio
@@ -83,3 +88,58 @@ async def test_trigger_actions_is_blocked_on_ephemeral_run(mocker):
         ephemeral_run.reset(token)
 
     assert not mock_publish_events.called
+
+
+@pytest.mark.asyncio
+async def test_trigger_actions_with_no_configs_needs_no_topic_and_returns_the_sync_shape(mocker):
+    mocker.patch.object(settings, "TRIGGER_ACTIONS_ALWAYS_SYNC", False)
+    mocker.patch.object(settings, "INTEGRATION_COMMANDS_TOPIC", "")
+    assert await trigger_actions(integration_id="int-1", action_id="read_per_collar", configs=[]) == {"messageIds": []}
+
+    mock_execute_action = AsyncMock()
+    mocker.patch("app.services.action_runner.execute_action", mock_execute_action)
+    mocker.patch.object(settings, "TRIGGER_ACTIONS_ALWAYS_SYNC", True)
+    assert await trigger_actions(integration_id="int-1", action_id="read_per_collar", configs=[]) == []
+    assert not mock_execute_action.called
+
+
+class _PerCollarConfig(pydantic.BaseModel):
+    collar_id: str
+    api_key: pydantic.SecretStr
+    credentials: dict
+
+
+@pytest.mark.asyncio
+async def test_trigger_actions_passes_secrets_to_the_triggered_action_unmasked(mocker):
+    # The command is serialized with json.dumps(default=str), and str() of a
+    # SecretStr is its mask: the sub-action would authenticate with
+    # '**********' (the mask is what config.dict() keeps).
+    mock_publish_events = AsyncMock(return_value={"messageIds": ["1"]})
+    mocker.patch("app.services.action_scheduler.publish_events", mock_publish_events)
+    mocker.patch.object(settings, "TRIGGER_ACTIONS_ALWAYS_SYNC", False)
+    mocker.patch.object(settings, "INTEGRATION_COMMANDS_TOPIC", "actions-topic")
+    config = _PerCollarConfig(
+        collar_id="ST-0", api_key="plain-key", credentials={"token": pydantic.SecretStr("nested-token")},
+    )
+
+    await trigger_actions(integration_id="int-1", action_id="read_per_collar", configs=[config])
+
+    (command,), _ = mock_publish_events.call_args.args
+    assert command.config_overrides == {
+        "collar_id": "ST-0", "api_key": "plain-key", "credentials": {"token": "nested-token"},
+    }
+    assert json.loads(json.dumps(command.dict(), default=str))["config_overrides"]["api_key"] == "plain-key"
+
+
+@pytest.mark.asyncio
+async def test_trigger_action_passes_secrets_to_the_triggered_action_unmasked(mocker):
+    mock_publish_event = AsyncMock(return_value={"messageIds": ["1"]})
+    mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
+    mocker.patch.object(settings, "TRIGGER_ACTIONS_ALWAYS_SYNC", False)
+    mocker.patch.object(settings, "INTEGRATION_COMMANDS_TOPIC", "actions-topic")
+    config = _PerCollarConfig(collar_id="ST-0", api_key="plain-key", credentials={})
+
+    await trigger_action(integration_id="int-1", action_id="read_per_collar", config=config)
+
+    command, _ = mock_publish_event.call_args.args
+    assert command.config_overrides == {"collar_id": "ST-0", "api_key": "plain-key", "credentials": {}}

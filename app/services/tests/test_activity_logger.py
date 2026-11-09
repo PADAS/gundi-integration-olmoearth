@@ -15,6 +15,8 @@ from gundi_core.events import (
 from app import settings
 from app.conftest import async_return
 from app.services.activity_logger import (
+    _is_transient_publish_error,
+    _serialized_size,
     publish_event, publish_events, activity_logger, webhook_activity_logger, log_activity,
     log_action_activity, log_webhook_activity, PUBSUB_MAX_MESSAGES_PER_PUBLISH, PUBSUB_MAX_BYTES_PER_PUBLISH,
 )
@@ -534,3 +536,84 @@ async def test_activity_logger_decorator_redacts_model_declared_secrets_below_th
     for call in mock_publish_event.call_args_list:
         event = call.kwargs["event"]
         assert event.payload.config_data == {"details": {"code": REDACTED, "realm": "r"}, "site": "s"}
+
+
+def _publish_rejection(status):
+    import aiohttp
+    from multidict import CIMultiDict, CIMultiDictProxy
+    from yarl import URL
+    request_info = aiohttp.RequestInfo(
+        url=URL("https://pubsub.googleapis.com/v1/projects/p/topics/t:publish"),
+        method="POST", headers=CIMultiDictProxy(CIMultiDict()), real_url=URL("https://pubsub.googleapis.com"),
+    )
+    return aiohttp.ClientResponseError(request_info, (), status=status, message=f"HTTP {status}")
+
+
+@pytest.mark.parametrize(
+    "error, transient",
+    [
+        (_publish_rejection(400), False),  # e.g. a message over the 10 MB limit
+        (_publish_rejection(403), False),
+        (_publish_rejection(404), False),
+        (_publish_rejection(429), True),
+        (_publish_rejection(503), True),
+        (__import__("aiohttp").ClientConnectionError("connection reset"), True),
+        (__import__("asyncio").TimeoutError(), True),
+        (ValueError("not a transport failure"), False),
+    ],
+    ids=["400", "403", "404", "429", "503", "connection", "timeout", "other"],
+)
+def test_is_transient_publish_error(error, transient):
+    assert _is_transient_publish_error(error) is transient
+
+
+@pytest.fixture
+def stamina_without_backoff():
+    import stamina
+    stamina.set_testing(True, attempts=3)
+    try:
+        yield
+    finally:
+        stamina.set_testing(False)
+
+
+@pytest.mark.asyncio
+async def test_publish_events_does_not_retry_a_rejection_pubsub_will_repeat(
+        mocker, mock_publisher_client_only, action_started_event, stamina_without_backoff,
+):
+    # The session raises for status, so a 400 (an oversize message, which
+    # _publish_batches sends alone precisely so the rejection names it) is
+    # a ClientError; it must fail at once, not after five backoffs.
+    import aiohttp
+    mock_publisher_client_only.publish.side_effect = _publish_rejection(400)
+
+    with pytest.raises(aiohttp.ClientResponseError):
+        await publish_events([action_started_event], topic_name=settings.INTEGRATION_EVENTS_TOPIC)
+
+    assert mock_publisher_client_only.publish.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_publish_events_retries_a_transient_rejection(
+        mocker, mock_publisher_client_only, action_started_event, stamina_without_backoff,
+):
+    mock_publisher_client_only.publish.side_effect = [
+        _publish_rejection(503), async_return({"messageIds": ["1"]}),
+    ]
+
+    response = await publish_events([action_started_event], topic_name=settings.INTEGRATION_EVENTS_TOPIC)
+
+    assert response == {"messageIds": ["1"]}
+    assert mock_publisher_client_only.publish.call_count == 2
+
+
+@pytest.mark.parametrize("data", [b"", b"a", b"ab", b"abc", b"abcd", "\u00e9t\u00e9", b"x" * 1000])
+@pytest.mark.parametrize("extra", [{}, {"ordering_key": "k1"}, {"source": "runner"}, {"ordering_key": "k", "a": "b"}])
+def test_serialized_size_matches_what_the_client_encodes_without_encoding_it(data, extra):
+    # The size is computed from the data length (base64 padding included)
+    # rather than by serializing the message a second time; it must still be
+    # exactly what gcloud-aio puts on the wire for the message.
+    from app.services import activity_logger
+    message = activity_logger.pubsub.PubsubMessage(data, **extra)
+
+    assert _serialized_size(message) == len(json.dumps(message.to_repr())) + len(", ")

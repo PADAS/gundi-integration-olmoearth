@@ -6,14 +6,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, status, BackgroundTasks
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 # app.settings first: the routers pull in gundi_client_v2, which loads a .env of
 # its own, and the first loader wins per key (see app/settings/base.py).
 import app.settings as settings
 from app.routers import actions, webhooks, config_events
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.services.action_runner import execute_action, _portal
+from app.services.action_runner import ActionErrorResponse, execute_action, _portal
 from app.services.self_registration import register_integration_in_gundi
 from app.services.webhooks import close_diagnostic_client
 
@@ -117,6 +117,15 @@ async def execute(
             # acked below, including failures a retry cannot fix (missing or
             # invalid configuration, rejected credentials, a provider 4xx, a
             # bug), which would otherwise be redelivered until they expire.
+            #
+            # The runner puts no cap on the attempts: each one runs the action
+            # again (hitting the provider, publishing another
+            # IntegrationActionFailed) until the run succeeds or the message
+            # expires, 7 days by default. Bound that on the subscription with
+            # a dead-letter policy (max delivery attempts): PubSub only
+            # reports the attempt number (`deliveryAttempt`) once such a
+            # policy is set, and then enforces the cap itself, so there is
+            # nothing for the runner to count. See the README.
             return result
     return {}
 
@@ -124,19 +133,13 @@ async def execute(
 def _should_redeliver(result) -> bool:
     """True for an execute_action error response whose failure is transient.
 
-    Successful runs return the handler's own result (a dict), errors a
-    JSONResponse from _handle_error whose body carries the verdict
-    (`retryable`, from retry_policies.is_retryable_failure on the exception).
-    Only 5xx responses qualify: the runner answers 4xx for request and
-    configuration problems, which are final.
+    Successful runs return the handler's own result (a dict), errors an
+    ActionErrorResponse from _handle_error carrying the verdict (`retryable`,
+    from retry_policies.is_retryable_failure on the exception). Only 5xx
+    responses qualify: the runner answers 4xx for request and configuration
+    problems, which are final.
     """
-    if not isinstance(result, Response) or result.status_code < 500:
-        return False
-    try:
-        detail = json.loads(result.body).get("detail") or {}
-    except (ValueError, AttributeError):
-        return False
-    return detail.get("retryable") is True
+    return isinstance(result, ActionErrorResponse) and result.status_code >= 500 and result.retryable
 
 
 @app.post(

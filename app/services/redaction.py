@@ -204,7 +204,9 @@ def redact_config_data(
         return {}
     rows = config_data.get("configurations")
     if isinstance(rows, list):
-        redacted = redact_secrets(config_data)
+        # Each level is walked once: the rows are redacted on their own, not
+        # also as part of the top-level walk.
+        redacted = redact_secrets({key: item for key, item in config_data.items() if key != "configurations"})
         redacted["configurations"] = [_redact_configuration_row(row, config_models) for row in rows]
         return redacted
     return redact_secrets(config_data, model=config_models.get(action_id))
@@ -215,7 +217,8 @@ def _redact_configuration_row(row: Any, config_models: Mapping[str, Type[pydanti
         return row
     action = row.get("action")
     action_value = action.get("value") if isinstance(action, dict) else None
-    redacted = redact_secrets(row)
-    if isinstance(row.get("data"), dict):
-        redacted["data"] = redact_secrets(row["data"], model=config_models.get(action_value) if action_value else None)
+    redacted = redact_secrets({key: item for key, item in row.items() if key != "data"})
+    if "data" in row:
+        model = config_models.get(action_value) if action_value and isinstance(row["data"], dict) else None
+        redacted["data"] = redact_secrets(row["data"], model=model)
     return redacted

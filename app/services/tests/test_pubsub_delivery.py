@@ -268,3 +268,21 @@ def test_internal_action_without_overrides_is_422(mocker, runner_mocks):
     assert response.status_code == 422
     assert not handler.called
     assert not runner_mocks.get_action_configuration.called
+
+
+# --- the verdict travels on the response object ------------------------------
+
+
+def test_redelivery_verdict_is_read_from_the_response_not_parsed_from_its_body():
+    from fastapi.responses import JSONResponse
+    from app.main import _should_redeliver
+    from app.services.action_runner import ActionErrorResponse
+
+    body = {"detail": {"retryable": True}}
+    assert _should_redeliver(ActionErrorResponse(status_code=500, content=body, retryable=True)) is True
+    assert _should_redeliver(ActionErrorResponse(status_code=500, content=body, retryable=False)) is False
+    # 4xx is final whatever the verdict: a request or configuration problem.
+    assert _should_redeliver(ActionErrorResponse(status_code=422, content=body, retryable=True)) is False
+    # A plain response carries no verdict, so its body is not consulted.
+    assert _should_redeliver(JSONResponse(status_code=503, content=body)) is False
+    assert _should_redeliver({"result": "ok"}) is False
