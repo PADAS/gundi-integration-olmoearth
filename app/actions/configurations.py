@@ -85,6 +85,11 @@ def _reference(action: str, params: Optional[dict] = None) -> dict:
 
 
 class PullEventsConfig(PullActionConfiguration):
+    viewer_config_id: Optional[UUID] = FieldWithUIOptions(
+        None,
+        title="Public OlmoEarth viewer config",
+        description="Completed predictions and results will be published in this existing public viewer before events are sent.",
+    )
     project_id: UUID = FieldWithUIOptions(
         ...,
         title="OlmoEarth project",

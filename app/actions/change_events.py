@@ -203,6 +203,13 @@ def prepare_event(
             **form_fields(feature, changed),
         }
     )
+    if job.viewer_config_id:
+        props["prediction_viewer_url"] = (
+            "https://olmoearth.allenai.org/viewer/"
+            f"{job.viewer_config_id}?color_by=post_change"
+            f"&prediction_ids={job.prediction_id}"
+            f"#13.95/{point.y:.6f}/{point.x:.6f}"
+        )
     return {
         "title": title,
         "event_type": config.event_type,

@@ -1,5 +1,6 @@
 """Orchestrate prediction submission, result collection, and recoverable delivery."""
 
+import asyncio
 import calendar
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
@@ -206,6 +207,7 @@ class Monitor:
                 selected_types=self.config.selected_types,
                 area_of_interest=area,
                 changes_since=self.config.changes_since,
+                viewer_config_id=str(self.config.viewer_config_id) if self.config.viewer_config_id else None,
             )
         )
         if not is_extra:
@@ -314,6 +316,26 @@ class Monitor:
                     "Prediction result changed while paging; earlier pages came from a different result."
                 ),
             )
+        if job.viewer_config_id:
+            viewer_id = str(job.viewer_config_id)
+            lock = self.store.db_client.lock(
+                f"{STATE_ACTION}:viewer:{self.api.base_url}:{viewer_id}",
+                timeout=120,
+                blocking=False,
+            )
+            if not await lock.acquire():
+                raise IntegrationConfigurationError(
+                    "Another monitor is updating this viewer; retry collection."
+                )
+            try:
+                await asyncio.wait_for(
+                    self.api.add_to_viewer(
+                        viewer_id, job.prediction_id, prediction.result.id
+                    ),
+                    timeout=90,
+                )
+            finally:
+                await lock.release()
         if job.result_id is None or job.status != JobStatus.COLLECTING:
             job.result_id = prediction.result.id
             job.status = JobStatus.COLLECTING

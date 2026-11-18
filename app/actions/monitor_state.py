@@ -39,6 +39,7 @@ class Job(BaseModel):
     # None only until load() fills it on jobs saved before the area could change.
     area_of_interest: Optional[dict] = None
     changes_since: Optional[date] = None
+    viewer_config_id: Optional[str] = None
     result_id: Optional[str] = None
     status: JobStatus = JobStatus.PENDING
     offset: int = 0

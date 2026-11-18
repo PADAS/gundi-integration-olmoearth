@@ -122,3 +122,45 @@ The implementation is on `olmoearth-integration` in PR #2, based on the fork's `
 ## Pilot completion criteria
 
 Use one small mining AOI. Confirm credentials and date semantics; register/deploy the runner with Redis; configure the Gundi route and EarthRanger event type; submit a real prediction; inspect its polygons; collect; verify geometry, date and fields in EarthRanger. Run a second reference date to inspect how repeats are marked and how many arrive. Only then enable recurring submission and validate cost, recovery and multiple cycles. Studio viewer links/thumbnails, destination updates, large-result export and real site/change tracking from OlmoEarth remain follow-up work.
+
+## Public viewer links (November 18, 2026)
+
+Set `viewer_config_id` in Collect LCC Events to
+`b1eeb680-1dc1-4e97-8636-6c4156bbbe9a` for the production pilot. The production
+pilot example includes it; other integrations default to no publication.
+This setting is snapshotted when a job is submitted, so it applies to new jobs,
+not jobs already saved or events already delivered.
+
+On completion, collection reads the existing viewer and adds both the Studio
+prediction ID and result ID using `PUT /api/v1/viewer_config/{id}`. It preserves
+existing associations, publishing state, layout and metadata. Explicit result
+association causes Studio to make that result publicly readable. The viewer must
+already be public, and the token needs BUILD permission and access to the viewer
+and prediction. Failed publication stops collection before new events are sent;
+retrying collection re-reads the config and does not duplicate associations.
+Runner updates to the same viewer are serialized through Redis. Studio's current
+API has no compare-and-swap protection, so manual edits or other clients must not
+update that viewer concurrently with collection.
+
+Events retain `prediction_id`, `prediction_result_id`,
+`oe_prediction_result_id`, and `oe_prediction_result_file_id`, and add
+`prediction_viewer_url`. The URL points to
+`https://olmoearth.allenai.org/viewer/{viewer_config_id}?color_by=post_change&prediction_ids={prediction_id}`
+with a map hash centered on the event polygon. The Studio prediction ID is supplied
+using the canonical `prediction_ids` parameter supported by the published viewer
+in monorepo PR #62 (verified at `a412ccab2`). The viewer checks only the matching
+prediction among its configured results and preserves the map hash and
+`color_by`. Predictions outside that configuration are not loaded, so publication
+must precede delivery. The singular `prediction_id` is also accepted. Satellite
+imagery defaults on for signed-in users and remains off for signed-out visitors;
+the connector leaves that parameter unset. It does not select an individual feature. This link
+host is production, so configure this option only against production Studio.
+
+The destination event-type form is managed outside this repository. Map
+`event_details.prediction_viewer_url` through Gundi to a URL/link field labeled
+“View OlmoEarth prediction” in that form. If the form supports separate link text
+and URL, show `prediction_id` as the text and use `prediction_viewer_url` as the
+href. Do not replace the raw result/file IDs with URLs: they identify different
+objects and remain useful for debugging. Verify the destination's actual link
+widget and mapping before deploying. This change does not modify the live form,
+viewer, or already-delivered events.

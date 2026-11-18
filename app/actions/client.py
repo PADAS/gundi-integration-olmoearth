@@ -287,6 +287,49 @@ class OlmoEarthClient:
         return parsed
 
     # -- endpoints ---------------------------------------------------------
+    async def add_to_viewer(
+        self, viewer_config_id: str, prediction_id: str, result_id: str
+    ) -> None:
+        """Preserve viewer settings and append a completed prediction and result.
+
+        Studio's PUT replaces associations; callers sharing a viewer must serialize
+        updates. Include the result explicitly so Studio makes it publicly readable.
+        """
+        path = f"/api/v1/viewer_config/{viewer_config_id}"
+        payload = await self._request("GET", path)
+        records = payload.get("records", [])
+        if payload.get("errors") or len(records) != 1:
+            raise IntegrationBadResponseError("Expected one viewer configuration.")
+        viewer = records[0]
+        if viewer.get("access_level") != "public":
+            raise IntegrationConfigurationError(
+                "The configured viewer must already be public."
+            )
+        required = {"organization_id", "access_level", "state", "ui_layout_config"}
+        if not (required | {"predictions", "prediction_results"}).issubset(viewer):
+            raise IntegrationBadResponseError(
+                "Viewer configuration is missing required settings."
+            )
+        prediction_ids = [item["id"] for item in viewer.get("predictions") or []]
+        result_ids = [item["id"] for item in viewer.get("prediction_results") or []]
+        if prediction_id in prediction_ids and result_id in result_ids:
+            return
+        fields = required | {
+            "project_settings_id",
+            "title",
+            "description",
+            "thumbnail_image_id",
+            "landing_page_order",
+        }
+        body = {key: viewer[key] for key in fields if key in viewer}
+        body["prediction_ids"] = list(dict.fromkeys([*prediction_ids, prediction_id]))
+        body["prediction_result_ids"] = list(dict.fromkeys([*result_ids, result_id]))
+        # Don't replay an old replacement payload after a transient failure.
+        # The next collect action re-reads the viewer before retrying.
+        updated = await self._request("PUT", path, body, attempts=1)
+        if updated.get("errors") or len(updated.get("records", [])) != 1:
+            raise IntegrationBadResponseError("Viewer update was not acknowledged.")
+
     async def search_predictions(
         self, request: PredictionSearchRequest
     ) -> PredictionSearchResponse:
