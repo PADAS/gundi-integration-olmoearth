@@ -1081,7 +1081,12 @@ async def test_viewer_update_preserves_settings_and_is_idempotent():
         "access_level": "public",
         "state": "published",
         "title": "Existing viewer",
+        "thumbnail_image_id": "thumbnail",
+        "project_settings_id": "settings",
+        "description": "Description",
+        "landing_page_order": 3,
         "ui_layout_config": {"legend": {"enabled": True}},
+        "basemaps": [{"id": "basemap"}],
         "predictions": [{"id": "old-prediction"}],
         "prediction_results": [{"id": "old-result"}],
     }
@@ -1109,7 +1114,12 @@ async def test_viewer_update_preserves_settings_and_is_idempotent():
         "access_level": "public",
         "state": "published",
         "title": "Existing viewer",
+        "thumbnail_image_id": "thumbnail",
+        "project_settings_id": "settings",
+        "description": "Description",
+        "landing_page_order": 3,
         "ui_layout_config": {"legend": {"enabled": True}},
+        "basemap_ids": ["basemap"],
         "prediction_ids": ["old-prediction", "p1"],
         "prediction_result_ids": ["old-result", "r1"],
     }
@@ -1138,7 +1148,7 @@ async def test_viewer_publication_precedes_delivery_and_retries(config, api, sto
     details = event["event_details"]
     assert details["prediction_id"] == "p1"
     assert details["prediction_viewer_url"] == (
-        f"https://olmoearth.allenai.org/viewer/{VIEWER}"
+        f"https://example.test/viewer/{VIEWER}"
         "?color_by=post_change&prediction_ids=p1#13.95/10.500000/10.500000"
     )
 
@@ -1148,6 +1158,7 @@ async def test_viewer_publication_precedes_delivery_and_retries(config, api, sto
     "payload",
     [
         {"records": []},
+        {"records": None},
         {"records": [{"access_level": "public"}]},
         {"errors": ["denied"], "records": []},
     ],
@@ -1175,7 +1186,7 @@ async def test_viewer_lock_contention_stops_collection(config, api, store):
     store.db_client = SimpleNamespace(lock=lambda *args, **kwargs: lock)
     monitor = await seed(config, api, store)
     store.value["jobs"][0]["viewer_config_id"] = VIEWER
-    with pytest.raises(IntegrationConfigurationError, match="Another monitor"):
+    with pytest.raises(IntegrationConnectionError, match="Another monitor"):
         await monitor.collect()
     api.add_to_viewer.assert_not_awaited()
     monitor.sender.send.assert_not_awaited()
@@ -1214,3 +1225,72 @@ async def test_viewer_setting_is_saved_with_prediction(config, api, store):
     api.add_to_viewer.assert_awaited_once_with(VIEWER, "p1", "r1")
     details = monitor.sender.send.call_args.args[0][0]["event_details"]
     assert f"/viewer/{VIEWER}?" in details["prediction_viewer_url"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [
+    IntegrationConfigurationError("private viewer"),
+    IntegrationAuthError("forbidden", status_code=403),
+    IntegrationBadResponseError("missing viewer", status_code=404),
+])
+async def test_permanent_viewer_error_releases_active_job(config, api, store, error):
+    lock = AsyncMock()
+    lock.acquire.return_value = True
+    store.db_client = SimpleNamespace(lock=lambda *args, **kwargs: lock)
+    monitor = await seed(config, api, store)
+    store.value["jobs"][0]["viewer_config_id"] = VIEWER
+    api.add_to_viewer.side_effect = error
+    with pytest.raises(type(error)):
+        await monitor.collect()
+    assert store.value["jobs"][0]["status"] == "failed"
+    monitor.sender.send.assert_not_awaited()
+    lock.release.assert_awaited_once()
+    # A failed job no longer prevents the next scheduled submission.
+    monitor.now += dt.timedelta(days=8)
+    await monitor.submit()
+    assert len(store.value["jobs"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_viewer_timeout_is_retryable_connectivity_error(config, api, store):
+    lock = AsyncMock()
+    lock.acquire.return_value = True
+    store.db_client = SimpleNamespace(lock=lambda *args, **kwargs: lock)
+    monitor = await seed(config, api, store)
+    store.value["jobs"][0]["viewer_config_id"] = VIEWER
+    api.add_to_viewer.side_effect = monitor_module.asyncio.TimeoutError()
+    with pytest.raises(IntegrationConnectionError, match="Publishing.*timed out"):
+        await monitor.collect()
+    assert store.value["jobs"][0]["status"] == "pending"
+    lock.release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_paging_does_not_republish_viewer(config, api, store):
+    monitor = await seed(config, api, store)
+    job = store.value["jobs"][0]
+    job.update(viewer_config_id=VIEWER, result_id="r1", status="collecting")
+    api.search_features.return_value = page([feature()])
+    await monitor.collect()
+    api.add_to_viewer.assert_not_awaited()
+    assert monitor.sender.send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_null_viewer_write_response_is_classified():
+    viewer = {
+        "organization_id": ORG, "access_level": "public", "state": "published",
+        "ui_layout_config": {}, "basemaps": [], "predictions": [], "prediction_results": [],
+    }
+    methods = []
+
+    def respond(request):
+        methods.append(request.method)
+        return httpx.Response(200, json={"records": [viewer] if request.method == "GET" else None})
+
+    async with client.OlmoEarthClient(
+        "https://example.test", "token", transport=httpx.MockTransport(respond)
+    ) as api:
+        with pytest.raises(IntegrationBadResponseError, match="not acknowledged"):
+            await api.add_to_viewer(VIEWER, "p1", "r1")
+    assert methods == ["GET", "PUT"]

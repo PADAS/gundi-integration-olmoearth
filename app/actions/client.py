@@ -296,9 +296,9 @@ class OlmoEarthClient:
         updates. Include the result explicitly so Studio makes it publicly readable.
         """
         path = f"/api/v1/viewer_config/{viewer_config_id}"
-        payload = await self._request("GET", path)
-        records = payload.get("records", [])
-        if payload.get("errors") or len(records) != 1:
+        payload = await self._request("GET", path, attempts=1)
+        records = payload.get("records") or []
+        if payload.get("errors") or not isinstance(records, list) or len(records) != 1:
             raise IntegrationBadResponseError("Expected one viewer configuration.")
         viewer = records[0]
         if viewer.get("access_level") != "public":
@@ -306,7 +306,7 @@ class OlmoEarthClient:
                 "The configured viewer must already be public."
             )
         required = {"organization_id", "access_level", "state", "ui_layout_config"}
-        if not (required | {"predictions", "prediction_results"}).issubset(viewer):
+        if not (required | {"predictions", "prediction_results", "basemaps"}).issubset(viewer):
             raise IntegrationBadResponseError(
                 "Viewer configuration is missing required settings."
             )
@@ -322,12 +322,14 @@ class OlmoEarthClient:
             "landing_page_order",
         }
         body = {key: viewer[key] for key in fields if key in viewer}
+        body["basemap_ids"] = [item["id"] for item in viewer.get("basemaps") or []]
         body["prediction_ids"] = list(dict.fromkeys([*prediction_ids, prediction_id]))
         body["prediction_result_ids"] = list(dict.fromkeys([*result_ids, result_id]))
         # Don't replay an old replacement payload after a transient failure.
         # The next collect action re-reads the viewer before retrying.
         updated = await self._request("PUT", path, body, attempts=1)
-        if updated.get("errors") or len(updated.get("records", [])) != 1:
+        records = updated.get("records") or []
+        if updated.get("errors") or not isinstance(records, list) or len(records) != 1:
             raise IntegrationBadResponseError("Viewer update was not acknowledged.")
 
     async def search_predictions(

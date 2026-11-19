@@ -158,6 +158,7 @@ def prepare_event(
     *,
     integration_id: str,
     now: datetime,
+    viewer_base_url: str,
 ) -> dict:
     """Build the Gundi event for one monitored detection and record its site.
 
@@ -205,7 +206,7 @@ def prepare_event(
     )
     if job.viewer_config_id:
         props["prediction_viewer_url"] = (
-            "https://olmoearth.allenai.org/viewer/"
+            f"{viewer_base_url.rstrip('/')}/viewer/"
             f"{job.viewer_config_id}?color_by=post_change"
             f"&prediction_ids={job.prediction_id}"
             f"#13.95/{point.y:.6f}/{point.x:.6f}"

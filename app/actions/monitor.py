@@ -8,6 +8,8 @@ from typing import Optional
 
 from app.services.activity_logger import LogLevel, log_action_activity
 from app.services.errors import (
+    IntegrationAuthError,
+    IntegrationConnectionError,
     IntegrationBadResponseError,
     IntegrationConfigurationError,
     IntegrationError,
@@ -316,15 +318,16 @@ class Monitor:
                     "Prediction result changed while paging; earlier pages came from a different result."
                 ),
             )
-        if job.viewer_config_id:
+        if job.viewer_config_id and (job.result_id is None or job.status != JobStatus.COLLECTING):
             viewer_id = str(job.viewer_config_id)
             lock = self.store.db_client.lock(
                 f"{STATE_ACTION}:viewer:{self.api.base_url}:{viewer_id}",
-                timeout=120,
-                blocking=False,
+                timeout=180,
+                blocking=True,
+                blocking_timeout=10,
             )
             if not await lock.acquire():
-                raise IntegrationConfigurationError(
+                raise IntegrationConnectionError(
                     "Another monitor is updating this viewer; retry collection."
                 )
             try:
@@ -332,8 +335,22 @@ class Monitor:
                     self.api.add_to_viewer(
                         viewer_id, job.prediction_id, prediction.result.id
                     ),
-                    timeout=90,
+                    timeout=150,
                 )
+            except asyncio.TimeoutError as exc:
+                raise IntegrationConnectionError(
+                    "Publishing the prediction to the viewer timed out; retry collection."
+                ) from exc
+            except IntegrationError as exc:
+                # Permanent errors must release the active job so corrected config
+                # can take effect on the next submission. Transient errors retry.
+                if isinstance(exc, (IntegrationConfigurationError, IntegrationAuthError)) or (
+                    exc.status_code is not None
+                    and 400 <= exc.status_code < 500
+                    and exc.status_code not in {408, 429}
+                ):
+                    await self._fail_job(job, exc)
+                raise
             finally:
                 await lock.release()
         if job.result_id is None or job.status != JobStatus.COLLECTING:
@@ -372,6 +389,7 @@ class Monitor:
                     sites,
                     integration_id=self.integration_id,
                     now=self.now,
+                    viewer_base_url=self.api.base_url,
                 )
                 for feature in response.records
                 if (found := classify(feature, job, self.config))

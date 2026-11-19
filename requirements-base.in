@@ -22,6 +22,6 @@ stamina~=24.3.0
 redis~=5.0.1
 gcloud-aio-pubsub~=6.0.0
 click~=8.1.7
-# OlmoEarth does not use the template's optional pyjq webhook transformations.
+pyjq~=2.6.0
 python-json-logger~=2.0.7
 marshmallow~=3.22.0
