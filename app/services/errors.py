@@ -84,6 +84,19 @@ class IntegrationConfigurationError(IntegrationError):
     default_title = "Invalid configuration"
 
 
+class ActionTimeoutError(Exception):
+    """The runner cancelled a handler that outran MAX_ACTION_EXECUTION_TIME.
+
+    Deliberately not an IntegrationError (connectors never raise it, and the
+    ephemeral path's redaction rules key off that hierarchy) and not an
+    asyncio.TimeoutError (which classify_error reads as the provider not
+    answering). The message says what happened, without the action id: the
+    portal already prefixes "Error running action '<id>': ".
+    """
+    error_type = "timeout"
+    default_title = "Action timed out"
+
+
 # Titles for failures of the runner's own requests to Gundi (raised by
 # gundi-client-v2). Kept apart from the provider titles above: a Gundi 401 is
 # the runner's OAuth configuration, not the source's credentials.
@@ -117,7 +130,12 @@ def source_status_code(exc: Exception) -> Optional[int]:
     (httpx.HTTPStatusError, requests.HTTPError, and anything else that keeps
     the response on the exception). This is the single reader shared by the
     classifier and the ephemeral status forwarding, so wherever a status is
-    forwarded at all, it is the one the text names.
+    forwarded at all, it is the one the text names. It reads the exception
+    itself, never its cause: an `IntegrationAuthError` raised from a 400 is
+    the connector's verdict that credentials were rejected, forwarded as the
+    401 the portal keys on. The retry policy walks the chain on its own
+    (retry_policies._failure_status) because a verdict about redelivery may
+    use evidence the text does not name.
 
     The one deliberate divergence is a Gundi-side failure, where the text
     keeps Gundi's status ("Gundi API request failed (HTTP 401)") while the
@@ -148,6 +166,18 @@ def source_status_code(exc: Exception) -> Optional[int]:
     return code
 
 
+def is_http_failure_status(status_code: int) -> bool:
+    """Whether ``status_code`` is a failure the provider answered with (4xx/5xx).
+
+    A status below 400 is not a failure the portal can classify (a redirect
+    surfaced by raise_for_status with redirects off is the common one), and
+    anything outside the HTTP range is a connector bug, not a verdict. One
+    rule shared by the ephemeral status forwarding and the retry policy, so
+    the status one forwards is the status the other judges.
+    """
+    return 400 <= status_code <= 599
+
+
 def classify_error(exc: Exception) -> Optional[ClassifiedError]:
     """Classify a third-party failure for consistent activity-log reporting.
 
@@ -159,6 +189,10 @@ def classify_error(exc: Exception) -> Optional[ClassifiedError]:
     keep the generic format.
     """
     status_code = source_status_code(exc)
+    if isinstance(exc, ActionTimeoutError):
+        # The runner's own execution cap: a verdict about the action, not the
+        # provider, so neither the connectivity title nor an HTTP status.
+        return ClassifiedError(exc.error_type, exc.default_title, str(exc), None)
     if isinstance(exc, IntegrationError):
         return ClassifiedError(
             error_type=exc.error_type,
