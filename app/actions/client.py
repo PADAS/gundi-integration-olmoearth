@@ -249,7 +249,7 @@ class OlmoEarthClient:
         self, method: str, path: str, body: Optional[dict] = None, attempts: int = 3
     ) -> dict:
         async for attempt in stamina.retry_context(
-            on=_is_transient,
+            on=is_transient,
             attempts=attempts,
             wait_initial=2.0,
             wait_max=20.0,
@@ -287,6 +287,75 @@ class OlmoEarthClient:
         return parsed
 
     # -- endpoints ---------------------------------------------------------
+    async def render_thumbnail(self, query: dict) -> bytes:
+        try:
+            response = await self._client.get(
+                "/api/v1/datasets-imagery/image.png",
+                params={"query": json.dumps(query)},
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise _classify_status_error(exc) from exc
+        except httpx.HTTPError as exc:
+            raise IntegrationConnectionError("Could not render satellite thumbnail") from exc
+        if not response.content.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise IntegrationBadResponseError("Imagery endpoint did not return a PNG")
+        return response.content
+
+    async def add_to_viewer(
+        self, viewer_config_id: str, prediction_id: str, result_id: str
+    ) -> None:
+        """Preserve viewer settings and append a completed prediction and result.
+
+        Studio's PUT replaces associations; callers sharing a viewer must serialize
+        updates. Include the result explicitly so Studio makes it publicly readable.
+        """
+        path = f"/api/v1/viewer_config/{viewer_config_id}"
+        viewer = _single_record(
+            await self._request("GET", path, attempts=1),
+            "Expected one viewer configuration.",
+        )
+        if viewer.get("access_level") != "public":
+            raise IntegrationConfigurationError(
+                "The configured viewer must already be public."
+            )
+        required = {"organization_id", "access_level", "state", "ui_layout_config"}
+        if not (required | {"predictions", "prediction_results", "basemaps"}).issubset(viewer):
+            raise IntegrationBadResponseError(
+                "Viewer configuration is missing required settings."
+            )
+        prediction_ids = [item["id"] for item in viewer.get("predictions") or []]
+        result_ids = [item["id"] for item in viewer.get("prediction_results") or []]
+        if prediction_id in prediction_ids and result_id in result_ids:
+            return
+        fields = required | {
+            "project_settings_id",
+            "title",
+            "description",
+            "thumbnail_image_id",
+            "landing_page_order",
+        }
+        body = {key: viewer[key] for key in fields if key in viewer}
+        body["basemap_ids"] = [item["id"] for item in viewer.get("basemaps") or []]
+        body["prediction_ids"] = list(dict.fromkeys([*prediction_ids, prediction_id]))
+        body["prediction_result_ids"] = list(dict.fromkeys([*result_ids, result_id]))
+        # Don't replay an old replacement payload after a transient failure.
+        # The next collect action re-reads the viewer before retrying.
+        _single_record(
+            await self._request("PUT", path, body, attempts=1),
+            "Viewer update was not acknowledged.",
+        )
+
+    async def search_scenes(self, query: dict) -> list[dict]:
+        """Imagery scenes matching a datasets-imagery search, in the requested order."""
+        response = await self._request(
+            "POST", "/api/v1/datasets-imagery/scenes/search", query, attempts=1
+        )
+        records = response.get("records")
+        if response.get("errors") or not isinstance(records, list):
+            raise IntegrationBadResponseError("Invalid imagery scene search response")
+        return records
+
     async def search_predictions(
         self, request: PredictionSearchRequest
     ) -> PredictionSearchResponse:
@@ -347,7 +416,15 @@ class OlmoEarthClient:
         return response.meta.total
 
 
-def _is_transient(exc: BaseException) -> bool:
+def _single_record(payload: dict, message: str) -> dict:
+    """The one record of a raw response envelope; raise ``message`` otherwise."""
+    records = payload.get("records") or []
+    if payload.get("errors") or not isinstance(records, list) or len(records) != 1:
+        raise IntegrationBadResponseError(message)
+    return records[0]
+
+
+def is_transient(exc: BaseException) -> bool:
     """Retry predicate: transport failures, 429 and 5xx are worth another try."""
     if isinstance(exc, IntegrationConnectionError):
         return True

@@ -1069,3 +1069,275 @@ async def test_legacy_pending_job_keeps_the_area_it_was_submitted_with(config, a
     assert api.search_features.call_args.args[1].intersects_geometry.dict(
         exclude_none=True
     ) == AREA
+
+
+VIEWER = "b1eeb680-1dc1-4e97-8636-6c4156bbbe9a"
+
+
+@pytest.mark.asyncio
+async def test_viewer_update_preserves_settings_and_is_idempotent():
+    viewer = {
+        "organization_id": ORG,
+        "access_level": "public",
+        "state": "published",
+        "title": "Existing viewer",
+        "thumbnail_image_id": "thumbnail",
+        "project_settings_id": "settings",
+        "description": "Description",
+        "landing_page_order": 3,
+        "ui_layout_config": {"legend": {"enabled": True}},
+        "basemaps": [{"id": "basemap"}],
+        "predictions": [{"id": "old-prediction"}],
+        "prediction_results": [{"id": "old-result"}],
+    }
+    writes = []
+
+    def respond(request):
+        assert request.url.path == f"/api/v1/viewer_config/{VIEWER}"
+        if request.method == "PUT":
+            body = json.loads(request.content)
+            writes.append(body)
+            viewer["predictions"] = [{"id": pid} for pid in body["prediction_ids"]]
+            viewer["prediction_results"] = [
+                {"id": rid} for rid in body["prediction_result_ids"]
+            ]
+        return httpx.Response(200, json={"records": [viewer]})
+
+    async with client.OlmoEarthClient(
+        "https://example.test", "token", transport=httpx.MockTransport(respond)
+    ) as api:
+        await api.add_to_viewer(VIEWER, "p1", "r1")
+        await api.add_to_viewer(VIEWER, "p1", "r1")
+    assert len(writes) == 1
+    assert writes[0] == {
+        "organization_id": ORG,
+        "access_level": "public",
+        "state": "published",
+        "title": "Existing viewer",
+        "thumbnail_image_id": "thumbnail",
+        "project_settings_id": "settings",
+        "description": "Description",
+        "landing_page_order": 3,
+        "ui_layout_config": {"legend": {"enabled": True}},
+        "basemap_ids": ["basemap"],
+        "prediction_ids": ["old-prediction", "p1"],
+        "prediction_result_ids": ["old-result", "r1"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_viewer_publication_precedes_delivery_and_retries(config, api, store):
+    config.viewer_config_id = VIEWER
+    lock = AsyncMock()
+    lock.acquire.return_value = True
+    store.db_client = SimpleNamespace(lock=lambda *args, **kwargs: lock)
+    api.add_to_viewer.side_effect = IntegrationConnectionError("unavailable")
+    api.search_features.return_value = page([feature()])
+    monitor = await seed(config, api, store)
+    store.value["jobs"][0]["viewer_config_id"] = VIEWER
+    with pytest.raises(IntegrationConnectionError):
+        await monitor.collect()
+    monitor.sender.send.assert_not_awaited()
+    api.search_features.assert_not_awaited()
+    lock.release.assert_awaited_once()
+    assert store.value["jobs"][0]["status"] == "pending"
+    api.add_to_viewer.side_effect = None
+    await monitor.collect()
+    api.add_to_viewer.assert_awaited_with(VIEWER, "p1", "r1")
+    event = monitor.sender.send.call_args.args[0][0]
+    details = event["event_details"]
+    assert details["prediction_id"] == "p1"
+    assert details["prediction_viewer_url"] == (
+        f"https://example.test/viewer/{VIEWER}"
+        "?color_by=post_change&prediction_ids=p1#13.95/10.500000/10.500000"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"records": []},
+        {"records": None},
+        {"records": [{"access_level": "public"}]},
+        {"errors": ["denied"], "records": []},
+    ],
+)
+async def test_invalid_viewer_response_does_not_update(payload):
+    requests = []
+
+    def respond(request):
+        requests.append(request.method)
+        return httpx.Response(200, json=payload)
+
+    async with client.OlmoEarthClient(
+        "https://example.test", "token", transport=httpx.MockTransport(respond)
+    ) as api:
+        with pytest.raises(IntegrationBadResponseError):
+            await api.add_to_viewer(VIEWER, "p1", "r1")
+    assert requests == ["GET"]
+
+
+@pytest.mark.asyncio
+async def test_viewer_lock_contention_stops_collection(config, api, store):
+    config.viewer_config_id = VIEWER
+    lock = AsyncMock()
+    lock.acquire.return_value = False
+    store.db_client = SimpleNamespace(lock=lambda *args, **kwargs: lock)
+    monitor = await seed(config, api, store)
+    store.value["jobs"][0]["viewer_config_id"] = VIEWER
+    with pytest.raises(IntegrationConnectionError, match="Another monitor"):
+        await monitor.collect()
+    api.add_to_viewer.assert_not_awaited()
+    monitor.sender.send.assert_not_awaited()
+    lock.release.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_private_viewer_is_not_published():
+    requests = []
+
+    def respond(request):
+        requests.append(request.method)
+        return httpx.Response(200, json={"records": [{"access_level": "internal"}]})
+
+    async with client.OlmoEarthClient(
+        "https://example.test", "token", transport=httpx.MockTransport(respond)
+    ) as api:
+        with pytest.raises(IntegrationConfigurationError, match="already be public"):
+            await api.add_to_viewer(VIEWER, "p1", "r1")
+    assert requests == ["GET"]
+
+
+@pytest.mark.asyncio
+async def test_viewer_setting_is_saved_with_prediction(config, api, store):
+    config.viewer_config_id = VIEWER
+    monitor = make_monitor(config, api, store)
+    await monitor.submit()
+    assert store.value["jobs"][0]["viewer_config_id"] == VIEWER
+    # Later configuration changes must not redirect the job's event links.
+    config.viewer_config_id = None
+    lock = AsyncMock()
+    lock.acquire.return_value = True
+    store.db_client = SimpleNamespace(lock=lambda *args, **kwargs: lock)
+    api.search_features.return_value = page([feature()])
+    await monitor.collect()
+    api.add_to_viewer.assert_awaited_once_with(VIEWER, "p1", "r1")
+    details = monitor.sender.send.call_args.args[0][0]["event_details"]
+    assert f"/viewer/{VIEWER}?" in details["prediction_viewer_url"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [
+    IntegrationConfigurationError("private viewer"),
+    IntegrationAuthError("forbidden", status_code=403),
+    IntegrationBadResponseError("missing viewer", status_code=404),
+    # No status code: a malformed viewer response is permanent, not retried forever.
+    IntegrationBadResponseError("Viewer configuration is missing required settings."),
+])
+async def test_permanent_viewer_error_delivers_events_without_link(
+    config, api, store, activity_log, error
+):
+    lock = AsyncMock()
+    lock.acquire.return_value = True
+    store.db_client = SimpleNamespace(lock=lambda *args, **kwargs: lock)
+    api.search_features.return_value = page([feature()])
+    monitor = await seed(config, api, store)
+    store.value["jobs"][0]["viewer_config_id"] = VIEWER
+    api.add_to_viewer.side_effect = error
+    await monitor.collect()
+    api.add_to_viewer.assert_awaited_once()
+    lock.release.assert_awaited_once()
+    details = monitor.sender.send.call_args.args[0][0]["event_details"]
+    assert details["prediction_id"] == "p1"
+    assert "prediction_viewer_url" not in details
+    job = store.value["jobs"][0]
+    assert job["viewer_config_id"] is None
+    assert job["status"] == "complete"
+    assert any(
+        "without a viewer link" in call.args[2] for call in activity_log.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_transient_viewer_errors_give_up_on_the_link(config, api, store):
+    lock = AsyncMock()
+    lock.acquire.return_value = True
+    store.db_client = SimpleNamespace(lock=lambda *args, **kwargs: lock)
+    api.search_features.return_value = page([feature()])
+    monitor = await seed(config, api, store)
+    store.value["jobs"][0]["viewer_config_id"] = VIEWER
+    api.add_to_viewer.side_effect = IntegrationConnectionError("unavailable")
+    for attempt in range(1, monitor_module.VIEWER_PUBLISH_ATTEMPTS):
+        with pytest.raises(IntegrationConnectionError):
+            await monitor.collect()
+        assert store.value["jobs"][0]["viewer_publish_failures"] == attempt
+        monitor.sender.send.assert_not_awaited()
+    await monitor.collect()
+    details = monitor.sender.send.call_args.args[0][0]["event_details"]
+    assert "prediction_viewer_url" not in details
+    assert store.value["jobs"][0]["viewer_config_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_viewer_timeout_is_retryable_connectivity_error(config, api, store):
+    lock = AsyncMock()
+    lock.acquire.return_value = True
+    store.db_client = SimpleNamespace(lock=lambda *args, **kwargs: lock)
+    monitor = await seed(config, api, store)
+    store.value["jobs"][0]["viewer_config_id"] = VIEWER
+    api.add_to_viewer.side_effect = monitor_module.asyncio.TimeoutError()
+    with pytest.raises(IntegrationConnectionError, match="Publishing.*timed out"):
+        await monitor.collect()
+    assert store.value["jobs"][0]["status"] == "pending"
+    lock.release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_paging_does_not_republish_viewer(config, api, store):
+    monitor = await seed(config, api, store)
+    job = store.value["jobs"][0]
+    job.update(viewer_config_id=VIEWER, result_id="r1", status="collecting")
+    api.search_features.return_value = page([feature()])
+    await monitor.collect()
+    api.add_to_viewer.assert_not_awaited()
+    assert monitor.sender.send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_null_viewer_write_response_is_classified():
+    viewer = {
+        "organization_id": ORG, "access_level": "public", "state": "published",
+        "ui_layout_config": {}, "basemaps": [], "predictions": [], "prediction_results": [],
+    }
+    methods = []
+
+    def respond(request):
+        methods.append(request.method)
+        return httpx.Response(200, json={"records": [viewer] if request.method == "GET" else None})
+
+    async with client.OlmoEarthClient(
+        "https://example.test", "token", transport=httpx.MockTransport(respond)
+    ) as api:
+        with pytest.raises(IntegrationBadResponseError, match="not acknowledged"):
+            await api.add_to_viewer(VIEWER, "p1", "r1")
+    assert methods == ["GET", "PUT"]
+
+
+@pytest.mark.asyncio
+async def test_thumbnails_are_queued_with_event_acknowledgement(config, api, store):
+    from app.actions.monitor_state import Outbox
+    config.include_thumbnails = True
+    monitor = await seed(config, api, store)
+    await monitor.load()
+    job = monitor.state.jobs[0]
+    job.include_thumbnails = True
+    event = {"event_details": {"ts_start": "2026-08-01", "ts_end": "2026-09-01"}}
+    monitor.state.outbox = Outbox(job_name=job.name, events=[event], next_offset=1, complete=True)
+    monitor.sender.send.return_value = [{"object_id": "created-event"}]
+    await monitor.flush_outbox()
+    assert store.value["outbox"] is None
+    assert [(x["event_id"], x["side"]) for x in store.value["thumbnails"]] == [
+        ("created-event", "before"), ("created-event", "after")]
+    await monitor.flush_outbox()
+    monitor.sender.send.assert_awaited_once()

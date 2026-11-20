@@ -1,5 +1,6 @@
 """Orchestrate prediction submission, result collection, and recoverable delivery."""
 
+import asyncio
 import calendar
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
@@ -7,6 +8,7 @@ from typing import Optional
 
 from app.services.activity_logger import LogLevel, log_action_activity
 from app.services.errors import (
+    IntegrationConnectionError,
     IntegrationBadResponseError,
     IntegrationConfigurationError,
     IntegrationError,
@@ -22,9 +24,11 @@ from .client import (
     PredictionSearchRequest,
     PropertyFilter,
     StringFilter,
+    is_transient,
 )
 from .configurations import Cadence, PullEventsConfig
 from .delivery import GundiEventSender
+from .imagery import select_thumbnail
 from .monitor_state import (
     ACTIVE_JOB_STATUSES,
     STATE_ACTION,
@@ -32,6 +36,7 @@ from .monitor_state import (
     JobStatus,
     MonitorState,
     Outbox,
+    ThumbnailDelivery,
     monitor_identity,
     monitor_schedule,
 )
@@ -46,6 +51,9 @@ IMAGERY_LAG_DAYS = 14
 # A prediction still unfinished this long after submission (stalled, or in a status
 # the monitor does not know) fails its job, so the monitor moves on to the next slot.
 MAX_PREDICTION_WAIT = timedelta(days=3)
+# Collection runs that may fail transiently to publish to the viewer before
+# events go out without the viewer link.
+VIEWER_PUBLISH_ATTEMPTS = 10
 # The action id that collection logs under in the portal.
 COLLECT_ACTION = "pull_events"
 
@@ -204,8 +212,10 @@ class Monitor:
                 prediction_id=prediction.id,
                 reference_time=reference,
                 selected_types=self.config.selected_types,
+                include_thumbnails=self.config.include_thumbnails,
                 area_of_interest=area,
                 changes_since=self.config.changes_since,
+                viewer_config_id=self.config.viewer_config_id and str(self.config.viewer_config_id),
             )
         )
         if not is_extra:
@@ -235,6 +245,32 @@ class Monitor:
             )
         return response.records[0] if response.records else None
 
+    async def _queue_thumbnails(self, events: list[dict], acknowledgements: list[dict]) -> None:
+        """Queue a before and an after attachment for each event Gundi gave an ID."""
+        missing = 0
+        for event, ack in zip(events, acknowledgements):
+            event_id = ack.get("object_id")
+            if not isinstance(event_id, str) or not event_id:
+                missing += 1
+                continue
+            # Keep only what scene selection reads; the full event is already delivered.
+            details = event["event_details"]
+            source = {
+                "geometry": event.get("geometry"),
+                "event_details": {k: details[k] for k in ("ts_start", "ts_end") if k in details},
+            }
+            for side in ("before", "after"):
+                self.state.thumbnails.append(
+                    ThumbnailDelivery(event_id=event_id, event=source, side=side)
+                )
+        if missing:
+            await log_action_activity(
+                self.integration_id, COLLECT_ACTION,
+                f"{missing} event(s) accepted without an object_id; "
+                "satellite attachments unavailable for them.",
+                level=LogLevel.WARNING,
+            )
+
     async def flush_outbox(self) -> list[dict]:
         """Deliver and commit the pending page, if any; return the events it sent.
 
@@ -245,9 +281,11 @@ class Monitor:
         box = self.state.outbox
         if box is None:
             return []
-        if box.events:
-            await self.sender.send(box.events)
         job = next(j for j in self.state.jobs if j.name == box.job_name)
+        if box.events:
+            acknowledgements = await self.sender.send(box.events)
+            if job.include_thumbnails:
+                await self._queue_thumbnails(box.events, acknowledgements)
         job.offset = box.next_offset
         job.status = JobStatus.COMPLETE if box.complete else JobStatus.COLLECTING
         self.state.outbox = None
@@ -270,6 +308,56 @@ class Monitor:
     async def _fail_job(self, job: Job, error: IntegrationError):
         await self._stop_job(job, JobStatus.FAILED, str(error))
         raise error
+
+    async def _publish_to_viewer(self, job: Job, result_id: str) -> None:
+        """Add the completed prediction and result to the job's viewer before delivery.
+
+        Events link to the viewer only once it holds the prediction. Transient
+        failures stop collection so the next run retries. A permanent failure, or
+        VIEWER_PUBLISH_ATTEMPTS transient ones, drops the job's viewer link rather
+        than its events: the viewer is optional, the detections are not.
+        """
+        try:
+            await self._add_to_viewer_locked(job, result_id)
+        except IntegrationError as exc:
+            job.viewer_publish_failures += 1
+            if is_transient(exc) and job.viewer_publish_failures < VIEWER_PUBLISH_ATTEMPTS:
+                await self.save()
+                raise
+            await log_action_activity(
+                self.integration_id,
+                COLLECT_ACTION,
+                f"Could not publish prediction {job.prediction_id} to viewer "
+                f"{job.viewer_config_id}: {exc}. Its events are sent without a viewer link.",
+                level=LogLevel.WARNING,
+                data={"job": job.name, "prediction_id": job.prediction_id,
+                      "viewer_config_id": job.viewer_config_id},
+            )
+            # The caller saves the job as it starts collecting.
+            job.viewer_config_id = None
+
+    async def _add_to_viewer_locked(self, job: Job, result_id: str) -> None:
+        lock = self.store.db_client.lock(
+            f"{STATE_ACTION}:viewer:{self.api.base_url}:{job.viewer_config_id}",
+            timeout=180,
+            blocking=True,
+            blocking_timeout=10,
+        )
+        if not await lock.acquire():
+            raise IntegrationConnectionError(
+                "Another monitor is updating this viewer; retry collection."
+            )
+        try:
+            await asyncio.wait_for(
+                self.api.add_to_viewer(job.viewer_config_id, job.prediction_id, result_id),
+                timeout=150,
+            )
+        except asyncio.TimeoutError as exc:
+            raise IntegrationConnectionError(
+                "Publishing the prediction to the viewer timed out; retry collection."
+            ) from exc
+        finally:
+            await lock.release()
 
     async def _ready_for_paging(self, job: Job) -> bool:
         """Advance the active job from its prediction; True once it has a result to page."""
@@ -315,6 +403,8 @@ class Monitor:
                 ),
             )
         if job.result_id is None or job.status != JobStatus.COLLECTING:
+            if job.viewer_config_id:
+                await self._publish_to_viewer(job, prediction.result.id)
             job.result_id = prediction.result.id
             job.status = JobStatus.COLLECTING
             await self.save()
@@ -350,6 +440,7 @@ class Monitor:
                     sites,
                     integration_id=self.integration_id,
                     now=self.now,
+                    viewer_base_url=self.api.base_url,
                 )
                 for feature in response.records
                 if (found := classify(feature, job, self.config))
@@ -374,6 +465,43 @@ class Monitor:
             await self.save()
         return await self.flush_outbox()
 
+    async def _deliver_thumbnail(self, item: ThumbnailDelivery) -> None:
+        if item.selection is None:
+            item.selection = await select_thumbnail(self.api, item.event, item.side, self.now)
+            # Persist the chosen scene so a retry renders the same one.
+            await self.save()
+        if item.selection is None:
+            await log_action_activity(
+                self.integration_id, COLLECT_ACTION,
+                f"No suitable {item.side} satellite scene for event {item.event_id}.",
+                level=LogLevel.WARNING,
+            )
+            return
+        data = await self.api.render_thumbnail(item.selection["query"])
+        await self.sender.attach(item.event_id, item.selection["filename"], data)
+
+    async def deliver_thumbnails(self):
+        # Bound work per poll. Persist each completed side independently of events.
+        for item in self.state.thumbnails[:4]:
+            retry = False
+            try:
+                await asyncio.wait_for(self._deliver_thumbnail(item), timeout=90)
+            except Exception:
+                item.attempts += 1
+                retry = item.attempts < 3
+                await log_action_activity(
+                    self.integration_id, COLLECT_ACTION,
+                    f"Satellite attachment {item.side} for event {item.event_id} failed "
+                    f"(attempt {item.attempts}/3)." +
+                    (" Giving up; event remains delivered." if item.attempts >= 3 else " Will retry."),
+                    level=LogLevel.WARNING,
+                )
+            # Remove only now: _deliver_thumbnail saves state while the item is queued.
+            self.state.thumbnails.remove(item)
+            if retry:
+                self.state.thumbnails.append(item)
+            await self.save()
+
     async def collect(self) -> dict:
         await self.load()
         sent = list(await self.flush_outbox())
@@ -385,9 +513,11 @@ class Monitor:
             while pages < PAGES_PER_POLL and job.status == JobStatus.COLLECTING:
                 sent += await self._collect_page(job)
                 pages += 1
+        await self.deliver_thumbnails()
         kinds = Counter(event["event_details"]["detection_kind"] for event in sent)
         return {
             "events_sent": len(sent),
+            "thumbnails_pending": len(self.state.thumbnails),
             "detections_by_kind": dict(kinds),
             "pages_read": pages,
             "known_sites": len(self.state.sites),

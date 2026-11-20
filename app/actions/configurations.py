@@ -85,6 +85,11 @@ def _reference(action: str, params: Optional[dict] = None) -> dict:
 
 
 class PullEventsConfig(PullActionConfiguration):
+    viewer_config_id: Optional[UUID] = FieldWithUIOptions(
+        None,
+        title="Public OlmoEarth viewer config",
+        description="Completed predictions and results will be published in this existing public viewer before events are sent.",
+    )
     project_id: UUID = FieldWithUIOptions(
         ...,
         title="OlmoEarth project",
@@ -128,6 +133,10 @@ class PullEventsConfig(PullActionConfiguration):
     changes_since: Optional[date] = pydantic.Field(
         None,
         description="Optional fixed event-date cutoff. Never advanced as an ingestion watermark.",
+    )
+    include_thumbnails: bool = FieldWithUIOptions(
+        False, title="Attach before and after satellite thumbnails",
+        description="Attach Sentinel-2 images within 90 days on each side of the change, with scene cloud cover at most 20%. Missing imagery does not prevent events. Applies to new predictions.",
     )
     event_type: str = pydantic.Field("olmoearth_detection", min_length=1)
 

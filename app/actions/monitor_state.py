@@ -39,6 +39,9 @@ class Job(BaseModel):
     # None only until load() fills it on jobs saved before the area could change.
     area_of_interest: Optional[dict] = None
     changes_since: Optional[date] = None
+    viewer_config_id: Optional[str] = None
+    viewer_publish_failures: int = 0
+    include_thumbnails: bool = False
     result_id: Optional[str] = None
     status: JobStatus = JobStatus.PENDING
     offset: int = 0
@@ -64,6 +67,14 @@ class Outbox(BaseModel):
     complete: bool
 
 
+class ThumbnailDelivery(BaseModel):
+    event_id: str
+    event: dict
+    side: str
+    attempts: int = 0
+    selection: Optional[dict] = None
+
+
 class MonitorState(BaseModel):
     identity: dict
     # The schedule settings next_slot counts in; None on state saved before the
@@ -73,6 +84,7 @@ class MonitorState(BaseModel):
     jobs: list[Job] = Field(default_factory=list)
     sites: dict[str, SiteRecord] = Field(default_factory=dict)
     outbox: Optional[Outbox] = None
+    thumbnails: list[ThumbnailDelivery] = Field(default_factory=list)
 
 
 IDENTITY_FIELDS = {"project_id", "model_id"}

@@ -158,6 +158,7 @@ def prepare_event(
     *,
     integration_id: str,
     now: datetime,
+    viewer_base_url: str,
 ) -> dict:
     """Build the Gundi event for one monitored detection and record its site.
 
@@ -203,6 +204,13 @@ def prepare_event(
             **form_fields(feature, changed),
         }
     )
+    if job.viewer_config_id:
+        props["prediction_viewer_url"] = (
+            f"{viewer_base_url}/viewer/"
+            f"{job.viewer_config_id}?color_by=post_change"
+            f"&prediction_ids={job.prediction_id}"
+            f"#13.95/{point.y:.6f}/{point.x:.6f}"
+        )
     return {
         "title": title,
         "event_type": config.event_type,
