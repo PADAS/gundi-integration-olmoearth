@@ -26,14 +26,14 @@ EVENT = {
 async def test_selects_covering_scene_and_pins_render_to_scene(side, date):
     def scene(id, geom):
         return {"id": id, "properties": {"collected_at": date + "T10:00:00Z", "geometry": mapping(geom)}}
-    api = SimpleNamespace(_request=AsyncMock(return_value={"records": [
+    api = SimpleNamespace(search_scenes=AsyncMock(return_value=[
         scene("partial", box(24.97, -13.02, 24.971, -13.019)),
         scene("full", box(24, -14, 26, -12)),
-    ]}))
+    ]))
     selected = await select_thumbnail(api, EVENT, side, NOW)
     assert selected["query"]["filters"] == {"id": {"inc": ["full"]}}
     assert selected["filename"] == f"{side}-{date}-sentinel2.png"
-    request = api._request.call_args.args[2]
+    request = api.search_scenes.call_args.args[0]
     assert request["cloud_cover"]["lte"] == 20
     dates = request["collected_at"]
     if side == "before":
@@ -44,9 +44,9 @@ async def test_selects_covering_scene_and_pins_render_to_scene(side, date):
 
 @pytest.mark.asyncio
 async def test_missing_dates_does_not_search():
-    api = SimpleNamespace(_request=AsyncMock())
+    api = SimpleNamespace(search_scenes=AsyncMock())
     assert await select_thumbnail(api, {**EVENT, "event_details": {}}, "before", NOW) is None
-    api._request.assert_not_awaited()
+    api.search_scenes.assert_not_awaited()
 
 
 @pytest.mark.asyncio

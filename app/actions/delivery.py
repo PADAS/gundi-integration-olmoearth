@@ -35,11 +35,14 @@ class GundiEventSender:
         self.integration_id = integration_id
         self._client: Optional[GundiDataSenderClient] = None
 
-    async def send(self, events: list[dict]) -> list[dict]:
-        """POST the batch once; raise unless Gundi acknowledged every event."""
+    async def _gundi(self) -> GundiDataSenderClient:
         if self._client is None:
             self._client = await get_gundi_client(self.integration_id)
-        response = await self._client.post_events(data=events)
+        return self._client
+
+    async def send(self, events: list[dict]) -> list[dict]:
+        """POST the batch once; raise unless Gundi acknowledged every event."""
+        response = await (await self._gundi()).post_events(data=events)
         if (
             not isinstance(response, list)
             or len(response) != len(events)
@@ -52,9 +55,7 @@ class GundiEventSender:
         return response
 
     async def attach(self, event_id: str, filename: str, data: bytes) -> None:
-        if self._client is None:
-            self._client = await get_gundi_client(self.integration_id)
-        response = await self._client.post_event_attachments(
+        response = await (await self._gundi()).post_event_attachments(
             event_id=event_id, attachments=[(filename, data)]
         )
         if (not isinstance(response, list) or len(response) != 1

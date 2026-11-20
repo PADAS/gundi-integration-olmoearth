@@ -311,11 +311,10 @@ class OlmoEarthClient:
         updates. Include the result explicitly so Studio makes it publicly readable.
         """
         path = f"/api/v1/viewer_config/{viewer_config_id}"
-        payload = await self._request("GET", path, attempts=1)
-        records = payload.get("records") or []
-        if payload.get("errors") or not isinstance(records, list) or len(records) != 1:
-            raise IntegrationBadResponseError("Expected one viewer configuration.")
-        viewer = records[0]
+        viewer = _single_record(
+            await self._request("GET", path, attempts=1),
+            "Expected one viewer configuration.",
+        )
         if viewer.get("access_level") != "public":
             raise IntegrationConfigurationError(
                 "The configured viewer must already be public."
@@ -342,10 +341,20 @@ class OlmoEarthClient:
         body["prediction_result_ids"] = list(dict.fromkeys([*result_ids, result_id]))
         # Don't replay an old replacement payload after a transient failure.
         # The next collect action re-reads the viewer before retrying.
-        updated = await self._request("PUT", path, body, attempts=1)
-        records = updated.get("records") or []
-        if updated.get("errors") or not isinstance(records, list) or len(records) != 1:
-            raise IntegrationBadResponseError("Viewer update was not acknowledged.")
+        _single_record(
+            await self._request("PUT", path, body, attempts=1),
+            "Viewer update was not acknowledged.",
+        )
+
+    async def search_scenes(self, query: dict) -> list[dict]:
+        """Imagery scenes matching a datasets-imagery search, in the requested order."""
+        response = await self._request(
+            "POST", "/api/v1/datasets-imagery/scenes/search", query, attempts=1
+        )
+        records = response.get("records")
+        if response.get("errors") or not isinstance(records, list):
+            raise IntegrationBadResponseError("Invalid imagery scene search response")
+        return records
 
     async def search_predictions(
         self, request: PredictionSearchRequest
@@ -405,6 +414,14 @@ class OlmoEarthClient:
         """
         response = await self.search_predictions(PredictionSearchRequest(limit=1))
         return response.meta.total
+
+
+def _single_record(payload: dict, message: str) -> dict:
+    """The one record of a raw response envelope; raise ``message`` otherwise."""
+    records = payload.get("records") or []
+    if payload.get("errors") or not isinstance(records, list) or len(records) != 1:
+        raise IntegrationBadResponseError(message)
+    return records[0]
 
 
 def _is_transient(exc: BaseException) -> bool:

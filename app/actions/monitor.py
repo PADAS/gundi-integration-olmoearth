@@ -212,7 +212,7 @@ class Monitor:
                 include_thumbnails=self.config.include_thumbnails,
                 area_of_interest=area,
                 changes_since=self.config.changes_since,
-                viewer_config_id=str(self.config.viewer_config_id) if self.config.viewer_config_id else None,
+                viewer_config_id=self.config.viewer_config_id and str(self.config.viewer_config_id),
             )
         )
         if not is_extra:
@@ -242,6 +242,32 @@ class Monitor:
             )
         return response.records[0] if response.records else None
 
+    async def _queue_thumbnails(self, events: list[dict], acknowledgements: list[dict]) -> None:
+        """Queue a before and an after attachment for each event Gundi gave an ID."""
+        missing = 0
+        for event, ack in zip(events, acknowledgements):
+            event_id = ack.get("object_id")
+            if not isinstance(event_id, str) or not event_id:
+                missing += 1
+                continue
+            # Keep only what scene selection reads; the full event is already delivered.
+            details = event["event_details"]
+            source = {
+                "geometry": event.get("geometry"),
+                "event_details": {k: details[k] for k in ("ts_start", "ts_end") if k in details},
+            }
+            for side in ("before", "after"):
+                self.state.thumbnails.append(
+                    ThumbnailDelivery(event_id=event_id, event=source, side=side)
+                )
+        if missing:
+            await log_action_activity(
+                self.integration_id, COLLECT_ACTION,
+                f"{missing} event(s) accepted without an object_id; "
+                "satellite attachments unavailable for them.",
+                level=LogLevel.WARNING,
+            )
+
     async def flush_outbox(self) -> list[dict]:
         """Deliver and commit the pending page, if any; return the events it sent.
 
@@ -256,18 +282,7 @@ class Monitor:
         if box.events:
             acknowledgements = await self.sender.send(box.events)
             if job.include_thumbnails:
-                for event, ack in zip(box.events, acknowledgements):
-                    if not isinstance(ack.get("object_id"), str) or not ack["object_id"]:
-                        await log_action_activity(
-                            self.integration_id, COLLECT_ACTION,
-                            "Event accepted without an object_id; satellite attachments unavailable.",
-                            level=LogLevel.WARNING,
-                        )
-                        continue
-                    for side in ("before", "after"):
-                        self.state.thumbnails.append(ThumbnailDelivery(
-                            event_id=ack["object_id"], event=event, side=side,
-                        ))
+                await self._queue_thumbnails(box.events, acknowledgements)
         job.offset = box.next_offset
         job.status = JobStatus.COMPLETE if box.complete else JobStatus.COLLECTING
         self.state.outbox = None
@@ -290,6 +305,40 @@ class Monitor:
     async def _fail_job(self, job: Job, error: IntegrationError):
         await self._stop_job(job, JobStatus.FAILED, str(error))
         raise error
+
+    async def _publish_to_viewer(self, job: Job, result_id: str) -> None:
+        """Add the completed prediction and result to the job's viewer before delivery."""
+        lock = self.store.db_client.lock(
+            f"{STATE_ACTION}:viewer:{self.api.base_url}:{job.viewer_config_id}",
+            timeout=180,
+            blocking=True,
+            blocking_timeout=10,
+        )
+        if not await lock.acquire():
+            raise IntegrationConnectionError(
+                "Another monitor is updating this viewer; retry collection."
+            )
+        try:
+            await asyncio.wait_for(
+                self.api.add_to_viewer(job.viewer_config_id, job.prediction_id, result_id),
+                timeout=150,
+            )
+        except asyncio.TimeoutError as exc:
+            raise IntegrationConnectionError(
+                "Publishing the prediction to the viewer timed out; retry collection."
+            ) from exc
+        except IntegrationError as exc:
+            # Permanent errors must release the active job so corrected config
+            # can take effect on the next submission. Transient errors retry.
+            if isinstance(exc, (IntegrationConfigurationError, IntegrationAuthError)) or (
+                exc.status_code is not None
+                and 400 <= exc.status_code < 500
+                and exc.status_code not in {408, 429}
+            ):
+                await self._fail_job(job, exc)
+            raise
+        finally:
+            await lock.release()
 
     async def _ready_for_paging(self, job: Job) -> bool:
         """Advance the active job from its prediction; True once it has a result to page."""
@@ -334,42 +383,9 @@ class Monitor:
                     "Prediction result changed while paging; earlier pages came from a different result."
                 ),
             )
-        if job.viewer_config_id and (job.result_id is None or job.status != JobStatus.COLLECTING):
-            viewer_id = str(job.viewer_config_id)
-            lock = self.store.db_client.lock(
-                f"{STATE_ACTION}:viewer:{self.api.base_url}:{viewer_id}",
-                timeout=180,
-                blocking=True,
-                blocking_timeout=10,
-            )
-            if not await lock.acquire():
-                raise IntegrationConnectionError(
-                    "Another monitor is updating this viewer; retry collection."
-                )
-            try:
-                await asyncio.wait_for(
-                    self.api.add_to_viewer(
-                        viewer_id, job.prediction_id, prediction.result.id
-                    ),
-                    timeout=150,
-                )
-            except asyncio.TimeoutError as exc:
-                raise IntegrationConnectionError(
-                    "Publishing the prediction to the viewer timed out; retry collection."
-                ) from exc
-            except IntegrationError as exc:
-                # Permanent errors must release the active job so corrected config
-                # can take effect on the next submission. Transient errors retry.
-                if isinstance(exc, (IntegrationConfigurationError, IntegrationAuthError)) or (
-                    exc.status_code is not None
-                    and 400 <= exc.status_code < 500
-                    and exc.status_code not in {408, 429}
-                ):
-                    await self._fail_job(job, exc)
-                raise
-            finally:
-                await lock.release()
         if job.result_id is None or job.status != JobStatus.COLLECTING:
+            if job.viewer_config_id:
+                await self._publish_to_viewer(job, prediction.result.id)
             job.result_id = prediction.result.id
             job.status = JobStatus.COLLECTING
             await self.save()
@@ -430,28 +446,30 @@ class Monitor:
             await self.save()
         return await self.flush_outbox()
 
+    async def _deliver_thumbnail(self, item: ThumbnailDelivery) -> None:
+        if item.selection is None:
+            item.selection = await select_thumbnail(self.api, item.event, item.side, self.now)
+            # Persist the chosen scene so a retry renders the same one.
+            await self.save()
+        if item.selection is None:
+            await log_action_activity(
+                self.integration_id, COLLECT_ACTION,
+                f"No suitable {item.side} satellite scene for event {item.event_id}.",
+                level=LogLevel.WARNING,
+            )
+            return
+        data = await self.api.render_thumbnail(item.selection["query"])
+        await self.sender.attach(item.event_id, item.selection["filename"], data)
+
     async def deliver_thumbnails(self):
         # Bound work per poll. Persist each completed side independently of events.
-        for item in list(self.state.thumbnails[:4]):
+        for item in self.state.thumbnails[:4]:
+            retry = False
             try:
-                async def deliver():
-                    if item.selection is None:
-                        item.selection = await select_thumbnail(
-                            self.api, item.event, item.side, self.now
-                        )
-                        await self.save()
-                    if item.selection is None:
-                        await log_action_activity(
-                            self.integration_id, COLLECT_ACTION,
-                            f"No suitable {item.side} satellite scene for event {item.event_id}.",
-                            level=LogLevel.WARNING,
-                        )
-                        return
-                    data = await self.api.render_thumbnail(item.selection["query"])
-                    await self.sender.attach(item.event_id, item.selection["filename"], data)
-                await asyncio.wait_for(deliver(), timeout=90)
+                await asyncio.wait_for(self._deliver_thumbnail(item), timeout=90)
             except Exception:
                 item.attempts += 1
+                retry = item.attempts < 3
                 await log_action_activity(
                     self.integration_id, COLLECT_ACTION,
                     f"Satellite attachment {item.side} for event {item.event_id} failed "
@@ -459,11 +477,10 @@ class Monitor:
                     (" Giving up; event remains delivered." if item.attempts >= 3 else " Will retry."),
                     level=LogLevel.WARNING,
                 )
-                self.state.thumbnails.remove(item)
-                if item.attempts < 3:
-                    self.state.thumbnails.append(item)
-            else:
-                self.state.thumbnails.remove(item)
+            # Remove only now: _deliver_thumbnail saves state while the item is queued.
+            self.state.thumbnails.remove(item)
+            if retry:
+                self.state.thumbnails.append(item)
             await self.save()
 
     async def collect(self) -> dict:

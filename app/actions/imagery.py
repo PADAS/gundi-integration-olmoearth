@@ -5,8 +5,6 @@ from datetime import datetime, timedelta, timezone
 
 from shapely.geometry import box, shape
 
-from app.services.errors import IntegrationBadResponseError
-
 COLLECTION = "sentinel-2-l2a"
 
 
@@ -39,17 +37,14 @@ async def select_thumbnail(api, event, side, today):
         return None
     bounds = thumbnail_area(event)
     region = box(*bounds)
-    response = await api._request("POST", "/api/v1/datasets-imagery/scenes/search", {
+    records = await api.search_scenes({
         "collection": {"eq": COLLECTION},
         "intersects_geometry": region.__geo_interface__,
         "collected_at": {"gte": start.isoformat(), "lte": end.isoformat()},
         "cloud_cover": {"gte": 0, "lte": 20},
         "sort_by": "collected_at", "sort_direction": "desc" if side == "before" else "asc",
         "limit": 1000,
-    }, attempts=1)
-    records = response.get("records")
-    if response.get("errors") or not isinstance(records, list):
-        raise IntegrationBadResponseError("Invalid imagery scene search response")
+    })
     for scene in records:
         props = scene["properties"]
         # Avoid partially covered thumbnails. No cloud-free guarantee at pixel level.
