@@ -28,6 +28,7 @@ from .client import (
 )
 from .configurations import Cadence, PullEventsConfig
 from .delivery import GundiEventSender
+from .imagery import select_thumbnail
 from .monitor_state import (
     ACTIVE_JOB_STATUSES,
     STATE_ACTION,
@@ -35,6 +36,7 @@ from .monitor_state import (
     JobStatus,
     MonitorState,
     Outbox,
+    ThumbnailDelivery,
     monitor_identity,
     monitor_schedule,
 )
@@ -207,6 +209,7 @@ class Monitor:
                 prediction_id=prediction.id,
                 reference_time=reference,
                 selected_types=self.config.selected_types,
+                include_thumbnails=self.config.include_thumbnails,
                 area_of_interest=area,
                 changes_since=self.config.changes_since,
                 viewer_config_id=str(self.config.viewer_config_id) if self.config.viewer_config_id else None,
@@ -249,9 +252,22 @@ class Monitor:
         box = self.state.outbox
         if box is None:
             return []
-        if box.events:
-            await self.sender.send(box.events)
         job = next(j for j in self.state.jobs if j.name == box.job_name)
+        if box.events:
+            acknowledgements = await self.sender.send(box.events)
+            if job.include_thumbnails:
+                for event, ack in zip(box.events, acknowledgements):
+                    if not isinstance(ack.get("object_id"), str) or not ack["object_id"]:
+                        await log_action_activity(
+                            self.integration_id, COLLECT_ACTION,
+                            "Event accepted without an object_id; satellite attachments unavailable.",
+                            level=LogLevel.WARNING,
+                        )
+                        continue
+                    for side in ("before", "after"):
+                        self.state.thumbnails.append(ThumbnailDelivery(
+                            event_id=ack["object_id"], event=event, side=side,
+                        ))
         job.offset = box.next_offset
         job.status = JobStatus.COMPLETE if box.complete else JobStatus.COLLECTING
         self.state.outbox = None
@@ -414,6 +430,42 @@ class Monitor:
             await self.save()
         return await self.flush_outbox()
 
+    async def deliver_thumbnails(self):
+        # Bound work per poll. Persist each completed side independently of events.
+        for item in list(self.state.thumbnails[:4]):
+            try:
+                async def deliver():
+                    if item.selection is None:
+                        item.selection = await select_thumbnail(
+                            self.api, item.event, item.side, self.now
+                        )
+                        await self.save()
+                    if item.selection is None:
+                        await log_action_activity(
+                            self.integration_id, COLLECT_ACTION,
+                            f"No suitable {item.side} satellite scene for event {item.event_id}.",
+                            level=LogLevel.WARNING,
+                        )
+                        return
+                    data = await self.api.render_thumbnail(item.selection["query"])
+                    await self.sender.attach(item.event_id, item.selection["filename"], data)
+                await asyncio.wait_for(deliver(), timeout=90)
+            except Exception:
+                item.attempts += 1
+                await log_action_activity(
+                    self.integration_id, COLLECT_ACTION,
+                    f"Satellite attachment {item.side} for event {item.event_id} failed "
+                    f"(attempt {item.attempts}/3)." +
+                    (" Giving up; event remains delivered." if item.attempts >= 3 else " Will retry."),
+                    level=LogLevel.WARNING,
+                )
+                self.state.thumbnails.remove(item)
+                if item.attempts < 3:
+                    self.state.thumbnails.append(item)
+            else:
+                self.state.thumbnails.remove(item)
+            await self.save()
+
     async def collect(self) -> dict:
         await self.load()
         sent = list(await self.flush_outbox())
@@ -425,9 +477,11 @@ class Monitor:
             while pages < PAGES_PER_POLL and job.status == JobStatus.COLLECTING:
                 sent += await self._collect_page(job)
                 pages += 1
+        await self.deliver_thumbnails()
         kinds = Counter(event["event_details"]["detection_kind"] for event in sent)
         return {
             "events_sent": len(sent),
+            "thumbnails_pending": len(self.state.thumbnails),
             "detections_by_kind": dict(kinds),
             "pages_read": pages,
             "known_sites": len(self.state.sites),

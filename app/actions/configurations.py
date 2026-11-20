@@ -134,6 +134,10 @@ class PullEventsConfig(PullActionConfiguration):
         None,
         description="Optional fixed event-date cutoff. Never advanced as an ingestion watermark.",
     )
+    include_thumbnails: bool = FieldWithUIOptions(
+        False, title="Attach before and after satellite thumbnails",
+        description="Attach Sentinel-2 images within 90 days on each side of the change, with scene cloud cover at most 20%. Missing imagery does not prevent events. Applies to new predictions.",
+    )
     event_type: str = pydantic.Field("olmoearth_detection", min_length=1)
 
     class Config:

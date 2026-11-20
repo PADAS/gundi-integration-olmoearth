@@ -1294,3 +1294,22 @@ async def test_null_viewer_write_response_is_classified():
         with pytest.raises(IntegrationBadResponseError, match="not acknowledged"):
             await api.add_to_viewer(VIEWER, "p1", "r1")
     assert methods == ["GET", "PUT"]
+
+
+@pytest.mark.asyncio
+async def test_thumbnails_are_queued_with_event_acknowledgement(config, api, store):
+    from app.actions.monitor_state import Outbox
+    config.include_thumbnails = True
+    monitor = await seed(config, api, store)
+    await monitor.load()
+    job = monitor.state.jobs[0]
+    job.include_thumbnails = True
+    event = {"event_details": {"ts_start": "2026-08-01", "ts_end": "2026-09-01"}}
+    monitor.state.outbox = Outbox(job_name=job.name, events=[event], next_offset=1, complete=True)
+    monitor.sender.send.return_value = [{"object_id": "created-event"}]
+    await monitor.flush_outbox()
+    assert store.value["outbox"] is None
+    assert [(x["event_id"], x["side"]) for x in store.value["thumbnails"]] == [
+        ("created-event", "before"), ("created-event", "after")]
+    await monitor.flush_outbox()
+    monitor.sender.send.assert_awaited_once()

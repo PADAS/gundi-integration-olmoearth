@@ -35,7 +35,7 @@ class GundiEventSender:
         self.integration_id = integration_id
         self._client: Optional[GundiDataSenderClient] = None
 
-    async def send(self, events: list[dict]) -> None:
+    async def send(self, events: list[dict]) -> list[dict]:
         """POST the batch once; raise unless Gundi acknowledged every event."""
         if self._client is None:
             self._client = await get_gundi_client(self.integration_id)
@@ -48,3 +48,16 @@ class GundiEventSender:
             raise IntegrationBadResponseError(
                 "Gundi did not acknowledge every event; the batch will be sent again."
             )
+
+        return response
+
+    async def attach(self, event_id: str, filename: str, data: bytes) -> None:
+        if self._client is None:
+            self._client = await get_gundi_client(self.integration_id)
+        response = await self._client.post_event_attachments(
+            event_id=event_id, attachments=[(filename, data)]
+        )
+        if (not isinstance(response, list) or len(response) != 1
+                or not isinstance(response[0], dict) or response[0].get("errors")
+                or not response[0].get("object_id")):
+            raise IntegrationBadResponseError("Gundi did not acknowledge the thumbnail")

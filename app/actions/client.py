@@ -287,6 +287,21 @@ class OlmoEarthClient:
         return parsed
 
     # -- endpoints ---------------------------------------------------------
+    async def render_thumbnail(self, query: dict) -> bytes:
+        try:
+            response = await self._client.get(
+                "/api/v1/datasets-imagery/image.png",
+                params={"query": json.dumps(query)},
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise _classify_status_error(exc) from exc
+        except httpx.HTTPError as exc:
+            raise IntegrationConnectionError("Could not render satellite thumbnail") from exc
+        if not response.content.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise IntegrationBadResponseError("Imagery endpoint did not return a PNG")
+        return response.content
+
     async def add_to_viewer(
         self, viewer_config_id: str, prediction_id: str, result_id: str
     ) -> None:
