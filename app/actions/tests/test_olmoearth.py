@@ -1232,23 +1232,51 @@ async def test_viewer_setting_is_saved_with_prediction(config, api, store):
     IntegrationConfigurationError("private viewer"),
     IntegrationAuthError("forbidden", status_code=403),
     IntegrationBadResponseError("missing viewer", status_code=404),
+    # No status code: a malformed viewer response is permanent, not retried forever.
+    IntegrationBadResponseError("Viewer configuration is missing required settings."),
 ])
-async def test_permanent_viewer_error_releases_active_job(config, api, store, error):
+async def test_permanent_viewer_error_delivers_events_without_link(
+    config, api, store, activity_log, error
+):
     lock = AsyncMock()
     lock.acquire.return_value = True
     store.db_client = SimpleNamespace(lock=lambda *args, **kwargs: lock)
+    api.search_features.return_value = page([feature()])
     monitor = await seed(config, api, store)
     store.value["jobs"][0]["viewer_config_id"] = VIEWER
     api.add_to_viewer.side_effect = error
-    with pytest.raises(type(error)):
-        await monitor.collect()
-    assert store.value["jobs"][0]["status"] == "failed"
-    monitor.sender.send.assert_not_awaited()
+    await monitor.collect()
+    api.add_to_viewer.assert_awaited_once()
     lock.release.assert_awaited_once()
-    # A failed job no longer prevents the next scheduled submission.
-    monitor.now += dt.timedelta(days=8)
-    await monitor.submit()
-    assert len(store.value["jobs"]) == 2
+    details = monitor.sender.send.call_args.args[0][0]["event_details"]
+    assert details["prediction_id"] == "p1"
+    assert "prediction_viewer_url" not in details
+    job = store.value["jobs"][0]
+    assert job["viewer_config_id"] is None
+    assert job["status"] == "complete"
+    assert any(
+        "without a viewer link" in call.args[2] for call in activity_log.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_transient_viewer_errors_give_up_on_the_link(config, api, store):
+    lock = AsyncMock()
+    lock.acquire.return_value = True
+    store.db_client = SimpleNamespace(lock=lambda *args, **kwargs: lock)
+    api.search_features.return_value = page([feature()])
+    monitor = await seed(config, api, store)
+    store.value["jobs"][0]["viewer_config_id"] = VIEWER
+    api.add_to_viewer.side_effect = IntegrationConnectionError("unavailable")
+    for attempt in range(1, monitor_module.VIEWER_PUBLISH_ATTEMPTS):
+        with pytest.raises(IntegrationConnectionError):
+            await monitor.collect()
+        assert store.value["jobs"][0]["viewer_publish_failures"] == attempt
+        monitor.sender.send.assert_not_awaited()
+    await monitor.collect()
+    details = monitor.sender.send.call_args.args[0][0]["event_details"]
+    assert "prediction_viewer_url" not in details
+    assert store.value["jobs"][0]["viewer_config_id"] is None
 
 
 @pytest.mark.asyncio

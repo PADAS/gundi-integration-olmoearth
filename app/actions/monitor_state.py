@@ -40,6 +40,7 @@ class Job(BaseModel):
     area_of_interest: Optional[dict] = None
     changes_since: Optional[date] = None
     viewer_config_id: Optional[str] = None
+    viewer_publish_failures: int = 0
     include_thumbnails: bool = False
     result_id: Optional[str] = None
     status: JobStatus = JobStatus.PENDING

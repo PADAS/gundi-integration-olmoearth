@@ -8,7 +8,6 @@ from typing import Optional
 
 from app.services.activity_logger import LogLevel, log_action_activity
 from app.services.errors import (
-    IntegrationAuthError,
     IntegrationConnectionError,
     IntegrationBadResponseError,
     IntegrationConfigurationError,
@@ -25,6 +24,7 @@ from .client import (
     PredictionSearchRequest,
     PropertyFilter,
     StringFilter,
+    is_transient,
 )
 from .configurations import Cadence, PullEventsConfig
 from .delivery import GundiEventSender
@@ -51,6 +51,9 @@ IMAGERY_LAG_DAYS = 14
 # A prediction still unfinished this long after submission (stalled, or in a status
 # the monitor does not know) fails its job, so the monitor moves on to the next slot.
 MAX_PREDICTION_WAIT = timedelta(days=3)
+# Collection runs that may fail transiently to publish to the viewer before
+# events go out without the viewer link.
+VIEWER_PUBLISH_ATTEMPTS = 10
 # The action id that collection logs under in the portal.
 COLLECT_ACTION = "pull_events"
 
@@ -307,7 +310,33 @@ class Monitor:
         raise error
 
     async def _publish_to_viewer(self, job: Job, result_id: str) -> None:
-        """Add the completed prediction and result to the job's viewer before delivery."""
+        """Add the completed prediction and result to the job's viewer before delivery.
+
+        Events link to the viewer only once it holds the prediction. Transient
+        failures stop collection so the next run retries. A permanent failure, or
+        VIEWER_PUBLISH_ATTEMPTS transient ones, drops the job's viewer link rather
+        than its events: the viewer is optional, the detections are not.
+        """
+        try:
+            await self._add_to_viewer_locked(job, result_id)
+        except IntegrationError as exc:
+            job.viewer_publish_failures += 1
+            if is_transient(exc) and job.viewer_publish_failures < VIEWER_PUBLISH_ATTEMPTS:
+                await self.save()
+                raise
+            await log_action_activity(
+                self.integration_id,
+                COLLECT_ACTION,
+                f"Could not publish prediction {job.prediction_id} to viewer "
+                f"{job.viewer_config_id}: {exc}. Its events are sent without a viewer link.",
+                level=LogLevel.WARNING,
+                data={"job": job.name, "prediction_id": job.prediction_id,
+                      "viewer_config_id": job.viewer_config_id},
+            )
+            # The caller saves the job as it starts collecting.
+            job.viewer_config_id = None
+
+    async def _add_to_viewer_locked(self, job: Job, result_id: str) -> None:
         lock = self.store.db_client.lock(
             f"{STATE_ACTION}:viewer:{self.api.base_url}:{job.viewer_config_id}",
             timeout=180,
@@ -327,16 +356,6 @@ class Monitor:
             raise IntegrationConnectionError(
                 "Publishing the prediction to the viewer timed out; retry collection."
             ) from exc
-        except IntegrationError as exc:
-            # Permanent errors must release the active job so corrected config
-            # can take effect on the next submission. Transient errors retry.
-            if isinstance(exc, (IntegrationConfigurationError, IntegrationAuthError)) or (
-                exc.status_code is not None
-                and 400 <= exc.status_code < 500
-                and exc.status_code not in {408, 429}
-            ):
-                await self._fail_job(job, exc)
-            raise
         finally:
             await lock.release()
 

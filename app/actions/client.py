@@ -249,7 +249,7 @@ class OlmoEarthClient:
         self, method: str, path: str, body: Optional[dict] = None, attempts: int = 3
     ) -> dict:
         async for attempt in stamina.retry_context(
-            on=_is_transient,
+            on=is_transient,
             attempts=attempts,
             wait_initial=2.0,
             wait_max=20.0,
@@ -424,7 +424,7 @@ def _single_record(payload: dict, message: str) -> dict:
     return records[0]
 
 
-def _is_transient(exc: BaseException) -> bool:
+def is_transient(exc: BaseException) -> bool:
     """Retry predicate: transport failures, 429 and 5xx are worth another try."""
     if isinstance(exc, IntegrationConnectionError):
         return True

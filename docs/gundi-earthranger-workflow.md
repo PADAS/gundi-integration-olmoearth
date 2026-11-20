@@ -136,8 +136,13 @@ prediction ID and result ID using `PUT /api/v1/viewer_config/{id}`. It preserves
 existing associations, publishing state, layout and metadata. Explicit result
 association causes Studio to make that result publicly readable. The viewer must
 already be public, and the token needs BUILD permission and access to the viewer
-and prediction. Failed publication stops collection before new events are sent;
+and prediction. A transient publication failure (a connection error, a timeout,
+lock contention, 429 or 5xx) stops collection before new events are sent;
 retrying collection re-reads the config and does not duplicate associations.
+After 10 such failures, or on any other error (a private or missing viewer, a
+token without permission, an unexpected response), the connector logs a warning
+and sends the prediction's events without `prediction_viewer_url`. The viewer is
+optional; the detections are not.
 Runner updates to the same viewer are serialized through Redis. Studio's current
 API has no compare-and-swap protection, so manual edits or other clients must not
 update that viewer concurrently with collection.
